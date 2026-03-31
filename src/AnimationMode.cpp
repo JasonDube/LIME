@@ -83,18 +83,28 @@ void AnimationMode::processInput(float deltaTime) {
 }
 
 void AnimationMode::update(float deltaTime) {
-    // Update animation playback
-    if (m_skinnedModelHandle != UINT32_MAX) {
-        if (m_animationPlaying && m_currentAnimationIndex >= 0 &&
-            m_currentAnimationIndex < static_cast<int>(m_animations.size())) {
-            m_animationTime += deltaTime * m_animationSpeed;
-            const auto& clip = m_animations[m_currentAnimationIndex].clip;
-            if (m_animationTime > clip.duration) {
-                m_animationTime = std::fmod(m_animationTime, clip.duration);
-            }
+    if (m_skinnedModelHandle == UINT32_MAX) return;
+
+    auto* data = m_ctx.skinnedModelRenderer.getModelData(m_skinnedModelHandle);
+    if (!data) return;
+
+    if (m_scrubbing) {
+        // Scrubbing: we set the time, player follows
+        data->animPlayer.setCurrentTime(m_animationTime);
+        const auto& boneMatrices = data->animPlayer.getBoneMatrices();
+        if (!boneMatrices.empty() && data->boneMappedMemory) {
+            size_t copySize = std::min(boneMatrices.size(), eden::MAX_BONES) * sizeof(glm::mat4);
+            memcpy(data->boneMappedMemory, boneMatrices.data(), copySize);
         }
-        m_ctx.skinnedModelRenderer.updateAnimation(m_skinnedModelHandle, m_animationPlaying ? deltaTime : 0.0f);
+        m_scrubbing = false;
+    } else {
+        // Player is the single clock — we just read from it
+        data->animPlayer.setPlaybackSpeed(m_animationPlaying ? m_animationSpeed : 0.0f);
+        m_ctx.skinnedModelRenderer.updateAnimation(m_skinnedModelHandle, deltaTime);
     }
+
+    // Always sync our timeline display from the player's actual time
+    m_animationTime = data->animPlayer.getCurrentTime();
 }
 
 void AnimationMode::renderUI() {
@@ -381,14 +391,71 @@ void AnimationMode::renderAnimationCombinerUI() {
         ImGui::Spacing();
         ImGui::Spacing();
 
+        // Keyframe tools
+        if (m_currentAnimationIndex >= 0 && m_currentAnimationIndex < static_cast<int>(m_animations.size())) {
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), "Keyframe Tools");
+            ImGui::Separator();
+            ImGui::SliderInt("Keep every N", &m_thinInterval, 2, 10);
+
+            auto& clip = m_animations[m_currentAnimationIndex].clip;
+            // Count total keys for display
+            int totalKeys = 0;
+            for (const auto& ch : clip.channels) {
+                totalKeys += static_cast<int>(ch.positions.size() + ch.rotations.size() + ch.scales.size());
+            }
+            int afterKeys = 0;
+            for (const auto& ch : clip.channels) {
+                afterKeys += static_cast<int>((ch.positions.size() + m_thinInterval - 1) / m_thinInterval);
+                afterKeys += static_cast<int>((ch.rotations.size() + m_thinInterval - 1) / m_thinInterval);
+                afterKeys += static_cast<int>((ch.scales.size() + m_thinInterval - 1) / m_thinInterval);
+            }
+            ImGui::Text("%d keys -> %d keys", totalKeys, afterKeys);
+
+            if (ImGui::Button("Thin Keyframes", ImVec2(-1, 0))) {
+                // Thin every channel in the current animation
+                for (auto& ch : clip.channels) {
+                    auto thinChannel = [&](std::vector<float>& times, auto& values) {
+                        if (times.size() <= 1) return;
+                        std::vector<float> newTimes;
+                        std::remove_reference_t<decltype(values)> newValues;
+                        for (size_t i = 0; i < times.size(); i++) {
+                            if (i % m_thinInterval == 0 || i == times.size() - 1) {
+                                newTimes.push_back(times[i]);
+                                newValues.push_back(values[i]);
+                            }
+                        }
+                        times = newTimes;
+                        values = newValues;
+                    };
+                    thinChannel(ch.positionTimes, ch.positions);
+                    thinChannel(ch.rotationTimes, ch.rotations);
+                    thinChannel(ch.scaleTimes, ch.scales);
+                }
+
+                // Update renderer's copy
+                auto* data = m_ctx.skinnedModelRenderer.getModelData(m_skinnedModelHandle);
+                if (data) {
+                    for (auto& rendererAnim : data->animations) {
+                        if (rendererAnim.name == clip.name) {
+                            rendererAnim = clip;
+                            break;
+                        }
+                    }
+                }
+                std::cout << "[Animation] Thinned keyframes: kept every " << m_thinInterval << "th frame" << std::endl;
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Spacing();
+
         // Rigging section
         ImGui::TextColored(ImVec4(1, 1, 0, 1), "Rigging");
         ImGui::Separator();
         ImGui::Checkbox("Show Joints", &m_showJoints);
         ImGui::Checkbox("Show Bone Names", &m_showBoneNames);
         ImGui::Checkbox("Show Bone Axes", &m_showBoneAxes);
-        // Weight Heat Map (disabled — needs cpuVertices re-add)
-        // ImGui::Checkbox("Weight Heat Map", &m_showWeightHeatMap);
+        ImGui::Checkbox("Weight Heat Map", &m_showWeightHeatMap);
 
         // Bone list
         if (m_skinnedModelHandle != UINT32_MAX) {
@@ -470,7 +537,36 @@ void AnimationMode::renderAnimationCombinerUI() {
                     }
                 }
 
-                // Weight heat map disabled (needs cpuVertices — will re-add later)
+                // Weight heat map
+                if (m_showWeightHeatMap && m_selectedBone >= 0 && !m_cpuVertices.empty()) {
+                    if (!m_weightHeatMapActive || m_selectedBone != m_weightHeatMapBone) {
+                        auto vertices = m_cpuVertices;
+                        for (auto& v : vertices) {
+                            float w = 0.0f;
+                            for (int j = 0; j < 4; j++) {
+                                if (v.joints[j] == m_selectedBone) w += v.weights[j];
+                            }
+                            float r = std::min(1.0f, w * 2.0f);
+                            float g = w < 0.5f ? w * 2.0f : 2.0f * (1.0f - w);
+                            float b = std::max(0.0f, 1.0f - w * 2.0f);
+                            v.color = glm::vec4(r, g, b, 1.0f);
+                        }
+                        VkDeviceSize vertexSize = sizeof(eden::SkinnedVertex) * vertices.size();
+                        void* mapped;
+                        vkMapMemory(m_ctx.vulkanContext.getDevice(), data->vertexMemory, 0, vertexSize, 0, &mapped);
+                        memcpy(mapped, vertices.data(), vertexSize);
+                        vkUnmapMemory(m_ctx.vulkanContext.getDevice(), data->vertexMemory);
+                        m_weightHeatMapActive = true;
+                        m_weightHeatMapBone = m_selectedBone;
+                    }
+                } else if (m_weightHeatMapActive && !m_cpuVertices.empty()) {
+                    VkDeviceSize vertexSize = sizeof(eden::SkinnedVertex) * m_cpuVertices.size();
+                    void* mapped;
+                    vkMapMemory(m_ctx.vulkanContext.getDevice(), data->vertexMemory, 0, vertexSize, 0, &mapped);
+                    memcpy(mapped, m_cpuVertices.data(), vertexSize);
+                    vkUnmapMemory(m_ctx.vulkanContext.getDevice(), data->vertexMemory);
+                    m_weightHeatMapActive = false;
+                }
             }
         }
 
@@ -731,6 +827,9 @@ void AnimationMode::loadSkinnedModel(const std::string& path) {
 
         // Get mesh data
         const auto& mesh = result.meshes[0];
+
+        // Store CPU vertex copy for weight heat map (kept in AnimationMode, not engine)
+        m_cpuVertices = mesh.vertices;
 
         // Create new model
         m_skinnedModelHandle = m_ctx.skinnedModelRenderer.createModel(

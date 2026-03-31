@@ -152,6 +152,17 @@ set(LIME_SOURCES
 
 add_executable(lime ${LIME_SOURCES})
 
+# Tracy profiler integration
+set(TRACY_DIR "$ENV{HOME}/Desktop/tracy")
+if(EXISTS ${TRACY_DIR}/public/tracy/Tracy.hpp)
+    option(TRACY_ENABLE "Enable Tracy profiler" ON)
+    if(TRACY_ENABLE)
+        target_sources(lime_engine PRIVATE ${TRACY_DIR}/public/TracyClient.cpp)
+        target_include_directories(lime_engine PUBLIC ${TRACY_DIR}/public)
+        target_compile_definitions(lime_engine PUBLIC TRACY_ENABLE)
+    endif()
+endif()
+
 target_link_libraries(lime PRIVATE lime_engine httplib::httplib)
 target_compile_definitions(lime PRIVATE CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 

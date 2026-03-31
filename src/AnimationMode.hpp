@@ -91,10 +91,12 @@ private:
     bool m_showJoints = true;
     bool m_showBoneNames = true;
     bool m_showBoneAxes = false;
+    int m_thinInterval = 5;
     bool m_showWeightHeatMap = false;
     int m_selectedBone = -1;
-    bool m_weightHeatMapActive = false; // tracks if colors are currently overridden
-    int m_weightHeatMapBone = -1;       // which bone the heat map was last computed for
+    bool m_weightHeatMapActive = false;
+    int m_weightHeatMapBone = -1;
+    std::vector<eden::SkinnedVertex> m_cpuVertices; // stored in AnimationMode, not engine
 
     // Timeline zoom/pan
     float m_timelineZoom = 1.0f;   // 1.0 = fit to window, >1 = zoomed in

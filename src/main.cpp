@@ -7,6 +7,10 @@
  * - AnimationMode: Skeletal animation combining
  */
 
+#ifdef TRACY_ENABLE
+#include <tracy/Tracy.hpp>
+#endif
+
 #include "Renderer/VulkanApplicationBase.hpp"
 #include "Renderer/VulkanContext.hpp"
 #include "Renderer/Swapchain.hpp"
@@ -1228,6 +1232,10 @@ protected:
 
         // End command buffer
         vkEndCommandBuffer(cmd);
+
+#ifdef TRACY_ENABLE
+        FrameMark;
+#endif
     }
 
 private:
