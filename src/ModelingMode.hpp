@@ -1,0 +1,422 @@
+#pragma once
+
+#include "IEditorMode.hpp"
+#include "EditorContext.hpp"
+
+/**
+ * @brief Modeling Editor mode for mesh editing
+ *
+ * Features:
+ * - Vertex/Edge/Face selection modes
+ * - Extrude, delete, merge operations
+ * - Edge loops and rings
+ * - UV editor integration
+ * - Reference images for ortho views
+ * - Grid and transform tools
+ */
+class ModelingMode : public IEditorMode {
+public:
+    explicit ModelingMode(EditorContext& ctx);
+    ~ModelingMode() override = default;
+
+    void onActivate() override;
+    void onDeactivate() override;
+    void processInput(float deltaTime) override;
+    void update(float deltaTime) override;
+    void renderUI() override;
+    void renderSceneOverlay(VkCommandBuffer cmd, const glm::mat4& viewProj) override;
+    void drawOverlays(float vpX, float vpY, float vpW, float vpH) override;
+    const char* getName() const override { return "Modeling Editor"; }
+    bool wantsGrid() const override { return m_ctx.showGrid; }
+    bool supportsSplitView() const override { return true; }
+
+    // Mesh operations
+    void buildEditableMeshFromObject();
+    void updateMeshFromEditable();
+    void saveEditableMeshAsGLB();
+    void saveEditableMeshAsOBJ();
+    void saveEditableMeshAsLime();
+    void exportTextureAsPNG();
+    void loadOBJFile();
+    void loadLimeFile();
+    void quickSave();  // F5 - save to current file path/format
+
+    // Scene save/load (.limes format - all objects in scene)
+    void saveLimeScene();
+    void loadLimeScene();
+
+    // Reference image operations
+    void loadReferenceImage(int viewIndex);
+
+private:
+    void renderModelingEditorUI();
+    void duplicateSelectedObject();  // Duplicate with random color and select
+    void renderModelingUVWindow();
+    void renderImageRefWindow();  // Clone source images window
+    void createPerspectiveCorrectedStamp(const CloneSourceImage& img);  // Perspective correction
+    void processModelingInput(float deltaTime, bool gizmoActive = false);
+    void renderModelingOverlay(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    void renderGrid3D(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    void renderWireframeOverlay3D(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    void drawQuadWireframeOverlay(Camera& camera, float vpX, float vpY, float vpW, float vpH);
+    void drawFaceNormalsOverlay(Camera& camera, float vpX, float vpY, float vpW, float vpH);
+    void drawReferenceImages(Camera& camera, float vpX, float vpY, float vpW, float vpH);
+
+    // Gizmo methods
+    void renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    bool processGizmoInput();  // Returns true if gizmo consumed the mouse click
+    glm::vec3 getGizmoPosition();  // Get position for gizmo (selection center or object origin)
+    void getGizmoAxes(glm::vec3& xAxis, glm::vec3& yAxis, glm::vec3& zAxis);  // Get local/world axes
+    GizmoAxis pickGizmoAxis(const glm::vec3& rayOrigin, const glm::vec3& rayDir, const glm::vec3& gizmoPos);
+    float rayAxisDistance(const glm::vec3& rayOrigin, const glm::vec3& rayDir,
+                          const glm::vec3& axisOrigin, const glm::vec3& axisDir);
+    glm::vec3 projectPointOntoAxis(const glm::vec3& point, const glm::vec3& axisOrigin, const glm::vec3& axisDir);
+
+    // Camera helpers
+    void startCameraTumble();
+
+    // UV helpers
+    bool pointInUVTriangle(const glm::vec2& p, const glm::vec2& a, const glm::vec2& b, const glm::vec2& c);
+    int findUVFaceAtPoint(const glm::vec2& uvPoint);
+    int findUVVertexAtPoint(const glm::vec2& uvPoint, float threshold);
+    void selectUVIsland(uint32_t startFace);
+    std::set<uint32_t> getUVSelectedVertices();
+    void getUVSelectionBounds(glm::vec2& outMin, glm::vec2& outMax);
+    void storeOriginalUVs();
+    void storeOriginalUVsForVertices();
+    void moveSelectedUVs(const glm::vec2& delta);
+    void moveSelectedUVVertices(const glm::vec2& delta);
+    void scaleSelectedUVs(const glm::vec2& center, float scale);
+    void scaleSelectedUVsFromAnchor(const glm::vec2& anchor, float scaleX, float scaleY);
+    void rotateSelectedUVs(const glm::vec2& center, float angleDegrees);
+
+    // Edge path extrusion
+    void extrudeBoxAlongSelectedEdges(float boxSize, float taper = 1.0f, bool autoUV = true);
+    std::vector<uint32_t> orderSelectedEdgesIntoPath();
+
+    // Pipe network extrusion (handles junctions and corners)
+    void extrudePipeNetwork(float boxSize, float blockSizeMultiplier = 1.0f, bool autoUV = true);
+
+    // UV sewing helpers
+    float pointToLineSegmentDistUV(const glm::vec2& p, const glm::vec2& a, const glm::vec2& b);
+    std::pair<uint32_t, uint32_t> findUVEdgeAtPoint(const glm::vec2& uvPoint, float threshold = 0.02f);
+    std::pair<glm::vec3, glm::vec3> getEdge3DPositions(uint32_t faceIdx, uint32_t localEdgeIdx);
+    std::pair<glm::vec2, glm::vec2> getEdgeUVs(uint32_t faceIdx, uint32_t localEdgeIdx);
+    bool positions3DEqual(const glm::vec3& a, const glm::vec3& b, float tol = 0.0001f);
+    void findTwinUVEdges(uint32_t selectedFaceIdx, uint32_t selectedEdgeIdx);
+    void clearUVEdgeSelection();
+    std::set<uint32_t> getUVIslandFaces(uint32_t startFace);
+    std::set<uint32_t> getIslandVertices(const std::set<uint32_t>& faces);
+    void sewSelectedEdge();
+    void moveAndSewSelectedEdge();
+    void unsewSelectedEdge();
+
+    // UV baking - draws UV edges onto texture
+    void bakeUVEdgesToTexture(const glm::vec3& edgeColor, int lineThickness = 1);
+
+    // Bake texture colors into vertex colors (then remove texture)
+    void bakeTextureToVertexColors();
+
+    // UV re-projection: store old UVs + texture, then re-project after UV edit
+    void storeUVsForReprojection();
+    void reprojectTexture(int outputSize = 0);  // 0 = use original texture size
+    void packAndReprojectUVs();  // One-click: store, shrink, reproject
+
+    // Stored UV/texture state for re-projection
+    struct StoredVertexUV {
+        glm::vec2 uv;
+    };
+    std::vector<StoredVertexUV> m_storedOldUVs;
+    std::vector<unsigned char> m_storedOldTexture;
+    int m_storedOldTexW = 0;
+    int m_storedOldTexH = 0;
+    bool m_hasStoredUVs = false;
+    int m_reprojectTexSize = 1024;  // Output texture size for re-projection
+    float m_packScale = 0.5f;       // How much to shrink UVs (0.25 = 25%, 0.5 = 50%)
+    int m_packCorner = 0;           // 0=bottom-left, 1=bottom-right, 2=top-left, 3=top-right
+
+    // Vertex paint state
+    bool m_vertexPaintMode = false;
+    glm::vec3 m_vertexPaintColor = glm::vec3(1.0f, 0.0f, 0.0f);
+    float m_vertexPaintRadius = 0.2f;
+    float m_vertexPaintStrength = 1.0f;
+    bool m_vertexPaintingActive = false;  // Currently in a paint stroke
+    bool m_vertexPaintSquare = true;      // Square brush (pixel art style) vs circular
+
+    // Image reference window state
+    int m_pendingCloneImageDelete = -1;  // Index to delete, -1 means none
+
+    // Rectangle stamp selection state
+    bool m_stampSelecting = false;       // Currently dragging a selection
+    glm::vec2 m_stampSelectStart{0.0f};  // Start pixel in image
+    glm::vec2 m_stampSelectEnd{0.0f};    // End pixel in image
+    int m_stampSelectImageIdx = -1;      // Which image we're selecting from
+    bool m_pendingStampPreviewUpdate = false;  // Deferred stamp preview texture update
+
+    // Perspective correction state
+    bool m_perspectiveMode = false;      // Placing corners for perspective correction
+    glm::vec2 m_perspectiveCorners[4];   // 4 corner positions in image pixel coordinates
+    int m_perspectiveCornerCount = 0;    // How many corners placed (0-4)
+    int m_perspectiveImageIdx = -1;      // Which image we're placing corners on
+
+    // Face snap state
+    bool m_snapMode = false;             // Snap tool is active
+    bool m_snapMergeMode = false;        // If true, merge objects after snap
+    SceneObject* m_snapSourceObject = nullptr;  // First object selected
+    int m_snapSourceFace = -1;           // Face index on source object
+    glm::vec3 m_snapSourceCenter{0.0f};  // Center of source face (world space)
+    glm::vec3 m_snapSourceNormal{0.0f};  // Normal of source face (world space)
+
+    // Snap & Merge vertex selection mode (ordered vertex correspondence)
+    bool m_snapVertexMode = false;       // Vertex selection mode active
+    SceneObject* m_snapSrcObj = nullptr; // Source object for merge
+    SceneObject* m_snapDstObj = nullptr; // Target object for merge
+    std::vector<glm::vec3> m_snapSrcVerts;   // Source vertices (world positions, in order)
+    std::vector<glm::vec3> m_snapDstVerts;   // Target vertices (world positions, in order)
+    std::vector<uint32_t> m_snapSrcVertIndices;  // Source vertex indices (for rendering)
+    std::vector<uint32_t> m_snapDstVertIndices;  // Target vertex indices (for rendering)
+
+    // Custom gizmo pivot (for post-snap rotation)
+    bool m_useCustomGizmoPivot = false;
+    glm::vec3 m_customGizmoPivot{0.0f};
+
+    // Control point visibility
+    bool m_showControlPoints = true;
+
+    // Origin visualization
+    bool m_showOrigin = true;
+
+    // Port authoring state
+    bool m_showPorts = true;
+    int m_selectedPortIndex = -1;        // Which port is selected (-1 = none)
+    int m_draggingPortAxis = -1;         // -1=none, 0=forward, 1=up, 2=position
+    glm::vec3 m_portDragStart{0.0f};
+    char m_portNameBuf[64] = "pipe_end";
+
+    // Port methods (implemented in ModelingMode_Ports.cpp)
+    void renderPortUI();
+    void renderPortOverlay(float vpX, float vpY, float vpW, float vpH);
+    void renderPortGizmos3D(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    void syncPortsToSceneObject();
+
+    // Metadata editor (implemented in ModelingMode_Ports.cpp)
+    void renderMetadataUI();
+    char m_metaKeyBuf[64] = "";
+    char m_metaValueBuf[128] = "";
+
+    // Mode switch notification
+    float m_modeNotificationTimer = 0.0f;
+    float m_saveNotificationTimer = 0.0f;
+
+    // UV rectangle selection
+    bool m_uvRectSelecting = false;
+    glm::vec2 m_uvRectStart{0.0f};
+    glm::vec2 m_uvRectEnd{0.0f};
+
+    // Wireframe/vertex overlay cache (avoid per-frame rebuild for high-poly meshes)
+    bool m_wireframeDirty = true;
+    glm::mat4 m_cachedModelMatrix{1.0f};
+    std::vector<glm::vec3> m_cachedWireLines;
+    std::vector<glm::vec3> m_cachedSelectedLines;
+    std::vector<glm::vec3> m_cachedNormalVerts;
+    std::vector<glm::vec3> m_cachedSelectedVerts;
+    std::vector<glm::vec3> m_cachedHoveredVerts;
+    int m_cachedHoveredVertex = -1;
+    size_t m_cachedSelectedEdgeCount = 0;
+    size_t m_cachedSelectedVertCount = 0;
+    ModelingSelectionMode m_cachedSelectionMode = ModelingSelectionMode::Face;
+    void invalidateWireframeCache() { m_wireframeDirty = true; }
+
+    // Snap helper methods
+    void cancelSnapMode();
+    void cancelSnapVertexMode();
+    glm::vec3 getFaceCenter(SceneObject* obj, int faceIdx);
+    glm::vec3 getFaceNormal(SceneObject* obj, int faceIdx);
+    void snapObjectToFace(SceneObject* srcObj, int srcFace, SceneObject* dstObj, int dstFace);
+    void snapAndMergeObjects(SceneObject* srcObj, int srcFace, SceneObject* dstObj, int dstFace);
+    void snapAndMergeWithVertexCorrespondence();  // Uses m_snapSrcVerts/m_snapDstVerts
+    void drawSnapVertexOverlay(float vpX, float vpY, float vpW, float vpH);
+
+    // Retopology state
+    bool m_retopologyMode = false;           // Place Vertex tool active
+    SceneObject* m_retopologyLiveObj = nullptr;  // "Live" reference surface
+    std::vector<glm::vec3> m_retopologyVerts;    // Placed vertices (world positions)
+    std::vector<glm::vec3> m_retopologyNormals;  // Surface normals at placed vertices
+    std::vector<uint32_t> m_retopologyVertMeshIdx; // Editable mesh index (UINT32_MAX = new vert)
+    bool m_retopologyObjCreated = false;     // Whether we've created the retopo scene object
+    bool m_retopologyDragging = false;       // G-key grab mode active
+    int m_retopologyDragQuadIdx = -1;        // Which quad overlay entry to update
+    int m_retopologyDragQuadVert = -1;       // Which corner of that quad (0-3)
+    glm::vec3 m_retopologyDragOrigPos{0.0f}; // Original position for cancel
+
+    // Accumulated retopo quads (for overlay drawing before finalize)
+    struct RetopologyQuad {
+        glm::vec3 verts[4];  // World positions
+    };
+    std::vector<RetopologyQuad> m_retopologyQuads;
+
+    // Retopology methods
+    void drawRetopologyOverlay(float vpX, float vpY, float vpW, float vpH);
+    void cancelRetopologyMode();
+    void createRetopologyQuad();     // Creates quad from 4 placed vertices
+    void finalizeRetopologyMesh();   // Build GPU mesh from accumulated quads
+
+    // Auto-retopology (voxel remesh)
+    void autoRetopology();           // Auto-retopo from live surface
+    int m_autoRetopResolution = 32;
+    int m_autoRetopSmoothIter = 5;
+
+    // Quad blanket retopology (view-based grid projection)
+    void quadBlanketRetopology();
+    int m_quadBlanketResX = 32;
+    int m_quadBlanketResY = 32;
+    int m_quadBlanketSmoothIter = 3;
+    bool m_quadBlanketTrimPartial = true;
+    float m_quadBlanketPadding = 0.05f;
+
+    // Patch Blanket (targeted rectangle → retopo quads accumulator)
+    bool m_patchBlanketMode = false;
+    bool m_patchBlanketDragging = false;
+    glm::vec2 m_patchBlanketStart{0.0f};
+    glm::vec2 m_patchBlanketEnd{0.0f};
+    void executePatchBlanket();
+
+    // Path Tube state
+    bool m_pathTubeMode = false;
+    std::vector<glm::vec3> m_pathNodes;
+    int m_pathSelectedNode = -1;
+    bool m_pathDragging = false;
+    int m_pathDragNodeIdx = -1;
+    glm::vec3 m_pathDragOrigPos{0.0f};
+
+    // Path tube surface attachment (first node snapped to live mesh)
+    bool m_pathTubeAttached = false;          // First node is attached to live surface
+    glm::vec3 m_pathTubeAttachNormal{0,1,0};  // Surface normal at attachment point
+
+    // Path Tube parameters
+    float m_pathTubeRadius = 0.05f;
+    float m_pathTubeRadiusStart = 1.0f;  // Taper multiplier at start
+    float m_pathTubeRadiusEnd = 1.0f;    // Taper multiplier at end
+    int m_pathTubeSegments = 8;
+    int m_pathTubeSamplesPerSpan = 8;
+
+    // Profile editor state
+    std::vector<glm::vec2> m_pathTubeProfile;  // Custom cross-section shape (unit-scale)
+    int m_profileDragIdx = -1;                 // Currently dragged profile vertex (-1 = none)
+    float m_pathTubeProfileExtent = 1.0f;      // How much of tube uses custom profile (0=none, 1=all)
+    void resetPathTubeProfile();               // Reset to circle from m_pathTubeSegments
+    void drawProfileEditor();                  // ImGui widget for profile editing
+
+    // Path Tube methods
+    void processPathTubeInput(bool mouseOverImGui);
+    void drawPathTubeOverlay(float vpX, float vpY, float vpW, float vpH);
+    void renderPathTubePreview3D(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    void generatePathTubeMesh();
+    void cancelPathTubeMode();
+
+    // Slice tool state
+    bool m_sliceMode = false;
+    glm::vec3 m_slicePlaneCenter{0.0f};
+    glm::vec3 m_slicePlaneNormal{0, 1, 0};
+    float m_slicePlaneOffset = 0.0f;
+    float m_slicePlaneRotationX = 0.0f;   // Pitch (degrees)
+    float m_slicePlaneRotationY = 0.0f;   // Yaw (degrees)
+    int m_slicePresetAxis = 1;            // 0=X, 1=Y, 2=Z
+
+    // Slice methods
+    void cancelSliceMode();
+    void performSlice();
+    void drawSlicePlaneOverlay3D(VkCommandBuffer cmd, const glm::mat4& viewProj);
+    void updateSlicePlaneFromParams();
+    static glm::vec3 pathCatmullRom(const glm::vec3& p0, const glm::vec3& p1,
+                                     const glm::vec3& p2, const glm::vec3& p3, float t);
+    static glm::vec3 pathEvaluateSpline(const std::vector<glm::vec3>& points, float t);
+    static std::vector<glm::vec3> pathSampleSpline(const std::vector<glm::vec3>& points,
+                                                    int samplesPerSegment);
+
+    // Rigging state
+    bool m_riggingMode = false;
+    int m_selectedBone = -1;
+    bool m_showSkeleton = true;
+    bool m_showBoneNames = true;
+    bool m_placingBone = false;      // Click mesh surface to place bone head
+    float m_boneInsetDepth = 0.2f;   // How far to push bone inward along surface normal
+    std::vector<glm::vec3> m_bonePositions;  // Editor-side head positions per bone
+    char m_newBoneName[64] = "Bone";
+
+    void drawSkeletonOverlay(float vpX, float vpY, float vpW, float vpH);
+    void cancelRiggingMode();
+    int pickBoneAtScreenPos(const glm::vec2& screenPos, float threshold = 20.0f);
+    std::vector<int> getDescendantBones(int boneIdx);  // Get all children recursively
+
+    // Patch Move state (UV editor: move UV island + texture pixels together)
+    bool m_patchMoveMode = false;
+    bool m_patchSelected = false;
+    bool m_patchDragging = false;
+    bool m_patchScaling = false;
+    int m_patchScaleHandle = -1;
+    glm::vec2 m_patchRectMin{0.0f};
+    glm::vec2 m_patchRectMax{1.0f};
+    glm::vec2 m_patchOrigRectMin{0.0f};
+    glm::vec2 m_patchOrigRectMax{1.0f};
+    glm::vec2 m_patchDragStart{0.0f};
+    std::vector<unsigned char> m_patchTextureBackup;
+    std::vector<unsigned char> m_patchPixels;
+    int m_patchPixelW = 0, m_patchPixelH = 0;
+    std::set<uint32_t> m_patchVertices;
+    std::map<uint32_t, glm::vec2> m_patchOrigUVs;
+
+    // Patch Move methods
+    void cancelPatchMoveMode();
+    void confirmPatchMove();
+    void extractPatchPixels();
+    void applyPatchTransform();
+
+    // Connect two objects by matching control points (merges boundary rings)
+    void connectByControlPoints();
+    void undoConnectCPs();  // Restore pre-connect state
+
+    // Undo state for Connect CPs operation
+    struct ConnectCPsBackup {
+        struct ObjectBackup {
+            std::string name;
+            eden::Transform transform;
+            glm::vec3 eulerRotation;
+            std::vector<SceneObject::StoredHEVertex> heVerts;
+            std::vector<SceneObject::StoredHalfEdge> heHalfEdges;
+            std::vector<SceneObject::StoredHEFace> heFaces;
+            std::vector<SceneObject::StoredControlPoint> controlPoints;
+            std::vector<ModelVertex> meshVerts;
+            std::vector<uint32_t> meshIndices;
+            std::vector<unsigned char> textureData;
+            int texWidth = 0, texHeight = 0;
+        };
+        std::vector<ObjectBackup> originals;
+        std::string combinedName;  // Name of the created object (to find & remove it)
+        bool valid = false;
+    };
+    ConnectCPsBackup m_connectCPsBackup;
+
+    // Auto UV island packing
+    void autoPackUVIslands(bool fitToUV = false);
+
+public:
+    // AI Generate (Hunyuan3D) UI state — public so main.cpp can read params
+    char m_generatePrompt[512] = "";
+    std::string m_generateImagePath;         // Single mode image
+    bool m_generateMultiView = false;        // Multi-view mode
+    std::string m_generateFrontPath;         // Multi-view: front (required)
+    std::string m_generateLeftPath;          // Multi-view: left (optional, defaults to front)
+    std::string m_generateRightPath;         // Multi-view: right (optional, defaults to front)
+    std::string m_generateBackPath;          // Multi-view: back (optional, defaults to front)
+    int m_generateSteps = 5;
+    int m_generateOctreeRes = 256;
+    float m_generateGuidance = 5.0f;
+    int m_generateMaxFaces = 10000;
+    bool m_generateTexture = true;
+    int m_generateTexSize = 1024;        // Texture resolution (512, 1024, 2048)
+    bool m_generateRemBG = true;         // Remove background from input image
+    int m_generateSeed = 12345;
+    bool m_generateSettingsOpen = false;
+    bool m_generateLowVRAM = false;      // Mini model + CPU offload for texture
+};
