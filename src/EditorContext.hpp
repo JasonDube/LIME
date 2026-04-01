@@ -103,7 +103,8 @@ enum class GizmoAxis {
     X,
     Y,
     Z,
-    Uniform  // Center cube for uniform scaling
+    Uniform,   // Center cube for uniform scaling
+    OrthoFree  // Free 2-axis drag in ortho views (sphere gizmo)
 };
 
 /**

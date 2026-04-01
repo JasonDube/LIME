@@ -253,6 +253,8 @@ public:
     // Mesh operations
     void extrudeFaces(const std::vector<uint32_t>& faceIndices, float distance);
     void extrudeSelectedFaces(float distance);
+    void extrudeEdges(const std::vector<uint32_t>& halfEdgeIndices, float distance);
+    void extrudeSelectedEdges(float distance);
     void insetSelectedFaces(float amount);  // Create inner quad with border quads (amount 0-1)
     void deleteFaces(const std::vector<uint32_t>& faceIndices);
     void deleteSelectedFaces();

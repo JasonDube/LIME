@@ -12,6 +12,34 @@
 
 using namespace eden;
 
+// Check if we should use the ortho sphere gizmo: ortho view + edge selection + move mode
+bool ModelingMode::isOrthoEdgeMoveMode() {
+    if (m_ctx.gizmoMode != GizmoMode::Move) return false;
+    if (m_ctx.objectMode) return false;
+    Camera& cam = m_ctx.getActiveCamera();
+    if (cam.getViewPreset() == ViewPreset::Custom) return false;
+    if (m_ctx.editableMesh.getSelectedEdges().empty()) return false;
+    return true;
+}
+
+// Get the two world axes visible in the current ortho view
+void ModelingMode::getOrthoAxes(glm::vec3& axis1, glm::vec3& axis2) {
+    Camera& cam = m_ctx.getActiveCamera();
+    switch (cam.getViewPreset()) {
+        case ViewPreset::Top:    // looking down -Y
+        case ViewPreset::Bottom: // looking up +Y
+            axis1 = glm::vec3(1, 0, 0); axis2 = glm::vec3(0, 0, 1); break;
+        case ViewPreset::Front:  // looking down -Z
+        case ViewPreset::Back:   // looking down +Z
+            axis1 = glm::vec3(1, 0, 0); axis2 = glm::vec3(0, 1, 0); break;
+        case ViewPreset::Right:  // looking down -X
+        case ViewPreset::Left:   // looking down +X
+            axis1 = glm::vec3(0, 0, 1); axis2 = glm::vec3(0, 1, 0); break;
+        default:
+            axis1 = glm::vec3(1, 0, 0); axis2 = glm::vec3(0, 1, 0); break;
+    }
+}
+
 glm::vec3 ModelingMode::getGizmoPosition() {
     if (!m_ctx.selectedObject) return glm::vec3(0.0f);
 
@@ -197,6 +225,21 @@ glm::vec3 ModelingMode::projectPointOntoAxis(const glm::vec3& point, const glm::
 GizmoAxis ModelingMode::pickGizmoAxis(const glm::vec3& rayOrigin, const glm::vec3& rayDir, const glm::vec3& gizmoPos) {
     float threshold = 0.15f * m_ctx.gizmoSize;  // Pick tolerance
 
+    // Ortho edge move: check if near the sphere
+    if (isOrthoEdgeMoveMode()) {
+        float sphereRadius = m_ctx.gizmoSize * 0.15f;
+        glm::vec3 toGizmo = gizmoPos - rayOrigin;
+        float t = glm::dot(toGizmo, rayDir);
+        if (t > 0) {
+            glm::vec3 closest = rayOrigin + rayDir * t;
+            float dist = glm::length(closest - gizmoPos);
+            if (dist < sphereRadius * 2.0f) {
+                return GizmoAxis::OrthoFree;
+            }
+        }
+        return GizmoAxis::None;
+    }
+
     // In scale mode, check center cube first for uniform scaling
     if (m_ctx.gizmoMode == GizmoMode::Scale) {
         float centerCubeSize = m_ctx.gizmoSize * 0.12f * 1.2f;  // Match render size
@@ -296,6 +339,45 @@ bool ModelingMode::processGizmoInput() {
             // Get local or world space axes
             glm::vec3 gizmoXAxis, gizmoYAxis, gizmoZAxis;
             getGizmoAxes(gizmoXAxis, gizmoYAxis, gizmoZAxis);
+
+            // Handle OrthoFree drag: project mouse delta onto 2 visible axes
+            if (m_ctx.gizmoActiveAxis == GizmoAxis::OrthoFree) {
+                glm::vec3 orthoAxis1, orthoAxis2;
+                getOrthoAxes(orthoAxis1, orthoAxis2);
+
+                // Intersect ray with the plane defined by the two ortho axes through gizmo start pos
+                Camera& cam = m_ctx.getActiveCamera();
+                glm::vec3 planeNormal = glm::normalize(glm::cross(orthoAxis1, orthoAxis2));
+                float denom = glm::dot(rayDir, planeNormal);
+                if (std::abs(denom) > 0.0001f) {
+                    float t = glm::dot(m_ctx.gizmoDragStartPos - rayOrigin, planeNormal) / denom;
+                    glm::vec3 currentPoint = rayOrigin + rayDir * t;
+                    glm::vec3 delta = currentPoint - m_ctx.gizmoDragStart;
+
+                    if (glm::length(delta) > 0.0001f) {
+                        // Apply snap if enabled
+                        if (m_ctx.snapEnabled && m_ctx.moveSnapIncrement > 0.0f) {
+                            float d1 = glm::dot(delta, orthoAxis1);
+                            float d2 = glm::dot(delta, orthoAxis2);
+                            float snap = m_ctx.moveSnapIncrement;
+                            d1 = std::round(d1 / snap) * snap;
+                            d2 = std::round(d2 / snap) * snap;
+                            delta = orthoAxis1 * d1 + orthoAxis2 * d2;
+                        }
+
+                        if (m_ctx.objectMode && m_ctx.selectedObject) {
+                            m_ctx.selectedObject->getTransform().translate(delta);
+                        } else if (!m_ctx.objectMode && m_ctx.selectedObject) {
+                            glm::mat4 invModel = glm::inverse(m_ctx.selectedObject->getTransform().getMatrix());
+                            glm::vec3 localDelta = glm::vec3(invModel * glm::vec4(delta, 0.0f));
+                            m_ctx.editableMesh.translateSelectedVertices(localDelta);
+                            m_ctx.meshDirty = true;
+                        }
+                        m_ctx.gizmoDragStart = currentPoint;
+                    }
+                }
+                return true;
+            }
 
             glm::vec3 axisDir(0.0f);
             switch (m_ctx.gizmoActiveAxis) {
@@ -644,7 +726,19 @@ bool ModelingMode::processGizmoInput() {
                 default: break;
             }
 
-            if (m_ctx.gizmoMode == GizmoMode::Rotate) {
+            if (m_ctx.gizmoActiveAxis == GizmoAxis::OrthoFree) {
+                // For ortho free drag, intersect ray with the 2-axis plane
+                glm::vec3 orthoAxis1, orthoAxis2;
+                getOrthoAxes(orthoAxis1, orthoAxis2);
+                glm::vec3 planeNormal = glm::normalize(glm::cross(orthoAxis1, orthoAxis2));
+                float denom = glm::dot(rayDir, planeNormal);
+                if (std::abs(denom) > 0.0001f) {
+                    float t = glm::dot(gizmoPos - rayOrigin, planeNormal) / denom;
+                    m_ctx.gizmoDragStart = rayOrigin + rayDir * t;
+                } else {
+                    m_ctx.gizmoDragStart = gizmoPos;
+                }
+            } else if (m_ctx.gizmoMode == GizmoMode::Rotate) {
                 // For rotation, store mouse screen position (in x,y of gizmoDragStart)
                 glm::vec2 mousePos = Input::getMousePosition();
                 m_ctx.gizmoDragStart = glm::vec3(mousePos.x, mousePos.y, 0.0f);
@@ -764,6 +858,39 @@ void ModelingMode::renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj) {
     // Get the gizmo axes (local or world space depending on settings)
     glm::vec3 gizmoXAxis, gizmoYAxis, gizmoZAxis;
     getGizmoAxes(gizmoXAxis, gizmoYAxis, gizmoZAxis);
+
+    // Ortho edge move: draw a small sphere instead of arrows
+    if (isOrthoEdgeMoveMode()) {
+        float sphereRadius = size * 0.15f;
+        bool hovered = (m_ctx.gizmoHoveredAxis == GizmoAxis::OrthoFree || m_ctx.gizmoActiveAxis == GizmoAxis::OrthoFree);
+        glm::vec3 sphereColor = hovered ? glm::vec3(1.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 1.0f, 1.0f);
+
+        // Draw 3 circles to form a wireframe sphere
+        auto makeCircle = [](glm::vec3 center, float radius, glm::vec3 axis, int segments = 16) -> std::vector<glm::vec3> {
+            std::vector<glm::vec3> lines;
+            glm::vec3 perp1, perp2;
+            if (std::abs(axis.x) < 0.9f)
+                perp1 = glm::normalize(glm::cross(axis, glm::vec3(1, 0, 0)));
+            else
+                perp1 = glm::normalize(glm::cross(axis, glm::vec3(0, 1, 0)));
+            perp2 = glm::normalize(glm::cross(axis, perp1));
+            for (int i = 0; i < segments; ++i) {
+                float a1 = (float)i / segments * 6.28318f;
+                float a2 = (float)(i + 1) / segments * 6.28318f;
+                lines.push_back(center + (perp1 * std::cos(a1) + perp2 * std::sin(a1)) * radius);
+                lines.push_back(center + (perp1 * std::cos(a2) + perp2 * std::sin(a2)) * radius);
+            }
+            return lines;
+        };
+
+        auto c1 = makeCircle(gizmoPos, sphereRadius, glm::vec3(1, 0, 0));
+        auto c2 = makeCircle(gizmoPos, sphereRadius, glm::vec3(0, 1, 0));
+        auto c3 = makeCircle(gizmoPos, sphereRadius, glm::vec3(0, 0, 1));
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, c1, sphereColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, c2, sphereColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, c3, sphereColor);
+        return;
+    }
 
     if (isRotateMode) {
         // ROTATE MODE: Draw circles around each axis

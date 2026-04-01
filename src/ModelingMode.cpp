@@ -2705,14 +2705,23 @@ void ModelingMode::renderModelingEditorUI() {
         if (!hasSelection) ImGui::BeginDisabled();
 
         if (ImGui::Button("Extrude (Shift+E)")) {
-            if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
+            if (!m_ctx.editableMesh.getSelectedEdges().empty()) {
+                m_ctx.editableMesh.saveState();
+                int count = std::max(1, m_ctx.extrudeCount);
+                float stepDist = m_ctx.extrudeDistance / static_cast<float>(count);
+                for (int i = 0; i < count; ++i) {
+                    m_ctx.editableMesh.extrudeSelectedEdges(stepDist);
+                }
+                m_ctx.meshDirty = true;
+                m_ctx.gizmoMode = GizmoMode::Move;
+            } else if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
                 m_ctx.editableMesh.saveState();
                 int count = std::max(1, m_ctx.extrudeCount);
                 float stepDist = m_ctx.extrudeDistance / static_cast<float>(count);
                 for (int i = 0; i < count; ++i) {
                     m_ctx.editableMesh.extrudeSelectedFaces(stepDist);
                 }
-                m_ctx.meshDirty = true;  // Defer GPU update to next frame
+                m_ctx.meshDirty = true;
             }
         }
         ImGui::SameLine();
@@ -2726,7 +2735,7 @@ void ModelingMode::renderModelingEditorUI() {
             ImGui::SetTooltip("Number of extrusion segments");
         }
 
-        if (ImGui::Button("Delete (X/Del)")) {
+        if (ImGui::Button("Delete (Del)")) {
             if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
                 m_ctx.editableMesh.saveState();
                 m_ctx.editableMesh.deleteSelectedFaces();
@@ -5073,7 +5082,7 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
     }
 
     // Delete selected faces (not during retopo mode)
-    if (!m_retopologyMode && (Input::isKeyPressed(Input::KEY_X) || Input::isKeyPressed(Input::KEY_DELETE))) {
+    if (!m_retopologyMode && Input::isKeyPressed(Input::KEY_DELETE)) {
         if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
             m_ctx.editableMesh.saveState();
             m_ctx.editableMesh.deleteSelectedFaces();
@@ -5081,9 +5090,43 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         }
     }
 
-    // Extrude faces (Shift+E)
+    // Extrude (Shift+E) — faces or edges depending on selection
     if (Input::isKeyPressed(Input::KEY_E) && Input::isKeyDown(Input::KEY_LEFT_SHIFT)) {
-        if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
+        if (!m_ctx.editableMesh.getSelectedEdges().empty()) {
+            m_ctx.editableMesh.saveState();
+            int count = std::max(1, m_ctx.extrudeCount);
+            float stepDist = m_ctx.extrudeDistance / static_cast<float>(count);
+            for (int i = 0; i < count; ++i) {
+                m_ctx.editableMesh.extrudeSelectedEdges(stepDist);
+            }
+            m_ctx.meshDirty = true;
+            m_ctx.gizmoMode = GizmoMode::Move;
+            m_lastOp = LastOp::ExtrudeEdge;
+        } else if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
+            m_ctx.editableMesh.saveState();
+            int count = std::max(1, m_ctx.extrudeCount);
+            float stepDist = m_ctx.extrudeDistance / static_cast<float>(count);
+            for (int i = 0; i < count; ++i) {
+                m_ctx.editableMesh.extrudeSelectedFaces(stepDist);
+            }
+            m_ctx.meshDirty = true;
+            m_lastOp = LastOp::ExtrudeFace;
+        }
+    }
+
+    // Repeat last operation (X)
+    if (Input::isKeyPressed(Input::KEY_X) && !Input::isKeyDown(Input::KEY_LEFT_SHIFT)
+        && !Input::isKeyDown(Input::KEY_LEFT_CONTROL) && !ImGui::GetIO().WantTextInput) {
+        if (m_lastOp == LastOp::ExtrudeEdge && !m_ctx.editableMesh.getSelectedEdges().empty()) {
+            m_ctx.editableMesh.saveState();
+            int count = std::max(1, m_ctx.extrudeCount);
+            float stepDist = m_ctx.extrudeDistance / static_cast<float>(count);
+            for (int i = 0; i < count; ++i) {
+                m_ctx.editableMesh.extrudeSelectedEdges(stepDist);
+            }
+            m_ctx.meshDirty = true;
+            m_ctx.gizmoMode = GizmoMode::Move;
+        } else if (m_lastOp == LastOp::ExtrudeFace && !m_ctx.editableMesh.getSelectedFaces().empty()) {
             m_ctx.editableMesh.saveState();
             int count = std::max(1, m_ctx.extrudeCount);
             float stepDist = m_ctx.extrudeDistance / static_cast<float>(count);

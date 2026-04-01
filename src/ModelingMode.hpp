@@ -68,6 +68,8 @@ private:
     glm::vec3 getGizmoPosition();  // Get position for gizmo (selection center or object origin)
     void getGizmoAxes(glm::vec3& xAxis, glm::vec3& yAxis, glm::vec3& zAxis);  // Get local/world axes
     GizmoAxis pickGizmoAxis(const glm::vec3& rayOrigin, const glm::vec3& rayDir, const glm::vec3& gizmoPos);
+    bool isOrthoEdgeMoveMode();  // Ortho + edge selection + move mode → sphere gizmo
+    void getOrthoAxes(glm::vec3& axis1, glm::vec3& axis2);  // Get 2 visible axes in ortho view
     float rayAxisDistance(const glm::vec3& rayOrigin, const glm::vec3& rayDir,
                           const glm::vec3& axisOrigin, const glm::vec3& axisDir);
     glm::vec3 projectPointOntoAxis(const glm::vec3& point, const glm::vec3& axisOrigin, const glm::vec3& axisDir);
@@ -236,6 +238,10 @@ private:
     void snapAndMergeObjects(SceneObject* srcObj, int srcFace, SceneObject* dstObj, int dstFace);
     void snapAndMergeWithVertexCorrespondence();  // Uses m_snapSrcVerts/m_snapDstVerts
     void drawSnapVertexOverlay(float vpX, float vpY, float vpW, float vpH);
+
+    // Repeat last operation (X key)
+    enum class LastOp { None, ExtrudeEdge, ExtrudeFace };
+    LastOp m_lastOp = LastOp::None;
 
     // Retopology state
     bool m_retopologyMode = false;           // Place Vertex tool active

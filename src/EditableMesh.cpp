@@ -2915,6 +2915,165 @@ void EditableMesh::extrudeSelectedFaces(float distance) {
     extrudeFaces(getSelectedFaces(), distance);
 }
 
+void EditableMesh::extrudeEdges(const std::vector<uint32_t>& halfEdgeIndices, float distance) {
+    if (halfEdgeIndices.empty()) return;
+
+    // Collect unique edge vertex pairs with their bordering face normal
+    struct EdgeInfo {
+        uint32_t v0, v1;
+        glm::vec3 faceNormal; // normal of the face this edge borders
+    };
+    std::vector<EdgeInfo> edges;
+    std::set<uint64_t> seen;
+    std::set<uint32_t> allVertIndices;
+
+    for (uint32_t heIdx : halfEdgeIndices) {
+        if (heIdx >= m_halfEdges.size()) continue;
+        auto [v0, v1] = getEdgeVertices(heIdx);
+        uint64_t key = makeEdgeKey(v0, v1);
+        if (seen.count(key)) continue;
+        seen.insert(key);
+
+        // Get the face normal from the half-edge's face (the bordering face)
+        glm::vec3 fn(0, 1, 0);
+        if (m_halfEdges[heIdx].faceIndex != UINT32_MAX) {
+            fn = getFaceNormal(m_halfEdges[heIdx].faceIndex);
+        } else {
+            uint32_t twin = m_halfEdges[heIdx].twinIndex;
+            if (twin != UINT32_MAX && m_halfEdges[twin].faceIndex != UINT32_MAX) {
+                fn = getFaceNormal(m_halfEdges[twin].faceIndex);
+            }
+        }
+
+        edges.push_back({v0, v1, fn});
+        allVertIndices.insert(v0);
+        allVertIndices.insert(v1);
+    }
+
+    if (edges.empty()) return;
+
+    // Compute per-vertex extrude direction: in the face plane, perpendicular to the edge,
+    // pointing away from the bordering face center
+    std::map<uint32_t, glm::vec3> vertexDir;
+    for (uint32_t vi : allVertIndices) {
+        vertexDir[vi] = glm::vec3(0.0f);
+    }
+
+    for (const auto& e : edges) {
+        glm::vec3 edgeDir = glm::normalize(m_vertices[e.v1].position - m_vertices[e.v0].position);
+        // Cross edge with face normal → vector in face plane, perpendicular to edge
+        glm::vec3 outward = glm::normalize(glm::cross(edgeDir, e.faceNormal));
+
+        // Make sure it points away from the face center
+        glm::vec3 edgeMid = (m_vertices[e.v0].position + m_vertices[e.v1].position) * 0.5f;
+
+        // Find the bordering face center to determine "away" direction
+        // Use the half-edge to get the face
+        uint64_t key = makeEdgeKey(e.v0, e.v1);
+        auto mapIt = m_edgeMap.find(key);
+        if (mapIt != m_edgeMap.end()) {
+            uint32_t he = mapIt->second;
+            uint32_t faceIdx = m_halfEdges[he].faceIndex;
+            if (faceIdx == UINT32_MAX) {
+                uint32_t twin = m_halfEdges[he].twinIndex;
+                if (twin != UINT32_MAX) faceIdx = m_halfEdges[twin].faceIndex;
+            }
+            if (faceIdx != UINT32_MAX) {
+                glm::vec3 fc = getFaceCenter(faceIdx);
+                // Flip if outward points toward face center
+                if (glm::dot(outward, edgeMid - fc) < 0.0f) {
+                    outward = -outward;
+                }
+            }
+        }
+
+        vertexDir[e.v0] += outward;
+        vertexDir[e.v1] += outward;
+    }
+
+    // Normalize directions
+    for (auto& [vi, dir] : vertexDir) {
+        if (glm::length(dir) > 0.0001f) {
+            dir = glm::normalize(dir);
+        } else {
+            dir = glm::vec3(0.0f, 1.0f, 0.0f);
+        }
+    }
+
+    // Create new vertices at extruded positions
+    std::map<uint32_t, uint32_t> oldToNew; // original vert index → new extruded vert index
+    for (uint32_t vi : allVertIndices) {
+        HEVertex newVert = m_vertices[vi];
+        newVert.position = m_vertices[vi].position + vertexDir[vi] * distance;
+        newVert.halfEdgeIndex = UINT32_MAX;
+        newVert.selected = false;
+        uint32_t newIdx = static_cast<uint32_t>(m_vertices.size());
+        oldToNew[vi] = newIdx;
+        m_vertices.push_back(newVert);
+    }
+
+    // Collect all existing faces
+    std::vector<std::vector<uint32_t>> allFaces;
+    for (uint32_t fi = 0; fi < static_cast<uint32_t>(m_faces.size()); fi++) {
+        allFaces.push_back(getFaceVertices(fi));
+    }
+
+    // Create quad faces connecting original edges to extruded edges
+    // Winding is chosen so the new quad's normal matches the bordering face's normal
+    for (const auto& e : edges) {
+        uint32_t nv0 = oldToNew[e.v0];
+        uint32_t nv1 = oldToNew[e.v1];
+
+        glm::vec3 p0 = m_vertices[e.v0].position;
+        glm::vec3 p1 = m_vertices[e.v1].position;
+        glm::vec3 np0 = m_vertices[nv0].position;
+
+        // Check which winding produces a normal aligned with the bordering face
+        glm::vec3 candidateNormal = glm::cross(p1 - p0, np0 - p0);
+
+        if (glm::dot(candidateNormal, e.faceNormal) >= 0.0f) {
+            allFaces.push_back({e.v0, e.v1, nv1, nv0});
+        } else {
+            allFaces.push_back({e.v0, nv0, nv1, e.v1});
+        }
+    }
+
+    // Rebuild half-edge structure
+    m_halfEdges.clear();
+    m_faces.clear();
+    m_edgeMap.clear();
+    m_selectedEdges.clear();
+
+    for (auto& v : m_vertices) {
+        v.halfEdgeIndex = UINT32_MAX;
+    }
+
+    for (const auto& fv : allFaces) {
+        addFace(fv);
+    }
+
+    linkTwinsByPosition();
+    rebuildEdgeMap();
+    recalculateNormals();
+
+    // Select the new extruded edges
+    for (const auto& e : edges) {
+        uint32_t nv0 = oldToNew[e.v0];
+        uint32_t nv1 = oldToNew[e.v1];
+        uint64_t key = makeEdgeKey(nv0, nv1);
+        auto it = m_edgeMap.find(key);
+        if (it != m_edgeMap.end()) {
+            m_selectedEdges.insert(it->second);
+            uint32_t twin = m_halfEdges[it->second].twinIndex;
+            if (twin != UINT32_MAX) m_selectedEdges.insert(twin);
+        }
+    }
+}
+
+void EditableMesh::extrudeSelectedEdges(float distance) {
+    extrudeEdges(getSelectedEdges(), distance);
+}
+
 void EditableMesh::insetSelectedFaces(float amount) {
     auto selectedFaces = getSelectedFaces();
     if (selectedFaces.empty()) return;
