@@ -55,6 +55,17 @@ void ModelingMode::drawRetopologyOverlay(float vpX, float vpY, float vpW, float 
         }
     }
 
+    // Draw scatter edges (ring connections) as green lines
+    ImU32 scatterEdgeColor = IM_COL32(0, 255, 100, 220);
+    for (const auto& edge : m_scatterEdges) {
+        if (edge.a >= m_retopologyVerts.size() || edge.b >= m_retopologyVerts.size()) continue;
+        ImVec2 a = worldToScreen(m_retopologyVerts[edge.a]);
+        ImVec2 b = worldToScreen(m_retopologyVerts[edge.b]);
+        if (a.x > -500 && b.x > -500) {
+            drawList->AddLine(a, b, scatterEdgeColor, 2.0f);
+        }
+    }
+
     // Draw existing retopo vertices — only if at least one adjacent quad faces the camera
     ImU32 existingVertColor = IM_COL32(255, 255, 0, 220);
     float existingRadius = 6.0f;
@@ -95,8 +106,8 @@ void ModelingMode::drawRetopologyOverlay(float vpX, float vpY, float vpW, float 
         }
     }
 
-    // Draw edges between consecutive placed vertices
-    if (m_retopologyVerts.size() >= 2) {
+    // Draw edges between consecutive placed vertices (only in manual placement mode, not scatter)
+    if (m_retopologyVerts.size() >= 2 && m_scatterEdges.empty()) {
         ImU32 edgeColor = IM_COL32(255, 100, 100, 200);
         for (size_t i = 0; i < m_retopologyVerts.size() - 1; ++i) {
             ImVec2 a = worldToScreen(m_retopologyVerts[i]);
@@ -111,6 +122,57 @@ void ModelingMode::drawRetopologyOverlay(float vpX, float vpY, float vpW, float 
             ImVec2 b = worldToScreen(m_retopologyVerts[0]);
             if (a.x > -500 && b.x > -500) {
                 drawList->AddLine(a, b, edgeColor, 2.0f);
+            }
+        }
+    }
+
+    // Draw ring anchor points (0, N/4, N/2, 3N/4) — ON TOP of everything
+    // Point 0 = green (right, Z=0 +X), N/4 = cyan (front, X=0 +Z),
+    // N/2 = blue (left, Z=0 -X), 3N/4 = magenta (back, X=0 -Z)
+    if (!m_scatterRings.empty()) {
+        ImU32 anchorColors[4] = {
+            IM_COL32(0, 255, 0, 255),    // 0: green (right)
+            IM_COL32(0, 255, 255, 255),  // N/4: cyan (front)
+            IM_COL32(80, 80, 255, 255),  // N/2: blue (left)
+            IM_COL32(255, 0, 255, 255),  // 3N/4: magenta (back)
+        };
+        ImU32 anchorOutline = IM_COL32(0, 0, 0, 255);
+
+        for (size_t ri = 0; ri < m_scatterRings.size(); ri++) {
+            const auto& ring = m_scatterRings[ri];
+            if (ring.count < 4 || ring.startIdx >= m_retopologyVerts.size()) continue;
+            int N = static_cast<int>(ring.count);
+            int quarter = N / 4;
+
+            for (int a = 0; a < 4; a++) {
+                int ptIdx = a * quarter;
+                if (ring.startIdx + ptIdx >= m_retopologyVerts.size()) continue;
+
+                ImVec2 sp = worldToScreen(m_retopologyVerts[ring.startIdx + ptIdx]);
+                if (sp.x <= -500) continue;
+
+                bool isSelected = (m_ringDragging && m_selectedRing == static_cast<int>(ri) && a == 0);
+                ImU32 color = isSelected ? IM_COL32(255, 255, 0, 255) : anchorColors[a];
+                float radius = (a == 0) ? 10.0f : 8.0f;
+                if (isSelected) radius = 12.0f;
+
+                drawList->AddCircleFilled(sp, radius, color);
+                drawList->AddCircle(sp, radius, anchorOutline, 0, 2.0f);
+
+                // Show XYZ only on the lead point (point 0)
+                if (a == 0) {
+                    glm::vec3 pos = m_retopologyVerts[ring.startIdx];
+                    char coordBuf[64];
+                    snprintf(coordBuf, sizeof(coordBuf), "%.3f, %.3f, %.3f", pos.x, pos.y, pos.z);
+                    ImVec2 textPos(sp.x + radius + 4, sp.y - 6);
+                    ImU32 textBg = IM_COL32(0, 0, 0, 180);
+                    ImVec2 textSize = ImGui::CalcTextSize(coordBuf);
+                    drawList->AddRectFilled(
+                        ImVec2(textPos.x - 2, textPos.y - 1),
+                        ImVec2(textPos.x + textSize.x + 2, textPos.y + textSize.y + 1),
+                        textBg, 2.0f);
+                    drawList->AddText(textPos, color, coordBuf);
+                }
             }
         }
     }
@@ -228,12 +290,79 @@ void ModelingMode::finalizeRetopologyMesh() {
         quadIndices.push_back(faceIndices);
     }
 
+    // Assign cylindrical UVs using scatter ring topology if available.
+    // Seam along -X anchor points (index N/2 per ring).
+    // U = position around ring starting from seam, V = ring level bottom to top.
+    std::unordered_map<uint32_t, glm::vec2> vertexUVs;
+    bool hasRingUVs = false;
+
+    if (!m_scatterRings.empty()) {
+        int numRings = static_cast<int>(m_scatterRings.size());
+        // Check if we have pole points
+        bool hasBottomPole = (m_bottomPoleIdx != SIZE_MAX && m_bottomPoleIdx < m_retopologyVerts.size());
+        bool hasTopPole = (m_topPoleIdx != SIZE_MAX && m_topPoleIdx < m_retopologyVerts.size());
+
+        for (int ri = 0; ri < numRings; ri++) {
+            const auto& ring = m_scatterRings[ri];
+            int N = static_cast<int>(ring.count);
+            int seamIdx = N / 2;  // -X anchor point = seam
+
+            // V = ring level (0 = bottom, 1 = top)
+            // Leave room for poles at V=0 and V=1
+            float v = (hasBottomPole ? 0.02f : 0.0f) +
+                      (static_cast<float>(ri) / std::max(1, numRings - 1)) *
+                      (1.0f - (hasBottomPole ? 0.02f : 0.0f) - (hasTopPole ? 0.02f : 0.0f));
+
+            for (int pi = 0; pi < N; pi++) {
+                // U starts from the seam (N/2), wraps around
+                int offsetFromSeam = ((pi - seamIdx) + N) % N;
+                float u = static_cast<float>(offsetFromSeam) / N;
+
+                // Find which unique vertex this scatter point maps to
+                glm::vec3 pos = m_retopologyVerts[ring.startIdx + pi];
+                for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
+                    if (glm::length(uniquePositions[vi] - pos) < mergeThreshold) {
+                        vertexUVs[vi] = glm::vec2(u, v);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Pole UVs
+        if (hasBottomPole) {
+            glm::vec3 polePos = m_retopologyVerts[m_bottomPoleIdx];
+            for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
+                if (glm::length(uniquePositions[vi] - polePos) < mergeThreshold) {
+                    vertexUVs[vi] = glm::vec2(0.5f, 0.0f);
+                    break;
+                }
+            }
+        }
+        if (hasTopPole) {
+            glm::vec3 polePos = m_retopologyVerts[m_topPoleIdx];
+            for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
+                if (glm::length(uniquePositions[vi] - polePos) < mergeThreshold) {
+                    vertexUVs[vi] = glm::vec2(0.5f, 1.0f);
+                    break;
+                }
+            }
+        }
+
+        hasRingUVs = !vertexUVs.empty();
+        if (hasRingUVs) {
+            std::cout << "[Retopo] Assigned cylindrical UVs from ring topology ("
+                      << vertexUVs.size() << " verts, seam at -X)" << std::endl;
+        }
+    }
+
     // Add vertices to the fresh mesh
-    for (const auto& pos : uniquePositions) {
+    for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
         HEVertex v;
-        v.position = pos;
+        v.position = uniquePositions[vi];
         v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
-        v.uv = glm::vec2(0.0f);
+        auto uvIt = vertexUVs.find(vi);
+        v.uv = (uvIt != vertexUVs.end()) ? uvIt->second : glm::vec2(0.0f);
         v.color = glm::vec4(0.7f, 0.7f, 0.7f, 1.0f);
         v.halfEdgeIndex = UINT32_MAX;
         v.selected = false;

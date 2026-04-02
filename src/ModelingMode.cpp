@@ -1451,6 +1451,39 @@ void ModelingMode::renderModelingEditorUI() {
                     ImGui::SetTooltip("Project a quad grid from current view onto the live surface");
                 }
 
+                // Scatter Points — evenly spaced retopo vertices on surface
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Scatter Points");
+                ImGui::Separator();
+                ImGui::SliderFloat("Spacing (cm)", &m_scatterSpacing, 1.0f, 50.0f, "%.1f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Distance between points in centimeters.\nSmaller = more points, denser coverage.");
+                }
+                if (ImGui::Button("Scatter Points On Surface")) {
+                    scatterPointsOnSurface();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Place evenly spaced retopo vertices across the entire live surface");
+                }
+
+                if (m_scatterRings.empty()) ImGui::BeginDisabled();
+                if (ImGui::Button("Connect Rings")) {
+                    connectScatterRings();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Horizontal: connect points within each ring loop");
+                }
+                if (m_scatterRings.empty()) ImGui::EndDisabled();
+
+                if (m_scatterRings.size() < 2) ImGui::BeginDisabled();
+                if (ImGui::Button("Connect Vertical")) {
+                    connectScatterVertical();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Vertical: connect matching indices between rings + create quads");
+                }
+                if (m_scatterRings.size() < 2) ImGui::EndDisabled();
+
                 // Patch Blanket — targeted rectangle into retopo quads
                 ImGui::Spacing();
                 if (m_patchBlanketMode) {
@@ -2749,6 +2782,15 @@ void ModelingMode::renderModelingEditorUI() {
                 m_ctx.editableMesh.flipSelectedNormals();
                 m_ctx.meshDirty = true;
             }
+        }
+
+        if (ImGui::Button("Make Normals Consistent")) {
+            m_ctx.editableMesh.saveState();
+            m_ctx.editableMesh.makeNormalsConsistent();
+            m_ctx.meshDirty = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Flood-fill to make all faces wind the same way.\nPress once = consistent. Press again = all flipped.");
         }
 
         if (ImGui::Button("Inset (I)")) {
@@ -4375,11 +4417,16 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
             for (SceneObject* obj : m_ctx.selectedObjects) {
                 m_ctx.pendingDeletions.push_back(obj);
             }
-            // Clear selection
+            // Clear selection and wireframe cache
             m_ctx.selectedObject = nullptr;
             m_ctx.selectedObjects.clear();
             m_ctx.editableMesh.clear();
             m_ctx.meshDirty = false;
+            m_cachedWireLines.clear();
+            m_cachedSelectedLines.clear();
+            m_cachedNormalVerts.clear();
+            m_cachedSelectedVerts.clear();
+            m_cachedHoveredVerts.clear();
             std::cout << "[Delete] Queued " << m_ctx.pendingDeletions.size() << " object(s) for deletion" << std::endl;
             return;  // Don't process further input after deletion
         } else if (m_ctx.selectedObject) {
@@ -4389,6 +4436,11 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
             m_ctx.selectedObjects.clear();
             m_ctx.editableMesh.clear();
             m_ctx.meshDirty = false;
+            m_cachedWireLines.clear();
+            m_cachedSelectedLines.clear();
+            m_cachedNormalVerts.clear();
+            m_cachedSelectedVerts.clear();
+            m_cachedHoveredVerts.clear();
             std::cout << "[Delete] Queued 1 object for deletion" << std::endl;
             return;  // Don't process further input after deletion
         }
@@ -5438,9 +5490,69 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         }
     }
 
+    // Scatter ring slide: G near a green dot → drag left/right to slide points along contour
+    if (m_retopologyMode && !m_scatterRings.empty() && !m_ringDragging && !mouseOverImGui
+        && Input::isKeyPressed(Input::KEY_G)) {
+        Camera& rcam = m_ctx.getActiveCamera();
+        glm::mat4 rcVP = rcam.getProjectionMatrix(
+            static_cast<float>(m_ctx.window.getWidth()) / static_cast<float>(m_ctx.window.getHeight()))
+            * rcam.getViewMatrix();
+        float rVpW = static_cast<float>(m_ctx.window.getWidth());
+        float rVpH = static_cast<float>(m_ctx.window.getHeight());
+        ImVec2 rMouse = ImGui::GetMousePos();
+
+        float closestDist = 30.0f;
+        int closestRing = -1;
+        for (size_t ri = 0; ri < m_scatterRings.size(); ri++) {
+            if (m_scatterRings[ri].count < 1) continue;
+            glm::vec3 pos = m_retopologyVerts[m_scatterRings[ri].startIdx];
+            glm::vec4 clip = rcVP * glm::vec4(pos, 1.0f);
+            if (clip.w <= 0.0f) continue;
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            glm::vec2 sp((ndc.x + 1.0f) * 0.5f * rVpW, (1.0f - ndc.y) * 0.5f * rVpH);
+            float d = glm::length(sp - glm::vec2(rMouse.x, rMouse.y));
+            if (d < closestDist) { closestDist = d; closestRing = static_cast<int>(ri); }
+        }
+        if (closestRing >= 0) {
+            m_ringDragging = true;
+            m_selectedRing = closestRing;
+            m_ringDragStartX = rMouse.x;
+            m_ringDragStartOffset = m_scatterRings[closestRing].slideOffset;
+            m_scatterEdges.clear();
+            m_retopologyQuads.clear();
+            std::cout << "[Scatter] Grabbed ring " << closestRing
+                      << " — drag left/right to slide, LMB to confirm, ESC to cancel" << std::endl;
+        }
+    }
+
+    if (m_ringDragging && m_selectedRing >= 0 && m_selectedRing < static_cast<int>(m_scatterRings.size())) {
+        ImVec2 rMouse = ImGui::GetMousePos();
+        float dx = rMouse.x - m_ringDragStartX;
+
+        // Convert pixel drag to contour distance (scale by contour length / screen width)
+        auto& ring = m_scatterRings[m_selectedRing];
+        float sensitivity = ring.totalLen / static_cast<float>(m_ctx.window.getWidth());
+        ring.slideOffset = m_ringDragStartOffset + dx * sensitivity;
+
+        // Re-place all points along the contour at new positions
+        resampleRing(static_cast<size_t>(m_selectedRing));
+
+        if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
+            std::cout << "[Scatter] Ring " << m_selectedRing << " slide confirmed (offset=" << ring.slideOffset << ")" << std::endl;
+            m_ringDragging = false;
+        }
+
+        if (Input::isKeyPressed(Input::KEY_ESCAPE)) {
+            ring.slideOffset = m_ringDragStartOffset;
+            resampleRing(static_cast<size_t>(m_selectedRing));
+            std::cout << "[Scatter] Ring slide cancelled" << std::endl;
+            m_ringDragging = false;
+        }
+    }
+
     // Retopology: G key grab — press G near a vertex to grab it, move mouse to slide on surface,
     // LMB to confirm, ESC to cancel
-    if (m_retopologyMode && m_retopologyLiveObj && !m_retopologyQuads.empty()) {
+    if (m_retopologyMode && m_retopologyLiveObj && !m_retopologyQuads.empty() && !m_ringDragging) {
         if (!m_retopologyDragging && Input::isKeyPressed(Input::KEY_G)) {
             // Start grab: find nearest retopo vertex under cursor (screen-space)
             glm::vec3 rayOrigin, rayDir;
@@ -9011,8 +9123,9 @@ void ModelingMode::drawReferenceImages(Camera& camera, float vpX, float vpY, flo
         screenCorners[i].y = vpY + (1.0f - (ndc.y * 0.5f + 0.5f)) * vpH;
     }
 
-    // Draw the image using ImGui
+    // Draw the image using ImGui, clipped to viewport bounds
     ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    drawList->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
     ImU32 tintColor = IM_COL32(255, 255, 255, static_cast<int>(ref.opacity * 255));
 
     drawList->AddImageQuad(
@@ -9021,6 +9134,7 @@ void ModelingMode::drawReferenceImages(Camera& camera, float vpX, float vpY, flo
         ImVec2(0, 1), ImVec2(1, 1), ImVec2(1, 0), ImVec2(0, 0),
         tintColor
     );
+    drawList->PopClipRect();
 }
 
 // UV helper implementations

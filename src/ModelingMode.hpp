@@ -227,7 +227,14 @@ private:
     size_t m_cachedSelectedEdgeCount = 0;
     size_t m_cachedSelectedVertCount = 0;
     ModelingSelectionMode m_cachedSelectionMode = ModelingSelectionMode::Face;
-    void invalidateWireframeCache() { m_wireframeDirty = true; }
+    void invalidateWireframeCache() {
+        m_wireframeDirty = true;
+        m_cachedWireLines.clear();
+        m_cachedSelectedLines.clear();
+        m_cachedNormalVerts.clear();
+        m_cachedSelectedVerts.clear();
+        m_cachedHoveredVerts.clear();
+    }
 
     // Snap helper methods
     void cancelSnapMode();
@@ -271,6 +278,32 @@ private:
     void autoRetopology();           // Auto-retopo from live surface
     int m_autoRetopResolution = 32;
     int m_autoRetopSmoothIter = 5;
+
+    // Scatter points on surface (evenly spaced retopo vertices)
+    void scatterPointsOnSurface();
+    void connectScatterRings();    // Horizontal: connect points within each ring
+    void connectScatterVertical(); // Vertical: connect matching indices between adjacent rings + quads
+    float m_scatterSpacing = 5.0f;  // cm
+    struct ScatterRing {
+        size_t startIdx;  // index into m_retopologyVerts
+        size_t count;     // number of points in this ring
+        // Stored contour path for sliding
+        std::vector<glm::vec3> contourPts;
+        std::vector<glm::vec3> contourNrms;
+        std::vector<float> cumDist;  // cumulative distance along contour
+        float totalLen = 0.0f;
+        float slideOffset = 0.0f;  // current slide offset in distance units
+    };
+    std::vector<ScatterRing> m_scatterRings;
+    struct ScatterEdge { size_t a, b; };
+    std::vector<ScatterEdge> m_scatterEdges;
+    size_t m_bottomPoleIdx = SIZE_MAX;
+    size_t m_topPoleIdx = SIZE_MAX;
+    int m_selectedRing = -1;
+    bool m_ringDragging = false;
+    float m_ringDragStartX = 0.0f;
+    float m_ringDragStartOffset = 0.0f;  // slideOffset when drag started
+    void resampleRing(size_t ringIdx);    // Re-place points along stored contour at current slideOffset
 
     // Quad blanket retopology (view-based grid projection)
     void quadBlanketRetopology();

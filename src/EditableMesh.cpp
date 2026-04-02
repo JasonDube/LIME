@@ -4150,6 +4150,101 @@ void EditableMesh::flipSelectedNormals() {
     }
 }
 
+void EditableMesh::makeNormalsConsistent() {
+    if (m_faces.empty()) return;
+
+    uint32_t faceCount = static_cast<uint32_t>(m_faces.size());
+
+    // Step 1: compute average normal direction
+    glm::vec3 avgNormal(0.0f);
+    for (uint32_t fi = 0; fi < faceCount; fi++) {
+        avgNormal += getFaceNormal(fi);
+    }
+    float avgLen = glm::length(avgNormal);
+    std::cout << "[Normals] " << faceCount << " faces, avg normal length=" << avgLen << std::endl;
+
+    if (avgLen < 0.001f) {
+        // Can't determine majority — just flip all as a toggle
+        std::cout << "[Normals] Average ~zero, flipping ALL faces" << std::endl;
+        std::vector<std::vector<uint32_t>> allFaceVerts(faceCount);
+        for (uint32_t fi = 0; fi < faceCount; fi++) {
+            allFaceVerts[fi] = getFaceVertices(fi);
+            std::reverse(allFaceVerts[fi].begin(), allFaceVerts[fi].end());
+        }
+        m_halfEdges.clear(); m_faces.clear(); m_edgeMap.clear(); m_selectedEdges.clear();
+        for (auto& v : m_vertices) v.halfEdgeIndex = UINT32_MAX;
+        for (const auto& fv : allFaceVerts) addFace(fv);
+        linkTwinsByPosition(); rebuildEdgeMap(); recalculateNormals();
+        return;
+    }
+    avgNormal = glm::normalize(avgNormal);
+
+    // Step 2: count how many agree vs disagree with average
+    int aligned = 0, opposed = 0;
+    for (uint32_t fi = 0; fi < faceCount; fi++) {
+        float d = glm::dot(getFaceNormal(fi), avgNormal);
+        if (d > 0.0f) aligned++;
+        else opposed++;
+    }
+    std::cout << "[Normals] Aligned with majority: " << aligned << ", opposed: " << opposed << std::endl;
+
+    if (opposed == 0) {
+        // Already unanimous — flip all to toggle
+        std::cout << "[Normals] Already unanimous — flipping ALL" << std::endl;
+        std::vector<std::vector<uint32_t>> allFaceVerts(faceCount);
+        for (uint32_t fi = 0; fi < faceCount; fi++) {
+            allFaceVerts[fi] = getFaceVertices(fi);
+            std::reverse(allFaceVerts[fi].begin(), allFaceVerts[fi].end());
+        }
+        m_halfEdges.clear(); m_faces.clear(); m_edgeMap.clear(); m_selectedEdges.clear();
+        for (auto& v : m_vertices) v.halfEdgeIndex = UINT32_MAX;
+        for (const auto& fv : allFaceVerts) addFace(fv);
+        linkTwinsByPosition(); rebuildEdgeMap(); recalculateNormals();
+        return;
+    }
+
+    // Iterate until all faces agree (flipping minority shifts the average, may need multiple passes)
+    int totalFlipped = 0;
+    for (int pass = 0; pass < 20; pass++) {  // max 20 passes as safety
+        avgNormal = glm::vec3(0.0f);
+        for (uint32_t fi = 0; fi < faceCount; fi++) avgNormal += getFaceNormal(fi);
+        if (glm::length(avgNormal) < 0.001f) break;
+        avgNormal = glm::normalize(avgNormal);
+
+        aligned = 0; opposed = 0;
+        for (uint32_t fi = 0; fi < faceCount; fi++) {
+            if (glm::dot(getFaceNormal(fi), avgNormal) > 0.0f) aligned++; else opposed++;
+        }
+
+        if (opposed == 0) break;  // All consistent
+
+        // Flip minority
+        std::vector<std::vector<uint32_t>> allFaceVerts(faceCount);
+        int flipped = 0;
+        for (uint32_t fi = 0; fi < faceCount; fi++) {
+            allFaceVerts[fi] = getFaceVertices(fi);
+            if (glm::dot(getFaceNormal(fi), avgNormal) < 0.0f) {
+                std::reverse(allFaceVerts[fi].begin(), allFaceVerts[fi].end());
+                flipped++;
+            }
+        }
+        totalFlipped += flipped;
+
+        // Rebuild
+        m_halfEdges.clear(); m_faces.clear(); m_edgeMap.clear(); m_selectedEdges.clear();
+        for (auto& v : m_vertices) v.halfEdgeIndex = UINT32_MAX;
+        for (const auto& fv : allFaceVerts) addFace(fv);
+        linkTwinsByPosition(); rebuildEdgeMap(); recalculateNormals();
+
+        std::cout << "[Normals] Pass " << (pass + 1) << ": flipped " << flipped
+                  << " (aligned=" << aligned << " opposed=" << opposed << ")" << std::endl;
+
+        if (flipped == 0) break;  // Nothing changed
+    }
+
+    std::cout << "[Normals] Done: total flipped " << totalFlipped << " / " << faceCount << std::endl;
+}
+
 void EditableMesh::catmullClarkSubdivide(int levels) {
     if (m_faces.empty() || m_vertices.empty()) return;
     levels = std::max(1, std::min(levels, 3));

@@ -227,7 +227,8 @@ GizmoAxis ModelingMode::pickGizmoAxis(const glm::vec3& rayOrigin, const glm::vec
 
     // Ortho edge move: check if near the sphere
     if (isOrthoEdgeMoveMode()) {
-        float sphereRadius = m_ctx.gizmoSize * 0.15f;
+        float orthoSize = m_ctx.getActiveCamera().getOrthoSize();
+        float sphereRadius = orthoSize * 0.02f;
         glm::vec3 toGizmo = gizmoPos - rayOrigin;
         float t = glm::dot(toGizmo, rayDir);
         if (t > 0) {
@@ -861,7 +862,8 @@ void ModelingMode::renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj) {
 
     // Ortho edge move: draw a small sphere instead of arrows
     if (isOrthoEdgeMoveMode()) {
-        float sphereRadius = size * 0.15f;
+        float orthoSize = m_ctx.getActiveCamera().getOrthoSize();
+        float sphereRadius = orthoSize * 0.02f;
         bool hovered = (m_ctx.gizmoHoveredAxis == GizmoAxis::OrthoFree || m_ctx.gizmoActiveAxis == GizmoAxis::OrthoFree);
         glm::vec3 sphereColor = hovered ? glm::vec3(1.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 1.0f, 1.0f);
 

@@ -1445,3 +1445,685 @@ void ModelingMode::executePatchBlanket() {
     std::cout << "[PatchBlanket] Done! Added " << addedQuads << " quads to retopo accumulator (total: "
               << m_retopologyQuads.size() << ")" << std::endl;
 }
+
+void ModelingMode::scatterPointsOnSurface() {
+    if (!m_retopologyLiveObj || !m_retopologyLiveObj->hasMeshData()) {
+        std::cout << "[Scatter] No live object set" << std::endl;
+        return;
+    }
+
+    float spacing = m_scatterSpacing * 0.01f;  // cm → model units (1 unit = 1m)
+    if (spacing < 0.001f) spacing = 0.001f;
+
+    const auto& verts = m_retopologyLiveObj->getVertices();
+    const auto& indices = m_retopologyLiveObj->getIndices();
+    glm::mat4 modelMat = m_retopologyLiveObj->getTransform().getMatrix();
+    glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(modelMat)));
+
+    // Transform all vertices and normals to world space
+    struct WVert { glm::vec3 pos, nrm; };
+    std::vector<WVert> worldVerts(verts.size());
+    for (size_t i = 0; i < verts.size(); i++) {
+        worldVerts[i].pos = glm::vec3(modelMat * glm::vec4(verts[i].position, 1.0f));
+        worldVerts[i].nrm = glm::normalize(normalMat * verts[i].normal);
+    }
+
+    // Find bounding box and global center for consistent ring alignment
+    glm::vec3 bmin(FLT_MAX), bmax(-FLT_MAX);
+    glm::vec3 globalCenter(0.0f);
+    for (const auto& wv : worldVerts) {
+        bmin = glm::min(bmin, wv.pos);
+        bmax = glm::max(bmax, wv.pos);
+        globalCenter += wv.pos;
+    }
+    globalCenter /= static_cast<float>(worldVerts.size());
+    float minY = bmin.y, maxY = bmax.y;
+
+    // Clear existing retopo verts and ring info (keep existing quads)
+    m_scatterRings.clear();
+    m_scatterEdges.clear();
+    m_retopologyVerts.clear();
+    m_retopologyNormals.clear();
+    m_retopologyVertMeshIdx.clear();
+
+    int totalPoints = 0;
+    int ringCount = 0;
+    int targetPointCount = -1;  // Set by first valid ring, then forced on all subsequent rings
+
+    // Slice from bottom to top at spacing intervals
+    for (float sliceY = minY + spacing * 0.5f; sliceY < maxY; sliceY += spacing) {
+
+        // ── Intersect all triangles with horizontal plane Y = sliceY ──
+        struct Segment { glm::vec3 a, b; glm::vec3 na, nb; };
+        std::vector<Segment> segments;
+
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            const glm::vec3& p0 = worldVerts[indices[i]].pos;
+            const glm::vec3& p1 = worldVerts[indices[i + 1]].pos;
+            const glm::vec3& p2 = worldVerts[indices[i + 2]].pos;
+            const glm::vec3& n0 = worldVerts[indices[i]].nrm;
+            const glm::vec3& n1 = worldVerts[indices[i + 1]].nrm;
+            const glm::vec3& n2 = worldVerts[indices[i + 2]].nrm;
+
+            // Classify vertices relative to the plane
+            float d0 = p0.y - sliceY;
+            float d1 = p1.y - sliceY;
+            float d2 = p2.y - sliceY;
+
+            // Count how many are above/below (with small epsilon)
+            const float eps = 1e-6f;
+            int above = (d0 > eps ? 1 : 0) + (d1 > eps ? 1 : 0) + (d2 > eps ? 1 : 0);
+            int below = (d0 < -eps ? 1 : 0) + (d1 < -eps ? 1 : 0) + (d2 < -eps ? 1 : 0);
+
+            // Need vertices on both sides for an intersection
+            if (above == 0 || below == 0) continue;
+
+            // Find the two intersection points on edges that cross the plane
+            glm::vec3 pts[3] = {p0, p1, p2};
+            glm::vec3 nrms[3] = {n0, n1, n2};
+            float dists[3] = {d0, d1, d2};
+            glm::vec3 hitPos[2];
+            glm::vec3 hitNrm[2];
+            int hitCount = 0;
+
+            for (int e = 0; e < 3 && hitCount < 2; e++) {
+                int ea = e, eb = (e + 1) % 3;
+                if ((dists[ea] > eps && dists[eb] < -eps) || (dists[ea] < -eps && dists[eb] > eps)) {
+                    float t = dists[ea] / (dists[ea] - dists[eb]);
+                    hitPos[hitCount] = pts[ea] + (pts[eb] - pts[ea]) * t;
+                    hitNrm[hitCount] = glm::normalize(nrms[ea] + (nrms[eb] - nrms[ea]) * t);
+                    hitCount++;
+                }
+            }
+
+            if (hitCount == 2) {
+                segments.push_back({hitPos[0], hitPos[1], hitNrm[0], hitNrm[1]});
+            }
+        }
+
+        if (segments.empty()) continue;
+
+        // ── Chain segments into contour loops ──
+        // Compute average segment length for weld tolerance
+        float avgSegLen = 0.0f;
+        for (const auto& seg : segments) avgSegLen += glm::length(seg.b - seg.a);
+        avgSegLen /= std::max(1.0f, static_cast<float>(segments.size()));
+        float weldDist = avgSegLen * 1.5f;  // Generous: 1.5x average segment length
+
+        std::vector<bool> used(segments.size(), false);
+
+        // Collect ALL contour loops at this height
+        struct ContourLoop {
+            std::vector<glm::vec3> pts;
+            std::vector<glm::vec3> nrms;
+            float length = 0.0f;
+        };
+        std::vector<ContourLoop> allLoops;
+
+        while (true) {
+            int startIdx = -1;
+            for (size_t s = 0; s < segments.size(); s++) {
+                if (!used[s]) { startIdx = static_cast<int>(s); break; }
+            }
+            if (startIdx < 0) break;
+
+            ContourLoop loop;
+            used[startIdx] = true;
+            loop.pts.push_back(segments[startIdx].a);
+            loop.pts.push_back(segments[startIdx].b);
+            loop.nrms.push_back(segments[startIdx].na);
+            loop.nrms.push_back(segments[startIdx].nb);
+
+            bool extended = true;
+            while (extended) {
+                extended = false;
+                glm::vec3 tail = loop.pts.back();
+                float bestDist = weldDist;
+                int bestSeg = -1;
+                bool bestFlip = false;
+                for (size_t s = 0; s < segments.size(); s++) {
+                    if (used[s]) continue;
+                    float da = glm::length(segments[s].a - tail);
+                    float db = glm::length(segments[s].b - tail);
+                    if (da < bestDist) { bestDist = da; bestSeg = static_cast<int>(s); bestFlip = false; }
+                    if (db < bestDist) { bestDist = db; bestSeg = static_cast<int>(s); bestFlip = true; }
+                }
+                if (bestSeg >= 0) {
+                    used[bestSeg] = true;
+                    if (bestFlip) {
+                        loop.pts.push_back(segments[bestSeg].a);
+                        loop.nrms.push_back(segments[bestSeg].na);
+                    } else {
+                        loop.pts.push_back(segments[bestSeg].b);
+                        loop.nrms.push_back(segments[bestSeg].nb);
+                    }
+                    extended = true;
+                }
+            }
+
+            // Compute loop length
+            for (size_t p = 1; p < loop.pts.size(); p++)
+                loop.length += glm::length(loop.pts[p] - loop.pts[p - 1]);
+
+            if (loop.pts.size() >= 3 && loop.length > spacing)
+                allLoops.push_back(std::move(loop));
+        }
+
+        if (allLoops.empty()) continue;
+
+        // Pick the LONGEST loop — that's the outer surface shell
+        size_t longestIdx = 0;
+        for (size_t li = 1; li < allLoops.size(); li++) {
+            if (allLoops[li].length > allLoops[longestIdx].length)
+                longestIdx = li;
+        }
+
+        std::vector<glm::vec3> contourPts = std::move(allLoops[longestIdx].pts);
+        std::vector<glm::vec3> contourNrms = std::move(allLoops[longestIdx].nrms);
+
+            // ── Ensure consistent winding (counterclockwise on XZ plane viewed from +Y) ──
+            // Compute signed area on XZ plane. If negative, reverse the contour.
+            {
+                float signedArea = 0.0f;
+                for (size_t p = 0; p < contourPts.size(); p++) {
+                    size_t pNext = (p + 1) % contourPts.size();
+                    signedArea += (contourPts[pNext].x - contourPts[p].x) *
+                                  (contourPts[pNext].z + contourPts[p].z);
+                }
+                if (signedArea > 0.0f) {
+                    // Clockwise — reverse to counterclockwise
+                    std::reverse(contourPts.begin(), contourPts.end());
+                    std::reverse(contourNrms.begin(), contourNrms.end());
+                }
+            }
+
+            // ── Find where contour crosses the sagittal plane ──
+            // Sagittal plane: Z = 0 (world origin, model centered on origin).
+            // Find crossing on the +X side (right ear area) to avoid mouth interior.
+            float planeZ = 0.0f;
+            int crossSeg = -1;
+            float crossT = 0.0f;
+            for (size_t p = 0; p < contourPts.size(); p++) {
+                size_t pNext = (p + 1) % contourPts.size();
+                float z0 = contourPts[p].z - planeZ;
+                float z1 = contourPts[pNext].z - planeZ;
+                // Look for sign change (crossing the sagittal plane)
+                if ((z0 <= 0.0f && z1 > 0.0f) || (z0 >= 0.0f && z1 < 0.0f)) {
+                    float t = z0 / (z0 - z1);
+                    glm::vec3 crossPt = contourPts[p] + (contourPts[pNext] - contourPts[p]) * t;
+                    // Must be on the +X side (right side of model)
+                    if (crossPt.x >= 0.0f) {
+                        crossSeg = static_cast<int>(p);
+                        crossT = t;
+                        break;
+                    }
+                }
+            }
+            // Fallback: if no +X crossing found, try any crossing
+            if (crossSeg < 0) {
+                for (size_t p = 0; p < contourPts.size(); p++) {
+                    size_t pNext = (p + 1) % contourPts.size();
+                    float z0 = contourPts[p].z - planeZ;
+                    float z1 = contourPts[pNext].z - planeZ;
+                    if ((z0 <= 0.0f && z1 > 0.0f) || (z0 >= 0.0f && z1 < 0.0f)) {
+                        crossSeg = static_cast<int>(p);
+                        crossT = z0 / (z0 - z1);
+                        break;
+                    }
+                }
+            }
+
+            // Rotate contour so the crossing point segment is at the start
+            // Insert the exact crossing point as the new start
+            if (crossSeg >= 0) {
+                size_t pNext = (crossSeg + 1) % contourPts.size();
+                glm::vec3 crossPt = contourPts[crossSeg] + (contourPts[pNext] - contourPts[crossSeg]) * crossT;
+                glm::vec3 crossNm = glm::normalize(contourNrms[crossSeg] * (1.0f - crossT) + contourNrms[pNext] * crossT);
+
+                // Rebuild contour starting from the crossing point
+                std::vector<glm::vec3> newPts;
+                std::vector<glm::vec3> newNrms;
+                newPts.push_back(crossPt);
+                newNrms.push_back(crossNm);
+                // Walk from the segment after the crossing
+                for (size_t k = 1; k <= contourPts.size(); k++) {
+                    size_t idx = (crossSeg + k) % contourPts.size();
+                    newPts.push_back(contourPts[idx]);
+                    newNrms.push_back(contourNrms[idx]);
+                }
+                // Close back to the crossing point
+                newPts.push_back(crossPt);
+                newNrms.push_back(crossNm);
+
+                contourPts = newPts;
+                contourNrms = newNrms;
+            }
+
+            // ── Compute total contour length ──
+            float totalLen = 0.0f;
+            for (size_t p = 1; p < contourPts.size(); p++) {
+                totalLen += glm::length(contourPts[p] - contourPts[p - 1]);
+            }
+            if (totalLen < spacing) continue;  // Skip tiny contours
+
+            // ── Determine point count for this ring (divisible by 4) ──
+            int pointsOnRing;
+            if (targetPointCount < 0) {
+                pointsOnRing = std::max(4, static_cast<int>(std::round(totalLen / spacing)));
+                // Round up to nearest multiple of 4
+                if (pointsOnRing % 4 != 0) pointsOnRing += (4 - pointsOnRing % 4);
+                targetPointCount = pointsOnRing;
+            } else {
+                pointsOnRing = targetPointCount;
+            }
+
+            // ── Distribute pointsOnRing points evenly along the contour ──
+            // Point 0 is at the plane crossing (contourPts[0])
+            float stepDist = totalLen / pointsOnRing;
+
+            std::vector<float> cumDist(contourPts.size(), 0.0f);
+            for (size_t p = 1; p < contourPts.size(); p++) {
+                cumDist[p] = cumDist[p - 1] + glm::length(contourPts[p] - contourPts[p - 1]);
+            }
+
+            size_t ringStartIdx = m_retopologyVerts.size();
+
+            for (int pi = 0; pi < pointsOnRing; pi++) {
+                float targetDist = pi * stepDist;
+
+                size_t seg = 0;
+                for (size_t s = 1; s < contourPts.size(); s++) {
+                    if (cumDist[s] >= targetDist) { seg = s - 1; break; }
+                    seg = s - 1;
+                }
+                if (seg + 1 >= contourPts.size()) seg = contourPts.size() - 2;
+
+                float segStart = cumDist[seg];
+                float segEnd = cumDist[seg + 1];
+                float segLen = segEnd - segStart;
+                float t = (segLen > 1e-7f) ? (targetDist - segStart) / segLen : 0.0f;
+                t = std::max(0.0f, std::min(1.0f, t));
+
+                glm::vec3 pt = contourPts[seg] + (contourPts[seg + 1] - contourPts[seg]) * t;
+                glm::vec3 nm = glm::normalize(contourNrms[seg] * (1.0f - t) + contourNrms[seg + 1] * t);
+
+                m_retopologyVerts.push_back(pt);
+                m_retopologyNormals.push_back(nm);
+                m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+                totalPoints++;
+            }
+
+            // Record ring with its contour path for later sliding
+            size_t ringPtCount = m_retopologyVerts.size() - ringStartIdx;
+            if (ringPtCount >= 3) {
+                ScatterRing ring;
+                ring.startIdx = ringStartIdx;
+                ring.count = ringPtCount;
+                ring.contourPts = contourPts;
+                ring.contourNrms = contourNrms;
+                ring.totalLen = totalLen;
+                ring.cumDist = cumDist;
+                ring.slideOffset = 0.0f;
+                m_scatterRings.push_back(std::move(ring));
+            }
+
+            ringCount++;
+    }
+
+    // ── Slide each ring so its start point lands on Z=0, +X side ──
+    // Walk each ring's stored contour, find the distance where Z crosses 0
+    // on the +X side, set that as the slideOffset, resample.
+    for (size_t ri = 0; ri < m_scatterRings.size(); ri++) {
+        auto& ring = m_scatterRings[ri];
+        if (ring.contourPts.size() < 3) continue;
+
+        // Walk the contour to find where Z crosses 0 on the +X side
+        float bestCrossDist = -1.0f;
+        for (size_t p = 0; p < ring.contourPts.size() - 1; p++) {
+            float z0 = ring.contourPts[p].z;
+            float z1 = ring.contourPts[p + 1].z;
+
+            // Sign change = crossing Z=0
+            if ((z0 <= 0.0f && z1 > 0.0f) || (z0 >= 0.0f && z1 < 0.0f)) {
+                float t = z0 / (z0 - z1);
+                glm::vec3 crossPt = ring.contourPts[p] + (ring.contourPts[p + 1] - ring.contourPts[p]) * t;
+
+                // Must be on +X side
+                if (crossPt.x >= 0.0f) {
+                    float crossDist = ring.cumDist[p] + t * (ring.cumDist[p + 1] - ring.cumDist[p]);
+                    bestCrossDist = crossDist;
+                    break;
+                }
+            }
+        }
+
+        if (bestCrossDist >= 0.0f) {
+            ring.slideOffset = bestCrossDist;
+            resampleRing(ri);
+        }
+    }
+
+    std::cout << "[Scatter] Slid " << m_scatterRings.size() << " rings to Z=0 seam" << std::endl;
+
+    // ── Level 1 Refinement: lock quarter-points to axis crossings ──
+    // Point 0 is already at Z=0 +X (right side).
+    // Now lock: N/4 → X=0 +Z (front), N/2 → Z=0 -X (left), 3N/4 → X=0 -Z (back)
+    // Then redistribute in-between points evenly within each quarter-arc.
+    for (size_t ri = 0; ri < m_scatterRings.size(); ri++) {
+        auto& ring = m_scatterRings[ri];
+        if (ring.contourPts.size() < 3 || ring.totalLen < 0.001f) continue;
+        int N = static_cast<int>(ring.count);
+        if (N < 4 || N % 2 != 0) continue;
+
+        int quarter = N / 4;
+
+        // Find contour distances for the 4 axis crossings
+        // We need: Z=0 +X (already have as slideOffset), X=0 +Z, Z=0 -X, X=0 -Z
+        struct AxisCross { float dist; };
+        float crossDists[4];
+        crossDists[0] = ring.slideOffset;  // Already computed: Z=0 +X
+
+        // Helper: find contour distance where axis crosses, starting search from a given distance
+        auto findCrossing = [&](bool crossZ, float targetVal, bool positiveSide, int sideAxis, float searchStart) -> float {
+            // Walk contour looking for the crossing
+            // crossZ=true: look for Z=targetVal, check sideAxis for +/- filter
+            // crossZ=false: look for X=targetVal
+            // Find the crossing closest to 25% of total length from searchStart
+            float expectedDist = ring.totalLen * 0.25f;
+            float bestCross = -1.0f;
+            float bestError = FLT_MAX;
+
+            for (size_t p = 0; p < ring.contourPts.size() - 1; p++) {
+                float v0, v1;
+                if (crossZ) {
+                    v0 = ring.contourPts[p].z - targetVal;
+                    v1 = ring.contourPts[p + 1].z - targetVal;
+                } else {
+                    v0 = ring.contourPts[p].x - targetVal;
+                    v1 = ring.contourPts[p + 1].x - targetVal;
+                }
+
+                if ((v0 <= 0.0f && v1 > 0.0f) || (v0 >= 0.0f && v1 < 0.0f)) {
+                    float t = v0 / (v0 - v1);
+                    glm::vec3 crossPt = ring.contourPts[p] + (ring.contourPts[p + 1] - ring.contourPts[p]) * t;
+                    float crossDist = ring.cumDist[p] + t * (ring.cumDist[p + 1] - ring.cumDist[p]);
+
+                    float sideVal = (sideAxis == 0) ? crossPt.x : crossPt.z;
+                    bool correctSide = positiveSide ? (sideVal >= -0.01f) : (sideVal <= 0.01f);
+                    if (!correctSide) continue;
+
+                    // How far is this crossing from searchStart (wrapping)?
+                    float wrapDist = crossDist;
+                    if (wrapDist < searchStart) wrapDist += ring.totalLen;
+                    float distFromStart = wrapDist - searchStart;
+
+                    // Pick the one closest to the expected quarter distance
+                    float error = std::abs(distFromStart - expectedDist);
+                    if (error < bestError) {
+                        bestError = error;
+                        bestCross = crossDist;
+                    }
+                }
+            }
+            return bestCross;
+        };
+
+        // Quarter 1: X=0 on +Z side (front) — roughly 1/4 around from point 0
+        crossDists[1] = findCrossing(false, 0.0f, true, 2, crossDists[0]);  // X=0, +Z side
+
+        // Quarter 2: Z=0 on -X side (left) — roughly 1/2 around
+        if (crossDists[1] >= 0.0f)
+            crossDists[2] = findCrossing(true, 0.0f, false, 0, crossDists[1]);  // Z=0, -X side
+        else
+            crossDists[2] = -1.0f;
+
+        // Quarter 3: X=0 on -Z side (back) — roughly 3/4 around
+        if (crossDists[2] >= 0.0f)
+            crossDists[3] = findCrossing(false, 0.0f, false, 2, crossDists[2]);  // X=0, -Z side
+        else
+            crossDists[3] = -1.0f;
+
+        // Only refine if we found all 4 crossings
+        if (crossDists[1] < 0.0f || crossDists[2] < 0.0f || crossDists[3] < 0.0f) continue;
+
+        // Redistribute N points with anchors at fixed N/4 intervals.
+        // N is divisible by 4, so anchors at 0, N/4, N/2, 3N/4.
+        // Each quarter-arc gets exactly N/4 points (anchor + N/4-1 in-between).
+
+        // Helper: sample contour at a given distance
+        auto sampleContour = [&](float dist, glm::vec3& outPt, glm::vec3& outNm) {
+            dist = std::fmod(dist, ring.totalLen);
+            if (dist < 0.0f) dist += ring.totalLen;
+            size_t seg = 0;
+            for (size_t s = 1; s < ring.cumDist.size(); s++) {
+                if (ring.cumDist[s] >= dist) { seg = s - 1; break; }
+                seg = s - 1;
+            }
+            if (seg + 1 >= ring.contourPts.size()) seg = ring.contourPts.size() - 2;
+            float segStart = ring.cumDist[seg];
+            float segEnd = ring.cumDist[seg + 1];
+            float segLen = segEnd - segStart;
+            float t = (segLen > 1e-7f) ? (dist - segStart) / segLen : 0.0f;
+            t = std::max(0.0f, std::min(1.0f, t));
+            outPt = ring.contourPts[seg] + (ring.contourPts[seg + 1] - ring.contourPts[seg]) * t;
+            outNm = glm::normalize(ring.contourNrms[seg] * (1.0f - t) + ring.contourNrms[seg + 1] * t);
+        };
+
+        for (int q = 0; q < 4; q++) {
+            float arcStart = crossDists[q];
+            float arcEnd = crossDists[(q + 1) % 4];
+            float arcLen = arcEnd - arcStart;
+            if (arcLen < 0.0f) arcLen += ring.totalLen;
+
+            int startPt = q * quarter;
+            for (int k = 0; k < quarter; k++) {
+                float frac = static_cast<float>(k) / quarter;
+                float dist = std::fmod(arcStart + frac * arcLen, ring.totalLen);
+
+                glm::vec3 pt, nm;
+                sampleContour(dist, pt, nm);
+                m_retopologyVerts[ring.startIdx + startPt + k] = pt;
+                m_retopologyNormals[ring.startIdx + startPt + k] = nm;
+            }
+        }
+    }
+
+    std::cout << "[Scatter] Level 1 refinement: locked quarter-points to axis crossings" << std::endl;
+
+    // ── Add pole cap points at top and bottom ──
+    // Find the highest and lowest points on the live mesh surface
+    m_bottomPoleIdx = SIZE_MAX;
+    m_topPoleIdx = SIZE_MAX;
+
+    if (!m_scatterRings.empty() && m_retopologyLiveObj) {
+        // Bottom pole: raycast straight down from mesh center to find bottom surface point
+        glm::vec3 bottomRayOrigin(globalCenter.x, bmin.y - 1.0f, globalCenter.z);
+        glm::vec3 upDir(0, 1, 0);
+        auto bottomHit = m_retopologyLiveObj->raycast(bottomRayOrigin, upDir);
+        if (bottomHit.hit) {
+            m_bottomPoleIdx = m_retopologyVerts.size();
+            m_retopologyVerts.push_back(bottomHit.position);
+            m_retopologyNormals.push_back(bottomHit.normal);
+            m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+            totalPoints++;
+        }
+
+        // Top pole: raycast straight down from above to find top surface point
+        glm::vec3 topRayOrigin(globalCenter.x, bmax.y + 1.0f, globalCenter.z);
+        glm::vec3 downDir(0, -1, 0);
+        auto topHit = m_retopologyLiveObj->raycast(topRayOrigin, downDir);
+        if (topHit.hit) {
+            m_topPoleIdx = m_retopologyVerts.size();
+            m_retopologyVerts.push_back(topHit.position);
+            m_retopologyNormals.push_back(topHit.normal);
+            m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+            totalPoints++;
+        }
+
+        std::cout << "[Scatter] Added pole caps: bottom=" << (m_bottomPoleIdx != SIZE_MAX ? "yes" : "no")
+                  << " top=" << (m_topPoleIdx != SIZE_MAX ? "yes" : "no") << std::endl;
+    }
+
+    // Print summary
+    float avgPerRing = ringCount > 0 ? static_cast<float>(totalPoints) / ringCount : 0;
+    std::cout << "[Scatter] Avg " << avgPerRing << " pts/ring, spacing=" << spacing
+              << " units, model height=" << (maxY - minY) << std::endl;
+
+    m_retopologyMode = true;
+
+    std::cout << "[Scatter] Placed " << totalPoints << " points in " << ringCount
+              << " contour rings (" << m_scatterRings.size() << " valid) at "
+              << m_scatterSpacing << "cm spacing ("
+              << spacing << " model units) on "
+              << m_retopologyLiveObj->getName() << std::endl;
+}
+
+void ModelingMode::resampleRing(size_t ringIdx) {
+    if (ringIdx >= m_scatterRings.size()) return;
+    auto& ring = m_scatterRings[ringIdx];
+    if (ring.contourPts.size() < 3 || ring.totalLen < 0.001f) return;
+
+    int N = static_cast<int>(ring.count);
+    float stepDist = ring.totalLen / N;
+
+    // Wrap slideOffset to [0, totalLen)
+    float offset = std::fmod(ring.slideOffset, ring.totalLen);
+    if (offset < 0.0f) offset += ring.totalLen;
+
+    for (int pi = 0; pi < N; pi++) {
+        float targetDist = std::fmod(offset + pi * stepDist, ring.totalLen);
+
+        // Find which contour segment this distance falls on
+        size_t seg = 0;
+        for (size_t s = 1; s < ring.cumDist.size(); s++) {
+            if (ring.cumDist[s] >= targetDist) { seg = s - 1; break; }
+            seg = s - 1;
+        }
+        if (seg + 1 >= ring.contourPts.size()) seg = ring.contourPts.size() - 2;
+
+        float segStart = ring.cumDist[seg];
+        float segEnd = ring.cumDist[seg + 1];
+        float segLen = segEnd - segStart;
+        float t = (segLen > 1e-7f) ? (targetDist - segStart) / segLen : 0.0f;
+        t = std::max(0.0f, std::min(1.0f, t));
+
+        glm::vec3 pt = ring.contourPts[seg] + (ring.contourPts[seg + 1] - ring.contourPts[seg]) * t;
+        glm::vec3 nm = glm::normalize(ring.contourNrms[seg] * (1.0f - t) + ring.contourNrms[seg + 1] * t);
+
+        m_retopologyVerts[ring.startIdx + pi] = pt;
+        m_retopologyNormals[ring.startIdx + pi] = nm;
+    }
+}
+
+void ModelingMode::connectScatterRings() {
+    if (m_scatterRings.size() < 1) {
+        std::cout << "[ConnectRings] No scatter rings" << std::endl;
+        return;
+    }
+
+    m_scatterEdges.clear();
+    int edgeCount = 0;
+
+    // Horizontal only: connect each ring into a closed loop
+    for (const auto& ring : m_scatterRings) {
+        if (ring.count < 3) continue;
+        for (size_t i = 0; i < ring.count; i++) {
+            size_t cur  = ring.startIdx + i;
+            size_t next = ring.startIdx + ((i + 1) % ring.count);
+            m_scatterEdges.push_back({cur, next});
+            edgeCount++;
+        }
+    }
+
+    m_retopologyMode = true;
+    std::cout << "[ConnectRings] " << m_scatterRings.size() << " rings, "
+              << edgeCount << " horizontal edges" << std::endl;
+}
+
+void ModelingMode::connectScatterVertical() {
+    if (m_scatterRings.size() < 2) {
+        std::cout << "[ConnectVert] Need at least 2 rings" << std::endl;
+        return;
+    }
+
+    int vertEdges = 0;
+    int quadsCreated = 0;
+
+    for (size_t ri = 0; ri + 1 < m_scatterRings.size(); ri++) {
+        const auto& ringA = m_scatterRings[ri];
+        const auto& ringB = m_scatterRings[ri + 1];
+        if (ringA.count != ringB.count) continue;
+
+        // Vertical edges: index-to-index
+        for (size_t i = 0; i < ringA.count; i++) {
+            size_t a = ringA.startIdx + i;
+            size_t b = ringB.startIdx + i;
+            m_scatterEdges.push_back({a, b});
+            vertEdges++;
+        }
+
+        // Quads from the grid
+        for (size_t i = 0; i < ringA.count; i++) {
+            size_t i1 = (i + 1) % ringA.count;
+            size_t a0 = ringA.startIdx + i;
+            size_t a1 = ringA.startIdx + i1;
+            size_t b0 = ringB.startIdx + i;
+            size_t b1 = ringB.startIdx + i1;
+
+            RetopologyQuad quad;
+            quad.verts[0] = m_retopologyVerts[a0];
+            quad.verts[1] = m_retopologyVerts[a1];
+            quad.verts[2] = m_retopologyVerts[b1];
+            quad.verts[3] = m_retopologyVerts[b0];
+            m_retopologyQuads.push_back(quad);
+            quadsCreated++;
+        }
+    }
+
+    // ── Pole caps: triangle fans from pole point to nearest ring ──
+    int trisCreated = 0;
+
+    // Bottom pole → first ring
+    if (m_bottomPoleIdx != SIZE_MAX && !m_scatterRings.empty()) {
+        const auto& firstRing = m_scatterRings[0];
+        glm::vec3 pole = m_retopologyVerts[m_bottomPoleIdx];
+        for (size_t i = 0; i < firstRing.count; i++) {
+            size_t i1 = (i + 1) % firstRing.count;
+            size_t a = firstRing.startIdx + i;
+            size_t b = firstRing.startIdx + i1;
+            // Triangle: pole, a, b (degenerate quad with pole repeated)
+            RetopologyQuad quad;
+            quad.verts[0] = pole;
+            quad.verts[1] = m_retopologyVerts[a];
+            quad.verts[2] = m_retopologyVerts[b];
+            quad.verts[3] = pole;
+            m_retopologyQuads.push_back(quad);
+            // Edge from pole to each ring point
+            m_scatterEdges.push_back({m_bottomPoleIdx, a});
+            trisCreated++;
+        }
+    }
+
+    // Top pole → last ring
+    if (m_topPoleIdx != SIZE_MAX && !m_scatterRings.empty()) {
+        const auto& lastRing = m_scatterRings.back();
+        glm::vec3 pole = m_retopologyVerts[m_topPoleIdx];
+        for (size_t i = 0; i < lastRing.count; i++) {
+            size_t i1 = (i + 1) % lastRing.count;
+            size_t a = lastRing.startIdx + i;
+            size_t b = lastRing.startIdx + i1;
+            RetopologyQuad quad;
+            quad.verts[0] = m_retopologyVerts[a];
+            quad.verts[1] = m_retopologyVerts[b];
+            quad.verts[2] = pole;
+            quad.verts[3] = pole;
+            m_retopologyQuads.push_back(quad);
+            m_scatterEdges.push_back({m_topPoleIdx, a});
+            trisCreated++;
+        }
+    }
+
+    m_retopologyMode = true;
+    std::cout << "[ConnectVert] " << vertEdges << " vertical edges, "
+              << quadsCreated << " quads, " << trisCreated << " cap tris" << std::endl;
+}

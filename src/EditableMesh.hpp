@@ -318,6 +318,11 @@ public:
     // Flips all selected to match the minority normal direction
     void flipSelectedNormals();
 
+    // Make all face normals consistent via flood-fill.
+    // Starts from face 0, propagates winding through shared edges.
+    // Press once = all consistent. Press again = all flipped.
+    void makeNormalsConsistent();
+
     // Catmull-Clark subdivision - smooths mesh by splitting each face into sub-quads
     // levels: number of subdivision iterations (1-3 recommended)
     void catmullClarkSubdivide(int levels = 1);
