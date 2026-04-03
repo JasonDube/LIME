@@ -356,6 +356,80 @@ void ModelingMode::performSlice() {
         }
     }
 
+    // 3b. Cap holes: collect boundary vertices (intersection points) and add a cap face
+    if (m_sliceCapHoles && (!posEdgeIntersections.empty())) {
+        // The intersection vertices form the boundary ring of the cut.
+        // Collect them and order into a loop by chaining adjacent edges.
+
+        auto capMesh = [&](EditableMesh& mesh, std::map<EdgeKey, uint32_t>& edgeIntersections, bool flipWinding) {
+            if (edgeIntersections.empty()) return;
+
+            // Collect all intersection vertex indices
+            std::set<uint32_t> capVertSet;
+            for (auto& [key, vidx] : edgeIntersections) {
+                capVertSet.insert(vidx);
+            }
+            std::vector<uint32_t> capVerts(capVertSet.begin(), capVertSet.end());
+
+            if (capVerts.size() < 3) return;
+
+            // Sort by angle around their centroid (projected onto the slice plane)
+            glm::vec3 centroid(0.0f);
+            for (uint32_t vi : capVerts) centroid += mesh.getVertex(vi).position;
+            centroid /= static_cast<float>(capVerts.size());
+
+            // Build local 2D basis on the slice plane
+            glm::vec3 up = glm::vec3(0, 1, 0);
+            if (std::abs(glm::dot(planeNormal, up)) > 0.9f) up = glm::vec3(1, 0, 0);
+            glm::vec3 localX = glm::normalize(glm::cross(up, planeNormal));
+            glm::vec3 localY = glm::normalize(glm::cross(planeNormal, localX));
+
+            std::sort(capVerts.begin(), capVerts.end(), [&](uint32_t a, uint32_t b) {
+                glm::vec3 da = mesh.getVertex(a).position - centroid;
+                glm::vec3 db = mesh.getVertex(b).position - centroid;
+                float angleA = std::atan2(glm::dot(da, localY), glm::dot(da, localX));
+                float angleB = std::atan2(glm::dot(db, localY), glm::dot(db, localX));
+                return angleA < angleB;
+            });
+
+            // Flip winding for one side so both caps face outward
+            if (flipWinding) {
+                std::reverse(capVerts.begin(), capVerts.end());
+            }
+
+            // Add cap face — if too many verts for one n-gon, use triangle fan
+            std::cout << "[Slice] Cap face: " << capVerts.size() << " boundary verts" << std::endl;
+            if (capVerts.size() <= 50) {
+                mesh.addFace(capVerts);
+            } else {
+                // Triangle fan from centroid for large caps
+                HEVertex centerVert;
+                centerVert.position = centroid;
+                centerVert.normal = planeNormal;
+                centerVert.uv = glm::vec2(0.5f);
+                centerVert.color = glm::vec4(0.7f, 0.7f, 0.7f, 1.0f);
+                centerVert.halfEdgeIndex = UINT32_MAX;
+                centerVert.selected = false;
+                uint32_t centerIdx = mesh.addVertex(centerVert);
+
+                for (size_t i = 0; i < capVerts.size(); i++) {
+                    size_t j = (i + 1) % capVerts.size();
+                    std::vector<uint32_t> tri = {capVerts[static_cast<uint32_t>(i)],
+                                                  capVerts[static_cast<uint32_t>(j)],
+                                                  centerIdx};
+                    mesh.addFace(tri);
+                }
+            }
+        };
+
+        capMesh(posMesh, posEdgeIntersections, false);  // Pos side: cap faces -normal direction
+        capMesh(negMesh, negEdgeIntersections, true);   // Neg side: cap faces +normal direction (flipped)
+
+        std::cout << "[Slice] Cap: " << posEdgeIntersections.size()
+                  << " pos intersections, " << negEdgeIntersections.size()
+                  << " neg intersections" << std::endl;
+    }
+
     // 4. Check results
     bool hasPos = posMesh.getFaceCount() > 0;
     bool hasNeg = negMesh.getFaceCount() > 0;

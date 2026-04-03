@@ -1446,6 +1446,135 @@ void ModelingMode::executePatchBlanket() {
               << m_retopologyQuads.size() << ")" << std::endl;
 }
 
+void ModelingMode::scatterSpherical() {
+    if (!m_retopologyLiveObj || !m_retopologyLiveObj->hasMeshData()) {
+        std::cout << "[Spherical] No live object set" << std::endl;
+        return;
+    }
+
+    float spacing = m_scatterSpacing * 0.01f;
+    if (spacing < 0.001f) spacing = 0.001f;
+
+    // Compute mesh bounding sphere
+    const auto& verts = m_retopologyLiveObj->getVertices();
+    glm::mat4 modelMat = m_retopologyLiveObj->getTransform().getMatrix();
+
+    glm::vec3 meshCenter(0.0f);
+    for (const auto& v : verts) {
+        meshCenter += glm::vec3(modelMat * glm::vec4(v.position, 1.0f));
+    }
+    meshCenter /= static_cast<float>(verts.size());
+
+    float maxRadius = 0.0f;
+    for (const auto& v : verts) {
+        float d = glm::length(glm::vec3(modelMat * glm::vec4(v.position, 1.0f)) - meshCenter);
+        maxRadius = std::max(maxRadius, d);
+    }
+    float sphereRadius = maxRadius * 1.5f;  // Sphere outside the model
+
+    // Determine sphere resolution from spacing
+    float circumference = 2.0f * 3.14159f * maxRadius;
+    int segments = std::max(8, static_cast<int>(std::round(circumference / spacing)));
+    int rings = segments / 2;  // Half as many latitude rings as longitude segments
+    // Make segments divisible by 4 for anchor alignment
+    if (segments % 4 != 0) segments += (4 - segments % 4);
+    if (rings % 2 != 0) rings++;
+
+    std::cout << "[Spherical] Sphere: center=(" << meshCenter.x << "," << meshCenter.y << ","
+              << meshCenter.z << ") radius=" << sphereRadius << " rings=" << rings
+              << " segments=" << segments << std::endl;
+
+    // Clear existing data
+    m_retopologyVerts.clear();
+    m_retopologyNormals.clear();
+    m_retopologyVertMeshIdx.clear();
+    m_scatterRings.clear();
+    m_scatterEdges.clear();
+    m_retopologyQuads.clear();
+    m_selectedScatterPoints.clear();
+    m_mirrorPairs.clear();
+
+    // Generate UV sphere points and raycast inward to find surface
+    // Layout: bottom pole, then rings from bottom to top, then top pole
+    int totalPoints = 0;
+    int missedPoints = 0;
+
+    // No pole points — they cause holes at the poles
+    m_bottomPoleIdx = SIZE_MAX;
+    m_topPoleIdx = SIZE_MAX;
+
+    // Latitude rings (bottom to top, excluding poles)
+    for (int ri = 1; ri < rings; ri++) {
+        float phi = 3.14159f * static_cast<float>(ri) / rings;  // 0=top pole, π=bottom pole
+        float y = std::cos(phi);
+        float ringRadius = std::sin(phi);
+
+        size_t ringStartIdx = m_retopologyVerts.size();
+        int ringPointCount = 0;
+
+        for (int si = 0; si < segments; si++) {
+            float theta = 2.0f * 3.14159f * static_cast<float>(si) / segments;
+            float x = ringRadius * std::cos(theta);
+            float z = ringRadius * std::sin(theta);
+
+            glm::vec3 spherePos = meshCenter + glm::vec3(x, y, z) * sphereRadius;
+            glm::vec3 rayDir = glm::normalize(meshCenter - spherePos);
+
+            auto hit = m_retopologyLiveObj->raycast(spherePos, rayDir);
+            if (hit.hit) {
+                m_retopologyVerts.push_back(hit.position);
+                m_retopologyNormals.push_back(hit.normal);
+                m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+                ringPointCount++;
+                totalPoints++;
+            } else {
+                // Fallback: place on the sphere surface (will be off-model)
+                m_retopologyVerts.push_back(spherePos);
+                m_retopologyNormals.push_back(glm::normalize(glm::vec3(x, y, z)));
+                m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+                ringPointCount++;
+                totalPoints++;
+                missedPoints++;
+            }
+        }
+
+        // Record ring
+        if (ringPointCount > 0) {
+            ScatterRing ring;
+            ring.startIdx = ringStartIdx;
+            ring.count = ringPointCount;
+            ring.totalLen = 0.0f;
+            ring.slideOffset = 0.0f;
+            ring.sliceY = meshCenter.y + y * maxRadius;
+            m_scatterRings.push_back(std::move(ring));
+        }
+    }
+
+    // Build mirror pairs
+    m_mirrorPairs.clear();
+    for (size_t i = 0; i < m_retopologyVerts.size(); i++) {
+        if (std::abs(m_retopologyVerts[i].x) < 0.01f) continue;
+        if (m_mirrorPairs.count(i)) continue;
+        glm::vec3 mirrorPos(-m_retopologyVerts[i].x, m_retopologyVerts[i].y, m_retopologyVerts[i].z);
+        float bestDist = 0.15f;
+        size_t bestIdx = SIZE_MAX;
+        for (size_t j = 0; j < m_retopologyVerts.size(); j++) {
+            if (j == i) continue;
+            float d = glm::length(m_retopologyVerts[j] - mirrorPos);
+            if (d < bestDist) { bestDist = d; bestIdx = j; }
+        }
+        if (bestIdx != SIZE_MAX) {
+            m_mirrorPairs[i] = bestIdx;
+            m_mirrorPairs[bestIdx] = i;
+        }
+    }
+
+    m_retopologyMode = true;
+
+    std::cout << "[Spherical] Placed " << totalPoints << " points (" << missedPoints << " missed surface) in "
+              << m_scatterRings.size() << " rings, " << segments << " segments" << std::endl;
+}
+
 void ModelingMode::scatterPointsOnSurface() {
     if (!m_retopologyLiveObj || !m_retopologyLiveObj->hasMeshData()) {
         std::cout << "[Scatter] No live object set" << std::endl;
@@ -1764,6 +1893,7 @@ void ModelingMode::scatterPointsOnSurface() {
                 ring.totalLen = totalLen;
                 ring.cumDist = cumDist;
                 ring.slideOffset = 0.0f;
+                ring.sliceY = sliceY;
                 m_scatterRings.push_back(std::move(ring));
             }
 
@@ -1969,6 +2099,26 @@ void ModelingMode::scatterPointsOnSurface() {
     std::cout << "[Scatter] Avg " << avgPerRing << " pts/ring, spacing=" << spacing
               << " units, model height=" << (maxY - minY) << std::endl;
 
+    // Build mirror pairs: for each point, find its mirror partner across X=0
+    m_mirrorPairs.clear();
+    for (size_t i = 0; i < m_retopologyVerts.size(); i++) {
+        if (std::abs(m_retopologyVerts[i].x) < 0.01f) continue;  // Center points have no mirror
+        if (m_mirrorPairs.count(i)) continue;  // Already paired
+        glm::vec3 mirrorPos(-m_retopologyVerts[i].x, m_retopologyVerts[i].y, m_retopologyVerts[i].z);
+        float bestDist = 0.15f;
+        size_t bestIdx = SIZE_MAX;
+        for (size_t j = 0; j < m_retopologyVerts.size(); j++) {
+            if (j == i) continue;
+            float d = glm::length(m_retopologyVerts[j] - mirrorPos);
+            if (d < bestDist) { bestDist = d; bestIdx = j; }
+        }
+        if (bestIdx != SIZE_MAX) {
+            m_mirrorPairs[i] = bestIdx;
+            m_mirrorPairs[bestIdx] = i;
+        }
+    }
+    std::cout << "[Scatter] Built " << m_mirrorPairs.size() / 2 << " mirror pairs" << std::endl;
+
     m_retopologyMode = true;
 
     std::cout << "[Scatter] Placed " << totalPoints << " points in " << ringCount
@@ -2015,6 +2165,127 @@ void ModelingMode::resampleRing(size_t ringIdx) {
     }
 }
 
+void ModelingMode::resliceRing(size_t ringIdx, float newY) {
+    if (ringIdx >= m_scatterRings.size() || !m_retopologyLiveObj) return;
+    auto& ring = m_scatterRings[ringIdx];
+
+    const auto& verts = m_retopologyLiveObj->getVertices();
+    const auto& indices = m_retopologyLiveObj->getIndices();
+    glm::mat4 modelMat = m_retopologyLiveObj->getTransform().getMatrix();
+    glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(modelMat)));
+    float spacing = m_scatterSpacing * 0.01f;
+
+    // Intersect all triangles with plane Y = newY
+    struct Segment { glm::vec3 a, b; glm::vec3 na, nb; };
+    std::vector<Segment> segments;
+
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        glm::vec3 p0 = glm::vec3(modelMat * glm::vec4(verts[indices[i]].position, 1.0f));
+        glm::vec3 p1 = glm::vec3(modelMat * glm::vec4(verts[indices[i+1]].position, 1.0f));
+        glm::vec3 p2 = glm::vec3(modelMat * glm::vec4(verts[indices[i+2]].position, 1.0f));
+        glm::vec3 n0 = glm::normalize(normalMat * verts[indices[i]].normal);
+        glm::vec3 n1 = glm::normalize(normalMat * verts[indices[i+1]].normal);
+        glm::vec3 n2 = glm::normalize(normalMat * verts[indices[i+2]].normal);
+
+        float d0 = p0.y - newY, d1 = p1.y - newY, d2 = p2.y - newY;
+        const float eps = 1e-6f;
+        int above = (d0>eps?1:0)+(d1>eps?1:0)+(d2>eps?1:0);
+        int below = (d0<-eps?1:0)+(d1<-eps?1:0)+(d2<-eps?1:0);
+        if (above == 0 || below == 0) continue;
+
+        glm::vec3 pts[3]={p0,p1,p2}, nrms[3]={n0,n1,n2};
+        float dists[3]={d0,d1,d2};
+        glm::vec3 hitPos[2]; glm::vec3 hitNrm[2]; int hitCount=0;
+        for (int e=0; e<3 && hitCount<2; e++) {
+            int ea=e, eb=(e+1)%3;
+            if ((dists[ea]>eps&&dists[eb]<-eps)||(dists[ea]<-eps&&dists[eb]>eps)) {
+                float t = dists[ea]/(dists[ea]-dists[eb]);
+                hitPos[hitCount] = pts[ea]+(pts[eb]-pts[ea])*t;
+                hitNrm[hitCount] = glm::normalize(nrms[ea]+(nrms[eb]-nrms[ea])*t);
+                hitCount++;
+            }
+        }
+        if (hitCount==2) segments.push_back({hitPos[0],hitPos[1],hitNrm[0],hitNrm[1]});
+    }
+
+    if (segments.empty()) return;
+
+    // Chain into loops, pick longest
+    float avgSegLen = 0.0f;
+    for (const auto& seg : segments) avgSegLen += glm::length(seg.b - seg.a);
+    avgSegLen /= std::max(1.0f, static_cast<float>(segments.size()));
+    float weldDist = avgSegLen * 1.5f;
+
+    struct Loop { std::vector<glm::vec3> pts, nrms; float len=0; };
+    std::vector<Loop> loops;
+    std::vector<bool> used(segments.size(), false);
+
+    while (true) {
+        int si=-1;
+        for (size_t s=0;s<segments.size();s++) if (!used[s]) {si=static_cast<int>(s);break;}
+        if (si<0) break;
+        Loop loop;
+        used[si]=true;
+        loop.pts.push_back(segments[si].a); loop.pts.push_back(segments[si].b);
+        loop.nrms.push_back(segments[si].na); loop.nrms.push_back(segments[si].nb);
+        bool ext=true;
+        while (ext) {
+            ext=false; glm::vec3 tail=loop.pts.back();
+            float bd=weldDist; int bs=-1; bool bf=false;
+            for (size_t s=0;s<segments.size();s++) {
+                if (used[s]) continue;
+                float da=glm::length(segments[s].a-tail), db=glm::length(segments[s].b-tail);
+                if (da<bd){bd=da;bs=static_cast<int>(s);bf=false;}
+                if (db<bd){bd=db;bs=static_cast<int>(s);bf=true;}
+            }
+            if (bs>=0) {
+                used[bs]=true;
+                if (bf){loop.pts.push_back(segments[bs].a);loop.nrms.push_back(segments[bs].na);}
+                else{loop.pts.push_back(segments[bs].b);loop.nrms.push_back(segments[bs].nb);}
+                ext=true;
+            }
+        }
+        for (size_t p=1;p<loop.pts.size();p++) loop.len+=glm::length(loop.pts[p]-loop.pts[p-1]);
+        if (loop.pts.size()>=3 && loop.len>spacing) loops.push_back(std::move(loop));
+    }
+    if (loops.empty()) return;
+
+    size_t best=0;
+    for (size_t i=1;i<loops.size();i++) if (loops[i].len>loops[best].len) best=i;
+
+    // Ensure consistent winding
+    float signedArea=0;
+    for (size_t p=0;p<loops[best].pts.size();p++) {
+        size_t pn=(p+1)%loops[best].pts.size();
+        signedArea+=(loops[best].pts[pn].x-loops[best].pts[p].x)*(loops[best].pts[pn].z+loops[best].pts[p].z);
+    }
+    if (signedArea>0) { std::reverse(loops[best].pts.begin(),loops[best].pts.end()); std::reverse(loops[best].nrms.begin(),loops[best].nrms.end()); }
+
+    // Update ring contour data
+    ring.contourPts = std::move(loops[best].pts);
+    ring.contourNrms = std::move(loops[best].nrms);
+    ring.totalLen = 0;
+    ring.cumDist.resize(ring.contourPts.size(), 0);
+    for (size_t p=1;p<ring.contourPts.size();p++) {
+        ring.cumDist[p] = ring.cumDist[p-1] + glm::length(ring.contourPts[p]-ring.contourPts[p-1]);
+    }
+    ring.totalLen = ring.cumDist.back();
+    ring.sliceY = newY;
+
+    // Find Z=0 crossing for slideOffset
+    float planeZ = 0.0f;
+    for (size_t p=0;p<ring.contourPts.size()-1;p++) {
+        float z0=ring.contourPts[p].z-planeZ, z1=ring.contourPts[p+1].z-planeZ;
+        if ((z0<=0&&z1>0)||(z0>=0&&z1<0)) {
+            float t=z0/(z0-z1);
+            glm::vec3 cp=ring.contourPts[p]+(ring.contourPts[p+1]-ring.contourPts[p])*t;
+            if (cp.x>=0) { ring.slideOffset=ring.cumDist[p]+t*(ring.cumDist[p+1]-ring.cumDist[p]); break; }
+        }
+    }
+
+    resampleRing(ringIdx);
+}
+
 void ModelingMode::connectScatterRings() {
     if (m_scatterRings.size() < 1) {
         std::cout << "[ConnectRings] No scatter rings" << std::endl;
@@ -2038,6 +2309,377 @@ void ModelingMode::connectScatterRings() {
     m_retopologyMode = true;
     std::cout << "[ConnectRings] " << m_scatterRings.size() << " rings, "
               << edgeCount << " horizontal edges" << std::endl;
+}
+
+void ModelingMode::subdivideSelectedQuad() {
+    if (m_selectedScatterPoints.size() != 4 || !m_retopologyLiveObj) {
+        std::cout << "[Subdivide] Need exactly 4 selected points and a live object" << std::endl;
+        return;
+    }
+
+    // Get the 4 selected vertex indices
+    std::vector<size_t> sel(m_selectedScatterPoints.begin(), m_selectedScatterPoints.end());
+
+    // Order them into proper quad winding: sort by angle around centroid
+    glm::vec3 centroid(0.0f);
+    for (size_t idx : sel) centroid += m_retopologyVerts[idx];
+    centroid /= 4.0f;
+
+    // Compute face plane normal from first 3 points
+    glm::vec3 e1 = m_retopologyVerts[sel[1]] - m_retopologyVerts[sel[0]];
+    glm::vec3 e2 = m_retopologyVerts[sel[2]] - m_retopologyVerts[sel[0]];
+    glm::vec3 planeNormal = glm::normalize(glm::cross(e1, e2));
+
+    // Build a local 2D basis on this plane
+    glm::vec3 localX = glm::normalize(e1);
+    glm::vec3 localY = glm::normalize(glm::cross(planeNormal, localX));
+
+    // Sort by angle in the local plane
+    std::sort(sel.begin(), sel.end(), [&](size_t a, size_t b) {
+        glm::vec3 da = m_retopologyVerts[a] - centroid;
+        glm::vec3 db = m_retopologyVerts[b] - centroid;
+        float angleA = std::atan2(glm::dot(da, localY), glm::dot(da, localX));
+        float angleB = std::atan2(glm::dot(db, localY), glm::dot(db, localX));
+        return angleA < angleB;
+    });
+
+    // Corner positions and normals
+    glm::vec3 c[4], cn[4];
+    for (int i = 0; i < 4; i++) {
+        c[i] = m_retopologyVerts[sel[i]];
+        cn[i] = (sel[i] < m_retopologyNormals.size()) ? m_retopologyNormals[sel[i]] : glm::vec3(0, 1, 0);
+    }
+
+    // Find mirror corners NOW (before appending new points that could confuse the search)
+    size_t mirrorSel[4] = {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
+    bool mirrorFound = false;
+    if (m_scatterSymmetryX) {
+        mirrorFound = true;
+        for (int i = 0; i < 4; i++) {
+            if (std::abs(c[i].x) < 0.01f) {
+                mirrorSel[i] = sel[i];  // On center line — mirrors to itself
+                continue;
+            }
+            glm::vec3 mirrorPos(-c[i].x, c[i].y, c[i].z);
+            float bestDist = 0.15f;
+            for (size_t vi = 0; vi < m_retopologyVerts.size(); vi++) {
+                if (vi == sel[i]) continue;
+                float d = glm::length(m_retopologyVerts[vi] - mirrorPos);
+                if (d < bestDist) { bestDist = d; mirrorSel[i] = vi; }
+            }
+            if (mirrorSel[i] == SIZE_MAX) { mirrorFound = false; break; }
+        }
+    }
+
+    // Compute 4 edge midpoints and 1 center
+    glm::vec3 newPts[5];  // mid01, mid12, mid23, mid30, center
+    glm::vec3 newNrms[5];
+    for (int i = 0; i < 4; i++) {
+        int j = (i + 1) % 4;
+        newPts[i] = (c[i] + c[j]) * 0.5f;
+        newNrms[i] = glm::normalize(cn[i] + cn[j]);
+    }
+    newPts[4] = centroid;
+    newNrms[4] = glm::normalize(cn[0] + cn[1] + cn[2] + cn[3]);
+
+    // Raycast each new point onto the live surface
+    for (int i = 0; i < 5; i++) {
+        glm::vec3 rayOrigin = newPts[i] + newNrms[i] * 0.05f;
+        auto hit = m_retopologyLiveObj->raycast(rayOrigin, -newNrms[i]);
+        if (hit.hit && glm::length(hit.position - newPts[i]) < 0.2f) {
+            newPts[i] = hit.position;
+            newNrms[i] = hit.normal;
+        }
+    }
+
+    // Append new points — but reuse existing ones if a point already exists at that position
+    const float weldThreshold = 0.01f;
+    size_t midIdx[5];
+    for (int i = 0; i < 5; i++) {
+        // Check if a point already exists here (from a previous subdivide)
+        size_t existingIdx = SIZE_MAX;
+        for (size_t vi = 0; vi < m_retopologyVerts.size(); vi++) {
+            if (glm::length(m_retopologyVerts[vi] - newPts[i]) < weldThreshold) {
+                existingIdx = vi;
+                break;
+            }
+        }
+        if (existingIdx != SIZE_MAX) {
+            midIdx[i] = existingIdx;  // Reuse existing point
+        } else {
+            midIdx[i] = m_retopologyVerts.size();
+            m_retopologyVerts.push_back(newPts[i]);
+            m_retopologyNormals.push_back(newNrms[i]);
+            m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+        }
+    }
+
+    // Remove the original quad from m_retopologyQuads if it exists
+    const float quadMatchThresh = 0.001f;
+    for (auto it = m_retopologyQuads.begin(); it != m_retopologyQuads.end(); ++it) {
+        int matches = 0;
+        for (int qi = 0; qi < 4; qi++) {
+            for (int si = 0; si < 4; si++) {
+                if (glm::length(it->verts[qi] - c[si]) < quadMatchThresh) { matches++; break; }
+            }
+        }
+        if (matches == 4) {
+            m_retopologyQuads.erase(it);
+            break;
+        }
+    }
+
+    // Create 4 sub-quads:
+    // Quad 0: c[0], mid01, center, mid30
+    // Quad 1: mid01, c[1], mid12, center
+    // Quad 2: center, mid12, c[2], mid23
+    // Quad 3: mid30, center, mid23, c[3]
+    auto makeQuad = [&](glm::vec3 a, glm::vec3 b, glm::vec3 cc, glm::vec3 d) {
+        RetopologyQuad q;
+        q.verts[0] = a; q.verts[1] = b; q.verts[2] = cc; q.verts[3] = d;
+        m_retopologyQuads.push_back(q);
+    };
+
+    makeQuad(c[0], newPts[0], newPts[4], newPts[3]);
+    makeQuad(newPts[0], c[1], newPts[1], newPts[4]);
+    makeQuad(newPts[4], newPts[1], c[2], newPts[2]);
+    makeQuad(newPts[3], newPts[4], newPts[2], c[3]);
+
+    // Remove old edges between the 4 corner points
+    for (int i = 0; i < 4; i++) {
+        int j = (i + 1) % 4;
+        size_t a = sel[i], b = sel[j];
+        m_scatterEdges.erase(
+            std::remove_if(m_scatterEdges.begin(), m_scatterEdges.end(),
+                [a, b](const ScatterEdge& e) {
+                    return (e.a == a && e.b == b) || (e.a == b && e.b == a);
+                }),
+            m_scatterEdges.end());
+    }
+
+    // Add scatter edges for the new subdivisions (skip duplicates)
+    auto addEdgeIfNew = [&](size_t a, size_t b) {
+        for (const auto& e : m_scatterEdges) {
+            if ((e.a == a && e.b == b) || (e.a == b && e.b == a)) return;
+        }
+        m_scatterEdges.push_back({a, b});
+    };
+    for (int i = 0; i < 4; i++) {
+        int j = (i + 1) % 4;
+        addEdgeIfNew(sel[i], midIdx[i]);
+        addEdgeIfNew(midIdx[i], sel[j]);
+        addEdgeIfNew(midIdx[i], midIdx[4]);
+    }
+
+    // Symmetry X: subdivide the mirror quad too (using pre-found mirrorSel indices)
+    if (m_scatterSymmetryX && mirrorFound) {
+        {
+            // Get mirror corner positions
+            glm::vec3 mc[4], mcn[4];
+            for (int i = 0; i < 4; i++) {
+                mc[i] = m_retopologyVerts[mirrorSel[i]];
+                mcn[i] = (mirrorSel[i] < m_retopologyNormals.size()) ? m_retopologyNormals[mirrorSel[i]] : glm::vec3(0, 1, 0);
+            }
+
+            // Compute 5 new mirror midpoints
+            glm::vec3 mNewPts[5], mNewNrms[5];
+            for (int i = 0; i < 4; i++) {
+                int j = (i + 1) % 4;
+                mNewPts[i] = (mc[i] + mc[j]) * 0.5f;
+                mNewNrms[i] = glm::normalize(mcn[i] + mcn[j]);
+            }
+            mNewPts[4] = (mc[0] + mc[1] + mc[2] + mc[3]) * 0.25f;
+            mNewNrms[4] = glm::normalize(mcn[0] + mcn[1] + mcn[2] + mcn[3]);
+
+            // Raycast onto surface
+            for (int i = 0; i < 5; i++) {
+                glm::vec3 ro = mNewPts[i] + mNewNrms[i] * 0.05f;
+                auto mHit = m_retopologyLiveObj->raycast(ro, -mNewNrms[i]);
+                if (mHit.hit && glm::length(mHit.position - mNewPts[i]) < 0.2f) {
+                    mNewPts[i] = mHit.position;
+                    mNewNrms[i] = mHit.normal;
+                }
+            }
+
+            // Append or reuse points
+            size_t mMidIdx[5];
+            for (int i = 0; i < 5; i++) {
+                size_t existingIdx = SIZE_MAX;
+                for (size_t vi = 0; vi < m_retopologyVerts.size(); vi++) {
+                    if (glm::length(m_retopologyVerts[vi] - mNewPts[i]) < weldThreshold) {
+                        existingIdx = vi; break;
+                    }
+                }
+                if (existingIdx != SIZE_MAX) {
+                    mMidIdx[i] = existingIdx;
+                } else {
+                    mMidIdx[i] = m_retopologyVerts.size();
+                    m_retopologyVerts.push_back(mNewPts[i]);
+                    m_retopologyNormals.push_back(mNewNrms[i]);
+                    m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+                }
+            }
+
+            // Remove mirror original quad
+            for (auto it = m_retopologyQuads.begin(); it != m_retopologyQuads.end(); ++it) {
+                int matches = 0;
+                for (int qi = 0; qi < 4; qi++) {
+                    for (int si = 0; si < 4; si++) {
+                        if (glm::length(it->verts[qi] - mc[si]) < 0.001f) { matches++; break; }
+                    }
+                }
+                if (matches == 4) { m_retopologyQuads.erase(it); break; }
+            }
+
+            // Remove old mirror edges
+            for (int i = 0; i < 4; i++) {
+                int j = (i + 1) % 4;
+                size_t a = mirrorSel[i], b = mirrorSel[j];
+                m_scatterEdges.erase(
+                    std::remove_if(m_scatterEdges.begin(), m_scatterEdges.end(),
+                        [a, b](const ScatterEdge& e) {
+                            return (e.a == a && e.b == b) || (e.a == b && e.b == a);
+                        }), m_scatterEdges.end());
+            }
+
+            // Create 4 mirror sub-quads (reversed winding — mirror flips normals)
+            makeQuad(mNewPts[3], mNewPts[4], mNewPts[0], mc[0]);
+            makeQuad(mNewPts[4], mNewPts[1], mc[1], mNewPts[0]);
+            makeQuad(mNewPts[2], mc[2], mNewPts[1], mNewPts[4]);
+            makeQuad(mc[3], mNewPts[2], mNewPts[4], mNewPts[3]);
+
+            // Add mirror edges
+            for (int i = 0; i < 4; i++) {
+                int j = (i + 1) % 4;
+                addEdgeIfNew(mirrorSel[i], mMidIdx[i]);
+                addEdgeIfNew(mMidIdx[i], mirrorSel[j]);
+                addEdgeIfNew(mMidIdx[i], mMidIdx[4]);
+            }
+
+            // Register mirror pairs for the new midpoints
+            for (int i = 0; i < 5; i++) {
+                if (midIdx[i] != mMidIdx[i]) {  // Don't pair a point with itself
+                    m_mirrorPairs[midIdx[i]] = mMidIdx[i];
+                    m_mirrorPairs[mMidIdx[i]] = midIdx[i];
+                }
+            }
+
+            std::cout << "[Subdivide] Mirror quad also subdivided" << std::endl;
+        }
+    }
+
+    m_selectedScatterPoints.clear();
+
+    std::cout << "[Subdivide] Split quad into 4 sub-quads ("
+              << m_retopologyVerts.size() << " total verts)" << std::endl;
+}
+
+void ModelingMode::alignScatterAnchors() {
+    if (m_scatterRings.empty()) return;
+
+    // Helper: sample contour at a given distance
+    auto sampleContour = [](const ScatterRing& ring, float dist, glm::vec3& outPt, glm::vec3& outNm) {
+        dist = std::fmod(dist, ring.totalLen);
+        if (dist < 0.0f) dist += ring.totalLen;
+        size_t seg = 0;
+        for (size_t s = 1; s < ring.cumDist.size(); s++) {
+            if (ring.cumDist[s] >= dist) { seg = s - 1; break; }
+            seg = s - 1;
+        }
+        if (seg + 1 >= ring.contourPts.size()) seg = ring.contourPts.size() - 2;
+        float segStart = ring.cumDist[seg];
+        float segEnd = ring.cumDist[seg + 1];
+        float segLen = segEnd - segStart;
+        float t = (segLen > 1e-7f) ? (dist - segStart) / segLen : 0.0f;
+        t = std::max(0.0f, std::min(1.0f, t));
+        outPt = ring.contourPts[seg] + (ring.contourPts[seg + 1] - ring.contourPts[seg]) * t;
+        outNm = glm::normalize(ring.contourNrms[seg] * (1.0f - t) + ring.contourNrms[seg + 1] * t);
+    };
+
+    // Helper: find crossing distance on contour
+    auto findCrossing = [](const ScatterRing& ring, bool crossZ, float targetVal, bool positiveSide, int sideAxis, float searchStart) -> float {
+        float expectedDist = ring.totalLen * 0.25f;
+        float bestCross = -1.0f;
+        float bestError = FLT_MAX;
+        for (size_t p = 0; p < ring.contourPts.size() - 1; p++) {
+            float v0, v1;
+            if (crossZ) { v0 = ring.contourPts[p].z - targetVal; v1 = ring.contourPts[p+1].z - targetVal; }
+            else { v0 = ring.contourPts[p].x - targetVal; v1 = ring.contourPts[p+1].x - targetVal; }
+            if ((v0 <= 0.0f && v1 > 0.0f) || (v0 >= 0.0f && v1 < 0.0f)) {
+                float t = v0 / (v0 - v1);
+                glm::vec3 crossPt = ring.contourPts[p] + (ring.contourPts[p+1] - ring.contourPts[p]) * t;
+                float crossDist = ring.cumDist[p] + t * (ring.cumDist[p+1] - ring.cumDist[p]);
+                float sideVal = (sideAxis == 0) ? crossPt.x : crossPt.z;
+                bool correctSide = positiveSide ? (sideVal >= -0.01f) : (sideVal <= 0.01f);
+                if (!correctSide) continue;
+                float wrapDist = crossDist;
+                if (wrapDist < searchStart) wrapDist += ring.totalLen;
+                float error = std::abs((wrapDist - searchStart) - expectedDist);
+                if (error < bestError) { bestError = error; bestCross = crossDist; }
+            }
+        }
+        return bestCross;
+    };
+
+    int aligned = 0;
+    for (size_t ri = 0; ri < m_scatterRings.size(); ri++) {
+        auto& ring = m_scatterRings[ri];
+        if (ring.contourPts.size() < 3 || ring.totalLen < 0.001f) continue;
+        int N = static_cast<int>(ring.count);
+        if (N < 4 || N % 4 != 0) continue;
+        int quarter = N / 4;
+
+        // First: slide to Z=0 +X crossing
+        float planeZ = 0.0f;
+        float crossDist0 = -1.0f;
+        for (size_t p = 0; p < ring.contourPts.size() - 1; p++) {
+            float z0 = ring.contourPts[p].z - planeZ, z1 = ring.contourPts[p+1].z - planeZ;
+            if ((z0 <= 0.0f && z1 > 0.0f) || (z0 >= 0.0f && z1 < 0.0f)) {
+                float t = z0 / (z0 - z1);
+                glm::vec3 cp = ring.contourPts[p] + (ring.contourPts[p+1] - ring.contourPts[p]) * t;
+                if (cp.x >= 0.0f) {
+                    crossDist0 = ring.cumDist[p] + t * (ring.cumDist[p+1] - ring.cumDist[p]);
+                    break;
+                }
+            }
+        }
+        if (crossDist0 < 0.0f) continue;
+
+        // Find the other 3 crossings
+        float crossDists[4];
+        crossDists[0] = crossDist0;
+        crossDists[1] = findCrossing(ring, false, 0.0f, true, 2, crossDists[0]);   // X=0 +Z
+        if (crossDists[1] < 0.0f) continue;
+        crossDists[2] = findCrossing(ring, true, 0.0f, false, 0, crossDists[1]);   // Z=0 -X
+        if (crossDists[2] < 0.0f) continue;
+        crossDists[3] = findCrossing(ring, false, 0.0f, false, 2, crossDists[2]);  // X=0 -Z
+        if (crossDists[3] < 0.0f) continue;
+
+        // Redistribute points with anchors at crossings
+        for (int q = 0; q < 4; q++) {
+            float arcStart = crossDists[q];
+            float arcEnd = crossDists[(q + 1) % 4];
+            float arcLen = arcEnd - arcStart;
+            if (arcLen < 0.0f) arcLen += ring.totalLen;
+
+            int startPt = q * quarter;
+            for (int k = 0; k < quarter; k++) {
+                float frac = static_cast<float>(k) / quarter;
+                float dist = std::fmod(arcStart + frac * arcLen, ring.totalLen);
+                glm::vec3 pt, nm;
+                sampleContour(ring, dist, pt, nm);
+                m_retopologyVerts[ring.startIdx + startPt + k] = pt;
+                m_retopologyNormals[ring.startIdx + startPt + k] = nm;
+            }
+        }
+        aligned++;
+    }
+
+    // Clear connections so user reconnects after alignment
+    m_scatterEdges.clear();
+    m_retopologyQuads.clear();
+
+    std::cout << "[Scatter] Aligned anchors on " << aligned << " / " << m_scatterRings.size() << " rings" << std::endl;
 }
 
 void ModelingMode::connectScatterVertical() {
@@ -2080,50 +2722,40 @@ void ModelingMode::connectScatterVertical() {
         }
     }
 
-    // ── Pole caps: triangle fans from pole point to nearest ring ──
-    int trisCreated = 0;
+    // Cap the top and bottom rings with a center point + triangle fan
+    if (!m_scatterRings.empty()) {
+        auto capRing = [&](const ScatterRing& ring, glm::vec3 defaultNormal) {
+            if (ring.count < 3) return;
+            glm::vec3 center(0.0f);
+            for (size_t i = 0; i < ring.count; i++)
+                center += m_retopologyVerts[ring.startIdx + i];
+            center /= static_cast<float>(ring.count);
 
-    // Bottom pole → first ring
-    if (m_bottomPoleIdx != SIZE_MAX && !m_scatterRings.empty()) {
-        const auto& firstRing = m_scatterRings[0];
-        glm::vec3 pole = m_retopologyVerts[m_bottomPoleIdx];
-        for (size_t i = 0; i < firstRing.count; i++) {
-            size_t i1 = (i + 1) % firstRing.count;
-            size_t a = firstRing.startIdx + i;
-            size_t b = firstRing.startIdx + i1;
-            // Triangle: pole, a, b (degenerate quad with pole repeated)
-            RetopologyQuad quad;
-            quad.verts[0] = pole;
-            quad.verts[1] = m_retopologyVerts[a];
-            quad.verts[2] = m_retopologyVerts[b];
-            quad.verts[3] = pole;
-            m_retopologyQuads.push_back(quad);
-            // Edge from pole to each ring point
-            m_scatterEdges.push_back({m_bottomPoleIdx, a});
-            trisCreated++;
-        }
-    }
+            if (m_retopologyLiveObj) {
+                glm::vec3 avgNrm(0.0f);
+                for (size_t i = 0; i < ring.count; i++)
+                    avgNrm += m_retopologyNormals[ring.startIdx + i];
+                if (glm::length(avgNrm) > 0.001f) avgNrm = glm::normalize(avgNrm);
+                else avgNrm = defaultNormal;
+                auto hit = m_retopologyLiveObj->raycast(center + avgNrm * 0.05f, -avgNrm);
+                if (hit.hit) center = hit.position;
+            }
 
-    // Top pole → last ring
-    if (m_topPoleIdx != SIZE_MAX && !m_scatterRings.empty()) {
-        const auto& lastRing = m_scatterRings.back();
-        glm::vec3 pole = m_retopologyVerts[m_topPoleIdx];
-        for (size_t i = 0; i < lastRing.count; i++) {
-            size_t i1 = (i + 1) % lastRing.count;
-            size_t a = lastRing.startIdx + i;
-            size_t b = lastRing.startIdx + i1;
-            RetopologyQuad quad;
-            quad.verts[0] = m_retopologyVerts[a];
-            quad.verts[1] = m_retopologyVerts[b];
-            quad.verts[2] = pole;
-            quad.verts[3] = pole;
-            m_retopologyQuads.push_back(quad);
-            m_scatterEdges.push_back({m_topPoleIdx, a});
-            trisCreated++;
-        }
+            size_t centerIdx = m_retopologyVerts.size();
+            m_retopologyVerts.push_back(center);
+            m_retopologyNormals.push_back(defaultNormal);
+            m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+
+            for (size_t i = 0; i < ring.count; i++) {
+                m_scatterEdges.push_back({centerIdx, ring.startIdx + i});
+            }
+        };
+
+        capRing(m_scatterRings.front(), glm::vec3(0, -1, 0));
+        capRing(m_scatterRings.back(), glm::vec3(0, 1, 0));
     }
 
     m_retopologyMode = true;
     std::cout << "[ConnectVert] " << vertEdges << " vertical edges, "
-              << quadsCreated << " quads, " << trisCreated << " cap tris" << std::endl;
+              << quadsCreated << " quads, 2 ring caps" << std::endl;
 }

@@ -43,22 +43,33 @@ void ModelingMode::drawRetopologyOverlay(float vpX, float vpY, float vpW, float 
     };
 
     // Draw previously created retopo quads as yellow wireframe (backface culled)
-    ImU32 quadEdgeColor = IM_COL32(255, 255, 0, 200);
-    for (const auto& quad : m_retopologyQuads) {
-        if (!quadFacesCamera(quad)) continue;
-        for (int i = 0; i < 4; ++i) {
-            ImVec2 a = worldToScreen(quad.verts[i]);
-            ImVec2 b = worldToScreen(quad.verts[(i + 1) % 4]);
-            if (a.x > -500 && b.x > -500) {
-                drawList->AddLine(a, b, quadEdgeColor, 2.0f);
+    // Skip when scatter edges exist — scatter uses green lines instead
+    if (m_scatterEdges.empty()) {
+        ImU32 quadEdgeColor = IM_COL32(255, 255, 0, 200);
+        for (const auto& quad : m_retopologyQuads) {
+            if (!quadFacesCamera(quad)) continue;
+            for (int i = 0; i < 4; ++i) {
+                ImVec2 a = worldToScreen(quad.verts[i]);
+                ImVec2 b = worldToScreen(quad.verts[(i + 1) % 4]);
+                if (a.x > -500 && b.x > -500) {
+                    drawList->AddLine(a, b, quadEdgeColor, 2.0f);
+                }
             }
         }
     }
 
-    // Draw scatter edges (ring connections) as green lines
+    // Draw scatter edges (ring connections) as green lines — backface culled
     ImU32 scatterEdgeColor = IM_COL32(0, 255, 100, 220);
     for (const auto& edge : m_scatterEdges) {
         if (edge.a >= m_retopologyVerts.size() || edge.b >= m_retopologyVerts.size()) continue;
+        // Cull if both endpoints face away from camera
+        bool aFacing = true, bFacing = true;
+        if (edge.a < m_retopologyNormals.size() && glm::length(m_retopologyNormals[edge.a]) > 0.001f)
+            aFacing = glm::dot(m_retopologyNormals[edge.a], camPos - m_retopologyVerts[edge.a]) > 0.0f;
+        if (edge.b < m_retopologyNormals.size() && glm::length(m_retopologyNormals[edge.b]) > 0.001f)
+            bFacing = glm::dot(m_retopologyNormals[edge.b], camPos - m_retopologyVerts[edge.b]) > 0.0f;
+        if (!aFacing && !bFacing) continue;
+
         ImVec2 a = worldToScreen(m_retopologyVerts[edge.a]);
         ImVec2 b = worldToScreen(m_retopologyVerts[edge.b]);
         if (a.x > -500 && b.x > -500) {
@@ -66,37 +77,48 @@ void ModelingMode::drawRetopologyOverlay(float vpX, float vpY, float vpW, float 
         }
     }
 
-    // Draw existing retopo vertices — only if at least one adjacent quad faces the camera
-    ImU32 existingVertColor = IM_COL32(255, 255, 0, 220);
-    float existingRadius = 6.0f;
-    std::set<size_t> drawnVertPositions;  // Avoid drawing duplicate dots at same screen pos
-    for (size_t qi = 0; qi < m_retopologyQuads.size(); ++qi) {
-        if (!quadFacesCamera(m_retopologyQuads[qi])) continue;
-        for (int i = 0; i < 4; ++i) {
-            ImVec2 screenPos = worldToScreen(m_retopologyQuads[qi].verts[i]);
-            if (screenPos.x > -500) {
-                // Simple dedup by screen pixel
-                size_t key = (size_t(screenPos.x) << 16) | size_t(screenPos.y);
-                if (drawnVertPositions.insert(key).second) {
-                    drawList->AddCircleFilled(screenPos, existingRadius, existingVertColor);
-                    drawList->AddCircle(screenPos, existingRadius, IM_COL32(0, 0, 0, 255), 0, 1.5f);
+    // Draw existing retopo vertices — only in manual mode (not scatter)
+    if (m_scatterEdges.empty()) {
+        ImU32 existingVertColor = IM_COL32(255, 255, 0, 220);
+        float existingRadius = 6.0f;
+        std::set<size_t> drawnVertPositions;
+        for (size_t qi = 0; qi < m_retopologyQuads.size(); ++qi) {
+            if (!quadFacesCamera(m_retopologyQuads[qi])) continue;
+            for (int i = 0; i < 4; ++i) {
+                ImVec2 screenPos = worldToScreen(m_retopologyQuads[qi].verts[i]);
+                if (screenPos.x > -500) {
+                    size_t key = (size_t(screenPos.x) << 16) | size_t(screenPos.y);
+                    if (drawnVertPositions.insert(key).second) {
+                        drawList->AddCircleFilled(screenPos, existingRadius, existingVertColor);
+                        drawList->AddCircle(screenPos, existingRadius, IM_COL32(0, 0, 0, 255), 0, 1.5f);
+                    }
                 }
             }
         }
     }
 
     // Draw currently placed retopo vertices with numbers (red, larger)
+    // Backface cull using stored normals
     ImU32 newVertColor = IM_COL32(255, 50, 50, 255);
     ImU32 existingPickedColor = IM_COL32(50, 255, 50, 255);  // Green for existing vert picks
     float selectedRadius = 10.0f;
 
     for (size_t i = 0; i < m_retopologyVerts.size(); ++i) {
+        // Backface cull: skip points whose normal faces away from camera
+        if (i < m_retopologyNormals.size() && glm::length(m_retopologyNormals[i]) > 0.001f) {
+            glm::vec3 toCamera = camPos - m_retopologyVerts[i];
+            if (glm::dot(m_retopologyNormals[i], toCamera) < 0.0f) continue;
+        }
+
         ImVec2 screenPos = worldToScreen(m_retopologyVerts[i]);
         if (screenPos.x > -500) {
             bool isExisting = (i < m_retopologyVertMeshIdx.size() && m_retopologyVertMeshIdx[i] != UINT32_MAX);
-            ImU32 color = isExisting ? existingPickedColor : newVertColor;
-            drawList->AddCircleFilled(screenPos, selectedRadius, color);
-            drawList->AddCircle(screenPos, selectedRadius, IM_COL32(0, 0, 0, 255), 0, 2.0f);
+            bool isSelected = m_selectedScatterPoints.count(i) > 0;
+            ImU32 color = isSelected ? IM_COL32(255, 255, 0, 255) :
+                          (isExisting ? existingPickedColor : newVertColor);
+            float radius = isSelected ? 12.0f : selectedRadius;
+            drawList->AddCircleFilled(screenPos, radius, color);
+            drawList->AddCircle(screenPos, radius, IM_COL32(0, 0, 0, 255), 0, 2.0f);
             // Draw number (1-based)
             char numStr[8];
             snprintf(numStr, sizeof(numStr), "%zu", i + 1);
@@ -146,9 +168,15 @@ void ModelingMode::drawRetopologyOverlay(float vpX, float vpY, float vpW, float 
 
             for (int a = 0; a < 4; a++) {
                 int ptIdx = a * quarter;
-                if (ring.startIdx + ptIdx >= m_retopologyVerts.size()) continue;
+                size_t vi = ring.startIdx + ptIdx;
+                if (vi >= m_retopologyVerts.size()) continue;
 
-                ImVec2 sp = worldToScreen(m_retopologyVerts[ring.startIdx + ptIdx]);
+                // Backface cull
+                if (vi < m_retopologyNormals.size() && glm::length(m_retopologyNormals[vi]) > 0.001f) {
+                    if (glm::dot(m_retopologyNormals[vi], camPos - m_retopologyVerts[vi]) < 0.0f) continue;
+                }
+
+                ImVec2 sp = worldToScreen(m_retopologyVerts[vi]);
                 if (sp.x <= -500) continue;
 
                 bool isSelected = (m_ringDragging && m_selectedRing == static_cast<int>(ri) && a == 0);
@@ -159,20 +187,6 @@ void ModelingMode::drawRetopologyOverlay(float vpX, float vpY, float vpW, float 
                 drawList->AddCircleFilled(sp, radius, color);
                 drawList->AddCircle(sp, radius, anchorOutline, 0, 2.0f);
 
-                // Show XYZ only on the lead point (point 0)
-                if (a == 0) {
-                    glm::vec3 pos = m_retopologyVerts[ring.startIdx];
-                    char coordBuf[64];
-                    snprintf(coordBuf, sizeof(coordBuf), "%.3f, %.3f, %.3f", pos.x, pos.y, pos.z);
-                    ImVec2 textPos(sp.x + radius + 4, sp.y - 6);
-                    ImU32 textBg = IM_COL32(0, 0, 0, 180);
-                    ImVec2 textSize = ImGui::CalcTextSize(coordBuf);
-                    drawList->AddRectFilled(
-                        ImVec2(textPos.x - 2, textPos.y - 1),
-                        ImVec2(textPos.x + textSize.x + 2, textPos.y + textSize.y + 1),
-                        textBg, 2.0f);
-                    drawList->AddText(textPos, color, coordBuf);
-                }
             }
         }
     }
@@ -257,121 +271,225 @@ void ModelingMode::createRetopologyQuad() {
 }
 
 void ModelingMode::finalizeRetopologyMesh() {
-    if (m_retopologyQuads.empty()) {
-        std::cout << "[Retopo] No quads to finalize" << std::endl;
-        return;
+    if (m_retopologyVerts.empty() || m_scatterEdges.empty()) {
+        // Fallback: use old quad-based method if no scatter data
+        if (!m_retopologyQuads.empty()) {
+            std::cout << "[Retopo] Finalizing from quads (no scatter data)" << std::endl;
+        } else {
+            std::cout << "[Retopo] Nothing to finalize" << std::endl;
+            return;
+        }
     }
 
-    // Build a fresh editable mesh from ONLY the retopo quads (not whatever is in m_ctx.editableMesh)
     EditableMesh retopoMesh;
+    size_t N = m_retopologyVerts.size();
 
-    // Collect unique vertices and build quad index lists
-    std::vector<glm::vec3> uniquePositions;
-    std::vector<std::vector<uint32_t>> quadIndices;
-    const float mergeThreshold = 0.001f;
+    // ── Build directly from scatter vertices and edges ──
+    // Step 1: Build adjacency from scatter edges
+    std::vector<std::set<size_t>> adj(N);
+    for (const auto& e : m_scatterEdges) {
+        if (e.a < N && e.b < N) {
+            adj[e.a].insert(e.b);
+            adj[e.b].insert(e.a);
+        }
+    }
 
-    for (const auto& quad : m_retopologyQuads) {
-        std::vector<uint32_t> faceIndices;
-        for (int i = 0; i < 4; ++i) {
-            // Check if this position already exists
-            uint32_t foundIdx = UINT32_MAX;
-            for (size_t vi = 0; vi < uniquePositions.size(); ++vi) {
-                if (glm::length(uniquePositions[vi] - quad.verts[i]) < mergeThreshold) {
-                    foundIdx = static_cast<uint32_t>(vi);
-                    break;
+    // Step 2: Find all quad faces by walking the edge graph
+    // For each edge (A→B), try to find C and D such that A-B-C-D forms a quad
+    std::set<uint64_t> usedFaces;  // Track found quads to avoid duplicates
+    std::vector<std::vector<uint32_t>> faceIndices;
+
+    auto faceKey = [](std::vector<size_t> verts) -> uint64_t {
+        std::sort(verts.begin(), verts.end());
+        uint64_t key = 0;
+        for (size_t v : verts) key = key * 131071 + v;
+        return key;
+    };
+
+    for (size_t a = 0; a < N; a++) {
+        for (size_t b : adj[a]) {
+            if (b <= a) continue;  // Avoid duplicate edge starts
+            // Find quads: A-B-C-D where B-C, C-D, D-A are all edges
+            for (size_t c : adj[b]) {
+                if (c == a) continue;
+                for (size_t d : adj[c]) {
+                    if (d == b || d == a) continue;
+                    if (adj[d].count(a) == 0) continue;  // D must connect back to A
+                    // Found quad A, B, C, D
+                    std::vector<size_t> fv = {a, b, c, d};
+                    uint64_t key = faceKey(fv);
+                    if (usedFaces.count(key)) continue;
+                    usedFaces.insert(key);
+                    faceIndices.push_back({static_cast<uint32_t>(a), static_cast<uint32_t>(b),
+                                           static_cast<uint32_t>(c), static_cast<uint32_t>(d)});
                 }
             }
-            if (foundIdx == UINT32_MAX) {
-                foundIdx = static_cast<uint32_t>(uniquePositions.size());
-                uniquePositions.push_back(quad.verts[i]);
-            }
-            faceIndices.push_back(foundIdx);
         }
-        quadIndices.push_back(faceIndices);
     }
 
-    // Assign cylindrical UVs using scatter ring topology if available.
-    // Seam along -X anchor points (index N/2 per ring).
-    // U = position around ring starting from seam, V = ring level bottom to top.
-    std::unordered_map<uint32_t, glm::vec2> vertexUVs;
-    bool hasRingUVs = false;
-
-    if (!m_scatterRings.empty()) {
-        int numRings = static_cast<int>(m_scatterRings.size());
-        // Check if we have pole points
-        bool hasBottomPole = (m_bottomPoleIdx != SIZE_MAX && m_bottomPoleIdx < m_retopologyVerts.size());
-        bool hasTopPole = (m_topPoleIdx != SIZE_MAX && m_topPoleIdx < m_retopologyVerts.size());
-
-        for (int ri = 0; ri < numRings; ri++) {
-            const auto& ring = m_scatterRings[ri];
-            int N = static_cast<int>(ring.count);
-            int seamIdx = N / 2;  // -X anchor point = seam
-
-            // V = ring level (0 = bottom, 1 = top)
-            // Leave room for poles at V=0 and V=1
-            float v = (hasBottomPole ? 0.02f : 0.0f) +
-                      (static_cast<float>(ri) / std::max(1, numRings - 1)) *
-                      (1.0f - (hasBottomPole ? 0.02f : 0.0f) - (hasTopPole ? 0.02f : 0.0f));
-
-            for (int pi = 0; pi < N; pi++) {
-                // U starts from the seam (N/2), wraps around
-                int offsetFromSeam = ((pi - seamIdx) + N) % N;
-                float u = static_cast<float>(offsetFromSeam) / N;
-
-                // Find which unique vertex this scatter point maps to
-                glm::vec3 pos = m_retopologyVerts[ring.startIdx + pi];
-                for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
-                    if (glm::length(uniquePositions[vi] - pos) < mergeThreshold) {
-                        vertexUVs[vi] = glm::vec2(u, v);
-                        break;
+    // Also find triangles (pole caps)
+    for (size_t a = 0; a < N; a++) {
+        for (size_t b : adj[a]) {
+            if (b <= a) continue;
+            for (size_t c : adj[b]) {
+                if (c <= a || c == b) continue;
+                if (adj[c].count(a) == 0) continue;
+                std::vector<size_t> fv = {a, b, c};
+                uint64_t key = faceKey(fv);
+                if (usedFaces.count(key)) continue;
+                // Only add as triangle if none of the 3 form a quad — skip if part of a quad
+                bool partOfQuad = false;
+                for (const auto& face : faceIndices) {
+                    if (face.size() == 4) {
+                        int matches = 0;
+                        for (uint32_t fi : face) {
+                            if (fi == a || fi == b || fi == c) matches++;
+                        }
+                        if (matches >= 3) { partOfQuad = true; break; }
                     }
                 }
-            }
-        }
-
-        // Pole UVs
-        if (hasBottomPole) {
-            glm::vec3 polePos = m_retopologyVerts[m_bottomPoleIdx];
-            for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
-                if (glm::length(uniquePositions[vi] - polePos) < mergeThreshold) {
-                    vertexUVs[vi] = glm::vec2(0.5f, 0.0f);
-                    break;
+                if (!partOfQuad) {
+                    usedFaces.insert(key);
+                    faceIndices.push_back({static_cast<uint32_t>(a), static_cast<uint32_t>(b),
+                                           static_cast<uint32_t>(c)});
                 }
             }
-        }
-        if (hasTopPole) {
-            glm::vec3 polePos = m_retopologyVerts[m_topPoleIdx];
-            for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
-                if (glm::length(uniquePositions[vi] - polePos) < mergeThreshold) {
-                    vertexUVs[vi] = glm::vec2(0.5f, 1.0f);
-                    break;
-                }
-            }
-        }
-
-        hasRingUVs = !vertexUVs.empty();
-        if (hasRingUVs) {
-            std::cout << "[Retopo] Assigned cylindrical UVs from ring topology ("
-                      << vertexUVs.size() << " verts, seam at -X)" << std::endl;
         }
     }
 
-    // Add vertices to the fresh mesh
-    for (uint32_t vi = 0; vi < static_cast<uint32_t>(uniquePositions.size()); vi++) {
+    std::cout << "[Retopo] Built " << faceIndices.size() << " faces from " << N
+              << " verts and " << m_scatterEdges.size() << " edges" << std::endl;
+
+    // Step 3: Spherical UV projection from mesh center
+    // U = longitude (theta), V = latitude (phi). Seam at -Z (back of head).
+    std::vector<glm::vec2> vertexUVs(N, glm::vec2(0.0f));
+    {
+        // Compute mesh center
+        glm::vec3 meshCenter(0.0f);
+        for (size_t vi = 0; vi < N; vi++) meshCenter += m_retopologyVerts[vi];
+        meshCenter /= static_cast<float>(N);
+
+        // Compute mesh vertical extent for V normalization
+        float minY = FLT_MAX, maxY = -FLT_MAX;
+        for (size_t vi = 0; vi < N; vi++) {
+            minY = std::min(minY, m_retopologyVerts[vi].y);
+            maxY = std::max(maxY, m_retopologyVerts[vi].y);
+        }
+        float heightRange = maxY - minY;
+        if (heightRange < 0.0001f) heightRange = 1.0f;
+
+        for (size_t vi = 0; vi < N; vi++) {
+            glm::vec3 dir = m_retopologyVerts[vi] - meshCenter;
+
+            // U = longitude: atan2(x, z) gives angle on XZ plane
+            // Offset so seam is at -Z (back): atan2(x, z) = 0 at +Z (front), π at -Z (back)
+            float theta = std::atan2(dir.x, dir.z);  // -π to π, 0 = +Z (front)
+            // Shift so seam is at -Z: theta=π and theta=-π both map to the seam
+            float u = (theta + 3.14159f) / (2.0f * 3.14159f);  // 0 at -Z, wraps to 1 at -Z
+
+            // V = latitude: normalize Y position to 0-1
+            float v = (m_retopologyVerts[vi].y - minY) / heightRange;
+
+            vertexUVs[vi] = glm::vec2(u, v);
+        }
+    }
+
+    // Step 4: Fix UV seam — duplicate vertices at the seam where U wraps from ~1 to ~0
+    // For each face, if any edge has a U jump > 0.5, duplicate the low-U verts with U+1
+    // Then we'll have correct faces. Extra verts with U>1 get rescaled at the end.
+    std::unordered_map<size_t, size_t> seamDuplicates;  // original idx → duplicate idx (U+1)
+
+    for (auto& fi : faceIndices) {
+        // Check if this face crosses the seam
+        bool crossesSeam = false;
+        float maxU = -FLT_MAX, minU = FLT_MAX;
+        for (uint32_t idx : fi) {
+            maxU = std::max(maxU, vertexUVs[idx].x);
+            minU = std::min(minU, vertexUVs[idx].x);
+        }
+        crossesSeam = (maxU - minU) > 0.5f;
+
+        if (crossesSeam) {
+            // Duplicate low-U vertices with U+1
+            for (size_t i = 0; i < fi.size(); i++) {
+                uint32_t idx = fi[i];
+                if (vertexUVs[idx].x < 0.5f) {
+                    // Need a duplicate with U+1
+                    auto dupIt = seamDuplicates.find(idx);
+                    size_t dupIdx;
+                    if (dupIt != seamDuplicates.end()) {
+                        dupIdx = dupIt->second;
+                    } else {
+                        dupIdx = vertexUVs.size();
+                        // Copy position/normal from original, UV with U+1
+                        m_retopologyVerts.push_back(m_retopologyVerts[idx]);
+                        if (idx < m_retopologyNormals.size())
+                            m_retopologyNormals.push_back(m_retopologyNormals[idx]);
+                        else
+                            m_retopologyNormals.push_back(glm::vec3(0, 1, 0));
+                        vertexUVs.push_back(glm::vec2(vertexUVs[idx].x + 1.0f, vertexUVs[idx].y));
+                        seamDuplicates[idx] = dupIdx;
+                    }
+                    fi[i] = static_cast<uint32_t>(dupIdx);
+                }
+            }
+        }
+    }
+
+    // Update N to include duplicates
+    N = vertexUVs.size();
+
+    // Rescale all U values to fit 0-1 (max U might be >1 from seam dups)
+    float maxU = 0.0f;
+    for (size_t vi = 0; vi < N; vi++) maxU = std::max(maxU, vertexUVs[vi].x);
+    if (maxU > 1.0f) {
+        for (size_t vi = 0; vi < N; vi++) vertexUVs[vi].x /= maxU;
+    }
+
+    // Step 4b: Add vertices to mesh
+    for (size_t vi = 0; vi < N; vi++) {
         HEVertex v;
-        v.position = uniquePositions[vi];
-        v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
-        auto uvIt = vertexUVs.find(vi);
-        v.uv = (uvIt != vertexUVs.end()) ? uvIt->second : glm::vec2(0.0f);
+        v.position = (vi < m_retopologyVerts.size()) ? m_retopologyVerts[vi] : glm::vec3(0);
+        v.normal = (vi < m_retopologyNormals.size()) ? m_retopologyNormals[vi] : glm::vec3(0, 1, 0);
+        v.uv = vertexUVs[vi];
         v.color = glm::vec4(0.7f, 0.7f, 0.7f, 1.0f);
         v.halfEdgeIndex = UINT32_MAX;
         v.selected = false;
         retopoMesh.addVertex(v);
     }
 
-    // Add quad faces
-    for (const auto& fi : quadIndices) {
-        retopoMesh.addQuadFace(fi);
+    if (!seamDuplicates.empty())
+        std::cout << "[Retopo] Duplicated " << seamDuplicates.size() << " seam vertices for UV wrap" << std::endl;
+
+    // Step 5: Fix winding then add faces
+    // Compute mesh center for outward direction test
+    glm::vec3 meshCenter(0.0f);
+    for (size_t vi = 0; vi < N; vi++) meshCenter += m_retopologyVerts[vi];
+    meshCenter /= static_cast<float>(N);
+
+    for (auto& fi : faceIndices) {
+        if (fi.size() < 3) continue;
+
+        // Compute face center and normal from winding
+        glm::vec3 faceCenter(0.0f);
+        for (uint32_t idx : fi) faceCenter += m_retopologyVerts[idx];
+        faceCenter /= static_cast<float>(fi.size());
+
+        glm::vec3 e1 = m_retopologyVerts[fi[1]] - m_retopologyVerts[fi[0]];
+        glm::vec3 e2 = m_retopologyVerts[fi[fi.size()-1]] - m_retopologyVerts[fi[0]];
+        glm::vec3 faceNormal = glm::cross(e1, e2);
+
+        // Should point outward: away from mesh center
+        glm::vec3 outDir = faceCenter - meshCenter;
+        if (glm::dot(faceNormal, outDir) < 0.0f) {
+            std::reverse(fi.begin(), fi.end());
+        }
+
+        if (fi.size() == 4) {
+            retopoMesh.addQuadFace(fi);
+        } else {
+            retopoMesh.addFace(fi);
+        }
     }
 
     // Find or create the retopo scene object
@@ -477,6 +595,6 @@ void ModelingMode::finalizeRetopologyMesh() {
     m_retopologyVertMeshIdx.clear();
     m_retopologyObjCreated = false;
     std::cout << "[Retopo] Finalized retopo mesh: " << retopoMesh.getFaceCount()
-              << " faces, " << uniquePositions.size() << " vertices, "
+              << " faces, " << N << " vertices, "
               << indices.size() / 3 << " triangles" << std::endl;
 }

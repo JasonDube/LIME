@@ -817,6 +817,26 @@ void ModelingMode::renderModelingEditorUI() {
             ImGui::SetTooltip("When enabled, gizmo moves entire object instead of components");
         }
 
+        // Mesh stats
+        if (m_ctx.selectedObject && m_ctx.editableMesh.isValid()) {
+            int quads = 0, tris = 0, ngons = 0;
+            for (uint32_t fi = 0; fi < m_ctx.editableMesh.getFaceCount(); fi++) {
+                uint32_t vc = m_ctx.editableMesh.getFace(fi).vertexCount;
+                if (vc == 4) quads++;
+                else if (vc == 3) tris++;
+                else ngons++;
+            }
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f),
+                "V:%zu  Q:%d  T:%d  F:%zu",
+                m_ctx.editableMesh.getVertexCount(), quads, tris,
+                m_ctx.editableMesh.getFaceCount());
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Vertices: %zu\nQuads: %d\nTriangles: %d\nTotal faces: %zu",
+                    m_ctx.editableMesh.getVertexCount(), quads, tris,
+                    m_ctx.editableMesh.getFaceCount());
+            }
+        }
+
         if (m_ctx.selectedObject) {
             ImGui::SameLine();
             if (ImGui::Button("Duplicate")) {
@@ -1459,11 +1479,18 @@ void ModelingMode::renderModelingEditorUI() {
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Distance between points in centimeters.\nSmaller = more points, denser coverage.");
                 }
-                if (ImGui::Button("Scatter Points On Surface")) {
+                if (ImGui::Button("Scatter Contour")) {
                     scatterPointsOnSurface();
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Place evenly spaced retopo vertices across the entire live surface");
+                    ImGui::SetTooltip("Horizontal contour rings on the live surface");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Scatter Spherical")) {
+                    scatterSpherical();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Project a UV sphere inward onto the live surface (balloon shrinkwrap)");
                 }
 
                 if (m_scatterRings.empty()) ImGui::BeginDisabled();
@@ -1483,6 +1510,33 @@ void ModelingMode::renderModelingEditorUI() {
                     ImGui::SetTooltip("Vertical: connect matching indices between rings + create quads");
                 }
                 if (m_scatterRings.size() < 2) ImGui::EndDisabled();
+
+                if (m_scatterRings.empty()) ImGui::BeginDisabled();
+                if (ImGui::Button("Align Anchors")) {
+                    alignScatterAnchors();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Re-align anchor points to axis crossings after sliding rings");
+                }
+                if (m_scatterRings.empty()) ImGui::EndDisabled();
+
+                if (m_selectedScatterPoints.size() != 4) ImGui::BeginDisabled();
+                if (ImGui::Button("Subdivide Quad")) {
+                    subdivideSelectedQuad();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (m_selectedScatterPoints.size() != 4)
+                        ImGui::SetTooltip("Click 4 points to select them, then subdivide (%zu/4 selected)",
+                                          m_selectedScatterPoints.size());
+                    else
+                        ImGui::SetTooltip("Split the selected quad into 4 sub-quads (9 points)");
+                }
+                if (m_selectedScatterPoints.size() != 4) ImGui::EndDisabled();
+
+                ImGui::Checkbox("Symmetry X", &m_scatterSymmetryX);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Mirror point moves across X=0.\nPoints on the X=0 line move alone.");
+                }
 
                 // Patch Blanket — targeted rectangle into retopo quads
                 ImGui::Spacing();
@@ -1595,6 +1649,11 @@ void ModelingMode::renderModelingEditorUI() {
                 }
                 if (ImGui::SliderFloat("Yaw", &m_slicePlaneRotationY, -180.0f, 180.0f, "%.1f deg")) {
                     updateSlicePlaneFromParams();
+                }
+
+                ImGui::Checkbox("Cap Holes", &m_sliceCapHoles);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Fill the open holes after slicing with a cap face");
                 }
 
                 ImGui::Spacing();
@@ -5133,6 +5192,18 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         duplicateSelectedObject();
     }
 
+    // Toggle wireframe (1 key)
+    if (Input::isKeyPressed(Input::KEY_1) && !Input::isKeyDown(Input::KEY_LEFT_CONTROL)
+        && !ImGui::GetIO().WantTextInput) {
+        m_ctx.showModelingWireframe = !m_ctx.showModelingWireframe;
+    }
+
+    // Toggle grid (2 key)
+    if (Input::isKeyPressed(Input::KEY_2) && !Input::isKeyDown(Input::KEY_LEFT_CONTROL)
+        && !ImGui::GetIO().WantTextInput) {
+        m_ctx.showGrid = !m_ctx.showGrid;
+    }
+
     // Delete selected faces (not during retopo mode)
     if (!m_retopologyMode && Input::isKeyPressed(Input::KEY_DELETE)) {
         if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
@@ -5490,9 +5561,48 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         }
     }
 
-    // Scatter ring slide: G near a green dot → drag left/right to slide points along contour
+    // Scatter point selection: LMB click to toggle select (up to 4) for subdivide
+    if (m_retopologyMode && !m_scatterRings.empty() && !m_ringDragging && !m_retopologyDragging
+        && !mouseOverImGui && Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
+        Camera& selCam = m_ctx.getActiveCamera();
+        glm::mat4 selVP = selCam.getProjectionMatrix(
+            static_cast<float>(m_ctx.window.getWidth()) / static_cast<float>(m_ctx.window.getHeight()))
+            * selCam.getViewMatrix();
+        float sVpW = static_cast<float>(m_ctx.window.getWidth());
+        float sVpH = static_cast<float>(m_ctx.window.getHeight());
+        ImVec2 sMouse = ImGui::GetMousePos();
+        glm::vec3 sCamPos = selCam.getPosition();
+
+        float closestDist = 15.0f;
+        int closestIdx = -1;
+        for (size_t i = 0; i < m_retopologyVerts.size(); i++) {
+            // Loose backface cull — allow perpendicular normals (center line points)
+            if (i < m_retopologyNormals.size() && glm::length(m_retopologyNormals[i]) > 0.001f) {
+                glm::vec3 toCamera = glm::normalize(sCamPos - m_retopologyVerts[i]);
+                if (glm::dot(m_retopologyNormals[i], toCamera) < -0.3f) continue;
+            }
+            glm::vec4 clip = selVP * glm::vec4(m_retopologyVerts[i], 1.0f);
+            if (clip.w <= 0.0f) continue;
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            glm::vec2 sp((ndc.x + 1.0f) * 0.5f * sVpW, (1.0f - ndc.y) * 0.5f * sVpH);
+            float d = glm::length(sp - glm::vec2(sMouse.x, sMouse.y));
+            if (d < closestDist) { closestDist = d; closestIdx = static_cast<int>(i); }
+        }
+
+        if (closestIdx >= 0) {
+            size_t idx = static_cast<size_t>(closestIdx);
+            if (m_selectedScatterPoints.count(idx)) {
+                m_selectedScatterPoints.erase(idx);  // Deselect
+            } else if (m_selectedScatterPoints.size() < 4) {
+                m_selectedScatterPoints.insert(idx);  // Select
+            }
+        }
+    }
+
+    // Scatter ring slide: Ctrl+G near a green dot → drag left/right to slide, up/down to raise/lower
     if (m_retopologyMode && !m_scatterRings.empty() && !m_ringDragging && !mouseOverImGui
-        && Input::isKeyPressed(Input::KEY_G)) {
+        && Input::isKeyPressed(Input::KEY_G)
+        && (Input::isKeyDown(Input::KEY_LEFT_CONTROL) || Input::isKeyDown(Input::KEY_RIGHT_CONTROL))) {
         Camera& rcam = m_ctx.getActiveCamera();
         glm::mat4 rcVP = rcam.getProjectionMatrix(
             static_cast<float>(m_ctx.window.getWidth()) / static_cast<float>(m_ctx.window.getHeight()))
@@ -5517,44 +5627,80 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
             m_ringDragging = true;
             m_selectedRing = closestRing;
             m_ringDragStartX = rMouse.x;
+            m_ringDragStartY = rMouse.y;
             m_ringDragStartOffset = m_scatterRings[closestRing].slideOffset;
+            m_ringDragStartSliceY = m_scatterRings[closestRing].sliceY;
             m_scatterEdges.clear();
             m_retopologyQuads.clear();
             std::cout << "[Scatter] Grabbed ring " << closestRing
-                      << " — drag left/right to slide, LMB to confirm, ESC to cancel" << std::endl;
+                      << " — drag L/R to slide, U/D to raise/lower, LMB confirm, ESC cancel" << std::endl;
         }
     }
 
     if (m_ringDragging && m_selectedRing >= 0 && m_selectedRing < static_cast<int>(m_scatterRings.size())) {
         ImVec2 rMouse = ImGui::GetMousePos();
         float dx = rMouse.x - m_ringDragStartX;
+        float dy = rMouse.y - m_ringDragStartY;
 
-        // Convert pixel drag to contour distance (scale by contour length / screen width)
         auto& ring = m_scatterRings[m_selectedRing];
-        float sensitivity = ring.totalLen / static_cast<float>(m_ctx.window.getWidth());
-        ring.slideOffset = m_ringDragStartOffset + dx * sensitivity;
 
-        // Re-place all points along the contour at new positions
+        // Left/right: slide along contour
+        float slideSensitivity = ring.totalLen / static_cast<float>(m_ctx.window.getWidth());
+        ring.slideOffset = m_ringDragStartOffset + dx * slideSensitivity;
         resampleRing(static_cast<size_t>(m_selectedRing));
 
+        // Up/down: raise/lower ring (re-slice at new Y)
+        // Mouse Y is inverted (up = negative), scale by model height / screen height
+        float heightRange = 2.0f;  // approximate model height in units
+        float heightSensitivity = heightRange / static_cast<float>(m_ctx.window.getHeight());
+        float newY = m_ringDragStartSliceY - dy * heightSensitivity;
+        if (std::abs(newY - ring.sliceY) > 0.001f) {
+            resliceRing(static_cast<size_t>(m_selectedRing), newY);
+        }
+
         if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
-            std::cout << "[Scatter] Ring " << m_selectedRing << " slide confirmed (offset=" << ring.slideOffset << ")" << std::endl;
+            std::cout << "[Scatter] Ring " << m_selectedRing << " adjusted (slide=" << ring.slideOffset
+                      << " Y=" << ring.sliceY << ")" << std::endl;
             m_ringDragging = false;
         }
 
         if (Input::isKeyPressed(Input::KEY_ESCAPE)) {
             ring.slideOffset = m_ringDragStartOffset;
-            resampleRing(static_cast<size_t>(m_selectedRing));
-            std::cout << "[Scatter] Ring slide cancelled" << std::endl;
+            resliceRing(static_cast<size_t>(m_selectedRing), m_ringDragStartSliceY);
+            std::cout << "[Scatter] Ring adjustment cancelled" << std::endl;
             m_ringDragging = false;
         }
     }
 
     // Retopology: G key grab — press G near a vertex to grab it, move mouse to slide on surface,
     // LMB to confirm, ESC to cancel
-    if (m_retopologyMode && m_retopologyLiveObj && !m_retopologyQuads.empty() && !m_ringDragging) {
-        if (!m_retopologyDragging && Input::isKeyPressed(Input::KEY_G)) {
-            // Start grab: find nearest retopo vertex under cursor (screen-space)
+    // Works with both quad vertices and scatter points
+    if (m_retopologyMode && m_retopologyLiveObj && !m_ringDragging
+        && (!m_retopologyQuads.empty() || !m_retopologyVerts.empty())) {
+        // If already dragging and G pressed, cancel the current drag
+        if (m_retopologyDragging && Input::isKeyPressed(Input::KEY_G)
+            && !Input::isKeyDown(Input::KEY_LEFT_CONTROL) && !Input::isKeyDown(Input::KEY_RIGHT_CONTROL)) {
+            // Restore original position
+            if (m_retopologyDragQuadIdx >= 0) {
+                glm::vec3 currentPos = m_retopologyQuads[m_retopologyDragQuadIdx].verts[m_retopologyDragQuadVert];
+                const float mt = 0.001f;
+                for (auto& quad : m_retopologyQuads) {
+                    for (int vi = 0; vi < 4; ++vi) {
+                        if (glm::length(quad.verts[vi] - currentPos) < mt)
+                            quad.verts[vi] = m_retopologyDragOrigPos;
+                    }
+                }
+            } else if (m_retopologyDragQuadVert >= 0 && m_retopologyDragQuadVert < static_cast<int>(m_retopologyVerts.size())) {
+                m_retopologyVerts[m_retopologyDragQuadVert] = m_retopologyDragOrigPos;
+            }
+            m_retopologyDragging = false;
+            m_retopologyDragQuadIdx = -1;
+            m_retopologyDragQuadVert = -1;
+            std::cout << "[Retopo] Grab cancelled (G pressed while dragging)" << std::endl;
+        }
+
+        if (!m_retopologyDragging && Input::isKeyPressed(Input::KEY_G)
+            && !Input::isKeyDown(Input::KEY_LEFT_CONTROL) && !Input::isKeyDown(Input::KEY_RIGHT_CONTROL)) {
             glm::vec3 rayOrigin, rayDir;
             m_ctx.getMouseRay(rayOrigin, rayDir);
 
@@ -5576,10 +5722,11 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
             float closestPixelDist = std::numeric_limits<float>::max();
             int foundQuadIdx = -1;
             int foundQuadVert = -1;
+            int foundScatterIdx = -1;  // Index into m_retopologyVerts
             const float grabPixelThreshold = 20.0f;
 
+            // Search quad vertices
             for (size_t qi = 0; qi < m_retopologyQuads.size(); ++qi) {
-                // Backface cull
                 glm::vec3 e1 = m_retopologyQuads[qi].verts[1] - m_retopologyQuads[qi].verts[0];
                 glm::vec3 e2 = m_retopologyQuads[qi].verts[3] - m_retopologyQuads[qi].verts[0];
                 glm::vec3 fNorm = glm::cross(e1, e2);
@@ -5594,7 +5741,20 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                         closestPixelDist = pixelDist;
                         foundQuadIdx = static_cast<int>(qi);
                         foundQuadVert = vi;
+                        foundScatterIdx = -1;
                     }
+                }
+            }
+
+            // Search scatter vertices (backface culling disabled for debugging)
+            for (size_t i = 0; i < m_retopologyVerts.size(); i++) {
+                glm::vec2 screenPos = grabWorldToScreen(m_retopologyVerts[i]);
+                float pixelDist = glm::length(screenPos - glm::vec2(gMousePos.x, gMousePos.y));
+                if (pixelDist < grabPixelThreshold && pixelDist < closestPixelDist) {
+                    closestPixelDist = pixelDist;
+                    foundScatterIdx = static_cast<int>(i);
+                    foundQuadIdx = -1;
+                    foundQuadVert = -1;
                 }
             }
 
@@ -5602,9 +5762,25 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                 m_retopologyDragging = true;
                 m_retopologyDragQuadIdx = foundQuadIdx;
                 m_retopologyDragQuadVert = foundQuadVert;
-                // Store original position for cancel
                 m_retopologyDragOrigPos = m_retopologyQuads[foundQuadIdx].verts[foundQuadVert];
-                std::cout << "[Retopo] Grabbed vertex (G key) — move mouse, LMB to confirm, ESC to cancel" << std::endl;
+                std::cout << "[Retopo] Grabbed quad vertex — move mouse, LMB to confirm, ESC to cancel" << std::endl;
+            } else if (foundScatterIdx >= 0) {
+                m_retopologyDragging = true;
+                m_retopologyDragQuadIdx = -1;
+                m_retopologyDragQuadVert = foundScatterIdx;
+                m_retopologyDragOrigPos = m_retopologyVerts[foundScatterIdx];
+
+                // Find mirror point at grab start using stored pairs
+                m_dragMirrorIdx = -1;
+                if (m_scatterSymmetryX) {
+                    auto pairIt = m_mirrorPairs.find(static_cast<size_t>(foundScatterIdx));
+                    if (pairIt != m_mirrorPairs.end()) {
+                        m_dragMirrorIdx = static_cast<int>(pairIt->second);
+                    }
+                }
+                std::cout << "[Retopo] Grabbed scatter point " << foundScatterIdx
+                          << (m_dragMirrorIdx >= 0 ? " (mirror: " + std::to_string(m_dragMirrorIdx) + ")" : "")
+                          << " — move mouse, LMB to confirm, ESC to cancel" << std::endl;
             }
         }
 
@@ -5614,13 +5790,61 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
             m_ctx.getMouseRay(rayOrigin, rayDir);
 
             auto hit = m_retopologyLiveObj->raycast(rayOrigin, rayDir);
-            if (hit.hit && m_retopologyDragQuadIdx >= 0) {
-                glm::vec3 oldPos = m_retopologyQuads[m_retopologyDragQuadIdx].verts[m_retopologyDragQuadVert];
-                const float mergeThreshold = 0.001f;
-                for (size_t qi = 0; qi < m_retopologyQuads.size(); ++qi) {
-                    for (int vi = 0; vi < 4; ++vi) {
-                        if (glm::length(m_retopologyQuads[qi].verts[vi] - oldPos) < mergeThreshold) {
-                            m_retopologyQuads[qi].verts[vi] = hit.position;
+            if (hit.hit) {
+                if (m_retopologyDragQuadIdx >= 0) {
+                    // Dragging a quad vertex
+                    glm::vec3 oldPos = m_retopologyQuads[m_retopologyDragQuadIdx].verts[m_retopologyDragQuadVert];
+                    const float mergeThreshold = 0.001f;
+                    for (size_t qi = 0; qi < m_retopologyQuads.size(); ++qi) {
+                        for (int vi = 0; vi < 4; ++vi) {
+                            if (glm::length(m_retopologyQuads[qi].verts[vi] - oldPos) < mergeThreshold) {
+                                m_retopologyQuads[qi].verts[vi] = hit.position;
+                            }
+                        }
+                    }
+                } else if (m_retopologyDragQuadVert >= 0 && m_retopologyDragQuadVert < static_cast<int>(m_retopologyVerts.size())) {
+                    // Dragging a scatter point
+                    int si = m_retopologyDragQuadVert;
+                    glm::vec3 oldPos = m_retopologyVerts[si];
+                    m_retopologyVerts[si] = hit.position;
+                    m_retopologyNormals[si] = hit.normal;
+
+                    // Symmetry X: move the mirror point (found at grab start)
+                    if (m_scatterSymmetryX && m_dragMirrorIdx >= 0
+                        && m_dragMirrorIdx < static_cast<int>(m_retopologyVerts.size())) {
+                        glm::vec3 mirrorTarget(-hit.position.x, hit.position.y, hit.position.z);
+                        glm::vec3 mirrorNormal = m_retopologyNormals[m_dragMirrorIdx];
+                        if (glm::length(mirrorNormal) < 0.001f)
+                            mirrorNormal = glm::vec3(-hit.normal.x, hit.normal.y, hit.normal.z);
+
+                        glm::vec3 mirrorRayOrigin = mirrorTarget + mirrorNormal * 0.05f;
+                        auto mirrorHit = m_retopologyLiveObj->raycast(mirrorRayOrigin, -mirrorNormal);
+
+                        glm::vec3 oldMirrorPos = m_retopologyVerts[m_dragMirrorIdx];
+                        glm::vec3 newMirrorPos = (mirrorHit.hit && glm::length(mirrorHit.position - mirrorTarget) < 0.15f)
+                            ? mirrorHit.position : mirrorTarget;
+                        glm::vec3 newMirrorNrm = (mirrorHit.hit && glm::length(mirrorHit.position - mirrorTarget) < 0.15f)
+                            ? mirrorHit.normal : mirrorNormal;
+
+                        m_retopologyVerts[m_dragMirrorIdx] = newMirrorPos;
+                        m_retopologyNormals[m_dragMirrorIdx] = newMirrorNrm;
+
+                        const float mt = 0.001f;
+                        for (auto& quad : m_retopologyQuads) {
+                            for (int vi = 0; vi < 4; ++vi) {
+                                if (glm::length(quad.verts[vi] - oldMirrorPos) < mt)
+                                    quad.verts[vi] = newMirrorPos;
+                            }
+                        }
+                    }
+
+                    // Update quads referencing the dragged point
+                    const float mergeThreshold = 0.001f;
+                    for (auto& quad : m_retopologyQuads) {
+                        for (int vi = 0; vi < 4; ++vi) {
+                            if (glm::length(quad.verts[vi] - oldPos) < mergeThreshold) {
+                                quad.verts[vi] = hit.position;
+                            }
                         }
                     }
                 }
@@ -5634,8 +5858,8 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                 m_retopologyDragQuadVert = -1;
             }
 
-            // ESC cancels — restore original position
-            if (Input::isKeyPressed(Input::KEY_ESCAPE)) {
+            // ESC or RMB cancels — restore original position
+            if (Input::isKeyPressed(Input::KEY_ESCAPE) || Input::isMouseButtonPressed(Input::MOUSE_RIGHT)) {
                 if (m_retopologyDragQuadIdx >= 0) {
                     glm::vec3 currentPos = m_retopologyQuads[m_retopologyDragQuadIdx].verts[m_retopologyDragQuadVert];
                     const float mergeThreshold = 0.001f;
@@ -5646,6 +5870,8 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                             }
                         }
                     }
+                } else if (m_retopologyDragQuadVert >= 0 && m_retopologyDragQuadVert < static_cast<int>(m_retopologyVerts.size())) {
+                    m_retopologyVerts[m_retopologyDragQuadVert] = m_retopologyDragOrigPos;
                 }
                 std::cout << "[Retopo] Grab cancelled" << std::endl;
                 m_retopologyDragging = false;

@@ -1408,10 +1408,6 @@ uint32_t EditableMesh::addQuadFace(const std::vector<uint32_t>& vertIndices) {
     m_faces.push_back(face);
     rebuildEdgeMap();
 
-    std::cout << "Added quad face " << faceIdx << " with vertices: "
-              << vertIndices[0] << ", " << vertIndices[1] << ", "
-              << vertIndices[2] << ", " << vertIndices[3]
-              << " (vertexCount=" << face.vertexCount << ")" << std::endl;
 
     return faceIdx;
 }

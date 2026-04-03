@@ -281,8 +281,10 @@ private:
 
     // Scatter points on surface (evenly spaced retopo vertices)
     void scatterPointsOnSurface();
+    void scatterSpherical();       // Project UV sphere onto surface from all directions
     void connectScatterRings();    // Horizontal: connect points within each ring
     void connectScatterVertical(); // Vertical: connect matching indices between adjacent rings + quads
+    void alignScatterAnchors();    // Re-slide rings so anchors land on axis crossings
     float m_scatterSpacing = 5.0f;  // cm
     struct ScatterRing {
         size_t startIdx;  // index into m_retopologyVerts
@@ -293,17 +295,26 @@ private:
         std::vector<float> cumDist;  // cumulative distance along contour
         float totalLen = 0.0f;
         float slideOffset = 0.0f;  // current slide offset in distance units
+        float sliceY = 0.0f;       // original slice height for re-slicing
     };
     std::vector<ScatterRing> m_scatterRings;
     struct ScatterEdge { size_t a, b; };
     std::vector<ScatterEdge> m_scatterEdges;
     size_t m_bottomPoleIdx = SIZE_MAX;
     size_t m_topPoleIdx = SIZE_MAX;
+    bool m_scatterSymmetryX = false;  // Mirror point moves across X=0
+    int m_dragMirrorIdx = -1;         // Mirror point index found at grab start
+    std::unordered_map<size_t, size_t> m_mirrorPairs;  // Point index → its mirror partner index
+    std::set<size_t> m_selectedScatterPoints;  // Up to 4 selected for subdivide
+    void subdivideSelectedQuad();              // Split 4 selected points into 4 sub-quads
     int m_selectedRing = -1;
     bool m_ringDragging = false;
     float m_ringDragStartX = 0.0f;
+    float m_ringDragStartY = 0.0f;
     float m_ringDragStartOffset = 0.0f;  // slideOffset when drag started
+    float m_ringDragStartSliceY = 0.0f;  // sliceY when drag started
     void resampleRing(size_t ringIdx);    // Re-place points along stored contour at current slideOffset
+    void resliceRing(size_t ringIdx, float newY);  // Re-slice at new Y, rebuild contour, resample
 
     // Quad blanket retopology (view-based grid projection)
     void quadBlanketRetopology();
@@ -361,6 +372,7 @@ private:
     float m_slicePlaneRotationX = 0.0f;   // Pitch (degrees)
     float m_slicePlaneRotationY = 0.0f;   // Yaw (degrees)
     int m_slicePresetAxis = 1;            // 0=X, 1=Y, 2=Z
+    bool m_sliceCapHoles = false;         // Fill holes after slicing
 
     // Slice methods
     void cancelSliceMode();
