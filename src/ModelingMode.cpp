@@ -547,35 +547,7 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
             return ImVec2(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
         };
 
-        // Orange outline for selected objects
-        ImU32 selectionColor = IM_COL32(255, 165, 0, 200);
-        float lineThickness = 2.0f;
-
-        for (SceneObject* obj : m_ctx.selectedObjects) {
-            if (!obj || !obj->isVisible() || !obj->hasMeshData()) continue;
-            // Skip the primary selected object if wireframe is already shown
-            if (obj == m_ctx.selectedObject && m_ctx.showModelingWireframe) continue;
-
-            const auto& verts = obj->getVertices();
-            const auto& indices = obj->getIndices();
-            glm::mat4 modelMatrix = obj->getTransform().getMatrix();
-
-            // Draw triangle edges
-            for (size_t i = 0; i + 2 < indices.size(); i += 3) {
-                glm::vec3 p0 = glm::vec3(modelMatrix * glm::vec4(verts[indices[i]].position, 1.0f));
-                glm::vec3 p1 = glm::vec3(modelMatrix * glm::vec4(verts[indices[i+1]].position, 1.0f));
-                glm::vec3 p2 = glm::vec3(modelMatrix * glm::vec4(verts[indices[i+2]].position, 1.0f));
-
-                ImVec2 s0 = worldToScreen(p0);
-                ImVec2 s1 = worldToScreen(p1);
-                ImVec2 s2 = worldToScreen(p2);
-
-                // Only draw if all points are in front of camera
-                if (s0.x > -500 && s1.x > -500) drawList->AddLine(s0, s1, selectionColor, lineThickness);
-                if (s1.x > -500 && s2.x > -500) drawList->AddLine(s1, s2, selectionColor, lineThickness);
-                if (s2.x > -500 && s0.x > -500) drawList->AddLine(s2, s0, selectionColor, lineThickness);
-            }
-        }
+        // Selection outline disabled — user prefers clean viewport
 
         drawList->PopClipRect();
     }
@@ -1537,6 +1509,26 @@ void ModelingMode::renderModelingEditorUI() {
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Mirror point moves across X=0.\nPoints on the X=0 line move alone.");
                 }
+
+                // Extract tool
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "Extract");
+                ImGui::Separator();
+                const char* extractModes[] = {"Include Partial", "Exclude Partial"};
+                int extractIdx = static_cast<int>(m_extractMode);
+                if (ImGui::Combo("Mode##extract", &extractIdx, extractModes, 2)) {
+                    m_extractMode = static_cast<ExtractMode>(extractIdx);
+                }
+
+                bool canExtract = m_retopologyLiveObj && !m_retopologyQuads.empty();
+                if (!canExtract) ImGui::BeginDisabled();
+                if (ImGui::Button("Extract Under Grid")) {
+                    performExtract();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Pull faces under the retopo grid off the original mesh");
+                }
+                if (!canExtract) ImGui::EndDisabled();
 
                 // Patch Blanket — targeted rectangle into retopo quads
                 ImGui::Spacing();

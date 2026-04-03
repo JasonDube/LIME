@@ -394,6 +394,20 @@ void ModelingMode::finalizeRetopologyMesh() {
         }
     }
 
+    // Fix cap center UVs: force cap center points to U=0.5 so caps fold under the main island
+    if (!m_scatterRings.empty()) {
+        std::set<size_t> ringVerts;
+        for (const auto& ring : m_scatterRings)
+            for (size_t i = 0; i < ring.count; i++)
+                ringVerts.insert(ring.startIdx + i);
+        for (size_t vi = 0; vi < vertexUVs.size(); vi++) {
+            if (!ringVerts.count(vi)) {
+                // Not a ring vert — cap center or subdivide point. Force U=0.5
+                vertexUVs[vi].x = 0.5f;
+            }
+        }
+    }
+
     // Step 4: Fix UV seam — duplicate vertices at the seam where U wraps from ~1 to ~0
     // For each face, if any edge has a U jump > 0.5, duplicate the low-U verts with U+1
     // Then we'll have correct faces. Extra verts with U>1 get rescaled at the end.
@@ -439,12 +453,8 @@ void ModelingMode::finalizeRetopologyMesh() {
     // Update N to include duplicates
     N = vertexUVs.size();
 
-    // Rescale all U values to fit 0-1 (max U might be >1 from seam dups)
-    float maxU = 0.0f;
-    for (size_t vi = 0; vi < N; vi++) maxU = std::max(maxU, vertexUVs[vi].x);
-    if (maxU > 1.0f) {
-        for (size_t vi = 0; vi < N; vi++) vertexUVs[vi].x /= maxU;
-    }
+    // Seam duplicates stay at U>1.0 — renderer tiles UVs so U=1.02 ≈ U=0.02
+    // This keeps seam faces continuous (no stretching)
 
     // Step 4b: Add vertices to mesh
     for (size_t vi = 0; vi < N; vi++) {

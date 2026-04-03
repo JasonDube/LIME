@@ -422,8 +422,8 @@ void ModelingMode::performSlice() {
             }
         };
 
-        capMesh(posMesh, posEdgeIntersections, false);  // Pos side: cap faces -normal direction
-        capMesh(negMesh, negEdgeIntersections, true);   // Neg side: cap faces +normal direction (flipped)
+        capMesh(posMesh, posEdgeIntersections, true);   // Pos side: flip to face outward
+        capMesh(negMesh, negEdgeIntersections, false);  // Neg side: natural winding faces outward
 
         std::cout << "[Slice] Cap: " << posEdgeIntersections.size()
                   << " pos intersections, " << negEdgeIntersections.size()
@@ -580,4 +580,323 @@ void ModelingMode::performSlice() {
               << " | "
               << (hasNeg ? std::to_string(negMesh.getFaceCount()) + " faces (-)" : "empty (-)")
               << std::endl;
+}
+
+void ModelingMode::performExtract() {
+    if (!m_retopologyLiveObj || m_retopologyQuads.empty()) {
+        std::cout << "[Extract] Need live object and retopo quads" << std::endl;
+        return;
+    }
+
+    // Collect all unique retopo vertex positions from the quads
+    std::vector<glm::vec3> gridPoints;
+    {
+        const float dedupThresh = 0.001f;
+        for (const auto& quad : m_retopologyQuads) {
+            for (int i = 0; i < 4; i++) {
+                bool exists = false;
+                for (const auto& gp : gridPoints) {
+                    if (glm::length(gp - quad.verts[i]) < dedupThresh) { exists = true; break; }
+                }
+                if (!exists) gridPoints.push_back(quad.verts[i]);
+            }
+        }
+        std::cout << "[Extract] Grid has " << gridPoints.size() << " unique vertices from "
+                  << m_retopologyQuads.size() << " quads" << std::endl;
+    }
+
+    if (!m_retopologyLiveObj->hasMeshData()) {
+        std::cout << "[Extract] Live object has no mesh data" << std::endl;
+        return;
+    }
+
+    // Work with the live object's triangle mesh directly (not m_ctx.editableMesh)
+    const auto& srcVerts = m_retopologyLiveObj->getVertices();
+    const auto& srcIndices = m_retopologyLiveObj->getIndices();
+    glm::mat4 modelMatrix = m_retopologyLiveObj->getTransform().getMatrix();
+
+    // Build editable mesh from the live object for proper face-level operations
+    EditableMesh srcMesh;
+    if (m_retopologyLiveObj->hasEditableMeshData()) {
+        // Restore from stored half-edge data
+        const auto& storedVerts = m_retopologyLiveObj->getHEVertices();
+        const auto& storedHE = m_retopologyLiveObj->getHEHalfEdges();
+        const auto& storedFaces = m_retopologyLiveObj->getHEFaces();
+        std::vector<eden::HEVertex> heVerts;
+        for (const auto& sv : storedVerts) {
+            eden::HEVertex v;
+            v.position = sv.position; v.normal = sv.normal; v.uv = sv.uv;
+            v.color = sv.color; v.halfEdgeIndex = sv.halfEdgeIndex; v.selected = sv.selected;
+            heVerts.push_back(v);
+        }
+        std::vector<eden::HalfEdge> heHE;
+        for (const auto& sh : storedHE) {
+            eden::HalfEdge h;
+            h.vertexIndex = sh.vertexIndex; h.faceIndex = sh.faceIndex;
+            h.nextIndex = sh.nextIndex; h.prevIndex = sh.prevIndex; h.twinIndex = sh.twinIndex;
+            heHE.push_back(h);
+        }
+        std::vector<eden::HEFace> heFaces;
+        for (const auto& sf : storedFaces) {
+            eden::HEFace f;
+            f.halfEdgeIndex = sf.halfEdgeIndex; f.vertexCount = sf.vertexCount; f.selected = sf.selected;
+            heFaces.push_back(f);
+        }
+        srcMesh.setFromData(heVerts, heHE, heFaces);
+    } else {
+        // Build from triangles
+        srcMesh.buildFromTriangles(srcVerts, srcIndices);
+    }
+
+    uint32_t faceCount = static_cast<uint32_t>(srcMesh.getFaceCount());
+    float maxRayDist = m_scatterSpacing * 0.01f * 3.0f;
+
+    // Ray-triangle intersection (Möller–Trumbore)
+    auto rayTriHit = [](const glm::vec3& org, const glm::vec3& dir,
+                        const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
+                        float maxD) -> bool {
+        glm::vec3 e1 = v1 - v0, e2 = v2 - v0;
+        glm::vec3 h = glm::cross(dir, e2);
+        float a = glm::dot(e1, h);
+        if (std::abs(a) < 1e-7f) return false;
+        float f = 1.0f / a;
+        glm::vec3 s = org - v0;
+        float u = f * glm::dot(s, h);
+        if (u < 0.0f || u > 1.0f) return false;
+        glm::vec3 q = glm::cross(s, e1);
+        float v = f * glm::dot(dir, q);
+        if (v < 0.0f || u + v > 1.0f) return false;
+        float t = f * glm::dot(e2, q);
+        return (t > 0.001f && t < maxD);
+    };
+
+    // Check if a ray from a point hits any retopo quad
+    auto rayHitsGrid = [&](const glm::vec3& org, const glm::vec3& dir) -> bool {
+        for (const auto& quad : m_retopologyQuads) {
+            if (rayTriHit(org, dir, quad.verts[0], quad.verts[1], quad.verts[2], maxRayDist)) return true;
+            if (rayTriHit(org, dir, quad.verts[0], quad.verts[2], quad.verts[3], maxRayDist)) return true;
+        }
+        return false;
+    };
+
+    // Selection mask approach: each retopo quad defines a mask region.
+    // A mesh face is "under the grid" if its center projects inside any retopo quad.
+    float maxProjectDist = m_scatterSpacing * 0.01f * 2.0f;
+
+    // Helper: check if point P projects inside quad (v0,v1,v2,v3) within maxDist
+    auto pointInQuadProjection = [&](const glm::vec3& P, const glm::vec3& v0, const glm::vec3& v1,
+                                      const glm::vec3& v2, const glm::vec3& v3) -> bool {
+        // Compute quad plane
+        glm::vec3 e1 = v1 - v0, e2 = v3 - v0;
+        glm::vec3 quadNormal = glm::cross(e1, e2);
+        float quadNormalLen = glm::length(quadNormal);
+        if (quadNormalLen < 1e-7f) return false;
+        quadNormal /= quadNormalLen;
+
+        // Distance from P to quad plane
+        float dist = std::abs(glm::dot(P - v0, quadNormal));
+        if (dist > maxProjectDist) return false;
+
+        // Project P onto the quad plane
+        glm::vec3 projected = P - quadNormal * glm::dot(P - v0, quadNormal);
+
+        // Check if projected point is inside the quad using cross product test
+        // Point inside convex quad if it's on the same side of all 4 edges
+        glm::vec3 edges[4] = {v1 - v0, v2 - v1, v3 - v2, v0 - v3};
+        glm::vec3 corners[4] = {v0, v1, v2, v3};
+
+        int positive = 0, negative = 0;
+        for (int i = 0; i < 4; i++) {
+            glm::vec3 toPoint = projected - corners[i];
+            float cross = glm::dot(quadNormal, glm::cross(edges[i], toPoint));
+            if (cross > 0) positive++;
+            else if (cross < 0) negative++;
+        }
+        // Inside if all same sign (all positive or all negative)
+        return (positive == 4 || negative == 4);
+    };
+
+    // Pre-compute retopo quad bounding boxes for fast rejection
+    struct QuadBBox { glm::vec3 min, max; };
+    std::vector<QuadBBox> quadBBoxes(m_retopologyQuads.size());
+    for (size_t qi = 0; qi < m_retopologyQuads.size(); qi++) {
+        glm::vec3 bmin(FLT_MAX), bmax(-FLT_MAX);
+        for (int i = 0; i < 4; i++) {
+            bmin = glm::min(bmin, m_retopologyQuads[qi].verts[i]);
+            bmax = glm::max(bmax, m_retopologyQuads[qi].verts[i]);
+        }
+        // Expand by max project distance
+        quadBBoxes[qi] = {bmin - glm::vec3(maxProjectDist), bmax + glm::vec3(maxProjectDist)};
+    }
+
+    std::vector<bool> faceUnderGrid(faceCount, false);
+    int underCount = 0;
+
+    for (uint32_t fi = 0; fi < faceCount; fi++) {
+        auto faceVerts = srcMesh.getFaceVertices(fi);
+        if (faceVerts.empty()) continue;
+
+        glm::vec3 faceCenter(0.0f);
+        for (uint32_t vi : faceVerts)
+            faceCenter += glm::vec3(modelMatrix * glm::vec4(srcMesh.getVertex(vi).position, 1.0f));
+        faceCenter /= static_cast<float>(faceVerts.size());
+
+        // Check if face center projects inside any retopo quad
+        for (size_t qi = 0; qi < m_retopologyQuads.size(); qi++) {
+            // Fast AABB rejection
+            if (faceCenter.x < quadBBoxes[qi].min.x || faceCenter.x > quadBBoxes[qi].max.x ||
+                faceCenter.y < quadBBoxes[qi].min.y || faceCenter.y > quadBBoxes[qi].max.y ||
+                faceCenter.z < quadBBoxes[qi].min.z || faceCenter.z > quadBBoxes[qi].max.z)
+                continue;
+
+            const auto& q = m_retopologyQuads[qi];
+            if (pointInQuadProjection(faceCenter, q.verts[0], q.verts[1], q.verts[2], q.verts[3])) {
+                faceUnderGrid[fi] = true;
+                underCount++;
+                break;
+            }
+        }
+    }
+
+    if (underCount == 0) {
+        std::cout << "[Extract] No faces found under retopo grid" << std::endl;
+        return;
+    }
+
+    std::cout << "[Extract] Found " << underCount << " / " << faceCount << " faces under grid" << std::endl;
+
+    // Build two meshes: extracted (under grid) and remaining
+    EditableMesh extractedMesh, remainingMesh;
+    std::vector<uint32_t> extractVertMap(srcMesh.getVertexCount(), UINT32_MAX);
+    std::vector<uint32_t> remainVertMap(srcMesh.getVertexCount(), UINT32_MAX);
+
+    auto getOrAddVert = [&](EditableMesh& mesh, std::vector<uint32_t>& vertMap, uint32_t oldIdx) -> uint32_t {
+        if (vertMap[oldIdx] != UINT32_MAX) return vertMap[oldIdx];
+        HEVertex v = srcMesh.getVertex(oldIdx);
+        v.halfEdgeIndex = UINT32_MAX;
+        v.selected = false;
+        uint32_t newIdx = mesh.addVertex(v);
+        vertMap[oldIdx] = newIdx;
+        return newIdx;
+    };
+
+    for (uint32_t fi = 0; fi < faceCount; fi++) {
+        auto faceVerts = srcMesh.getFaceVertices(fi);
+        if (faceVerts.empty()) continue;
+
+        EditableMesh& targetMesh = faceUnderGrid[fi] ? extractedMesh : remainingMesh;
+        auto& targetMap = faceUnderGrid[fi] ? extractVertMap : remainVertMap;
+
+        std::vector<uint32_t> newFaceVerts;
+        for (uint32_t vi : faceVerts) {
+            newFaceVerts.push_back(getOrAddVert(targetMesh, targetMap, vi));
+        }
+        targetMesh.addFace(newFaceVerts);
+    }
+
+    // Rebuild topology
+    if (extractedMesh.getFaceCount() > 0) {
+        extractedMesh.rebuildEdgeMap();
+        extractedMesh.linkTwinsByPosition();
+        extractedMesh.recalculateNormals();
+    }
+    if (remainingMesh.getFaceCount() > 0) {
+        remainingMesh.rebuildEdgeMap();
+        remainingMesh.linkTwinsByPosition();
+        remainingMesh.recalculateNormals();
+    }
+
+    // Create scene objects using the same pattern as slice
+    Transform originalTransform = m_retopologyLiveObj->getTransform();
+    std::string originalName = m_retopologyLiveObj->getName();
+
+    // Get texture from original
+    const unsigned char* texData = nullptr;
+    int texW = 0, texH = 0;
+    std::vector<unsigned char> texDataCopy;
+    if (m_retopologyLiveObj->hasTextureData()) {
+        texDataCopy = m_retopologyLiveObj->getTextureData();
+        texW = m_retopologyLiveObj->getTextureWidth();
+        texH = m_retopologyLiveObj->getTextureHeight();
+        texData = texDataCopy.data();
+    }
+
+    auto createExtractObject = [&](EditableMesh& mesh, const std::string& suffix) -> SceneObject* {
+        if (mesh.getFaceCount() == 0) return nullptr;
+
+        auto newObj = std::make_unique<SceneObject>(originalName + suffix);
+        SceneObject* obj = newObj.get();
+        m_ctx.sceneObjects.push_back(std::move(newObj));
+
+        obj->getTransform().setPosition(originalTransform.getPosition());
+        obj->getTransform().setRotation(originalTransform.getRotation());
+        obj->getTransform().setScale(originalTransform.getScale());
+
+        std::vector<ModelVertex> vertices;
+        std::vector<uint32_t> indices;
+        std::set<uint32_t> noHidden;
+        mesh.triangulate(vertices, indices, noHidden);
+
+        if (indices.empty()) return nullptr;
+
+        uint32_t handle = m_ctx.modelRenderer.createModel(vertices, indices, texData, texW, texH);
+        if (texData && texW > 0) obj->setTextureData(texDataCopy, texW, texH);
+        obj->setBufferHandle(handle);
+        obj->setIndexCount(static_cast<uint32_t>(indices.size()));
+        obj->setVertexCount(static_cast<uint32_t>(vertices.size()));
+        obj->setMeshData(vertices, indices);
+        obj->setVisible(true);
+
+        // Store half-edge data
+        const auto& heVerts = mesh.getVerticesData();
+        const auto& heHE = mesh.getHalfEdges();
+        const auto& heFaces = mesh.getFacesData();
+        std::vector<SceneObject::StoredHEVertex> sv;
+        for (const auto& v : heVerts) sv.push_back({v.position, v.normal, v.uv, v.color, v.halfEdgeIndex, v.selected});
+        std::vector<SceneObject::StoredHalfEdge> she;
+        for (const auto& h : heHE) she.push_back({h.vertexIndex, h.faceIndex, h.nextIndex, h.prevIndex, h.twinIndex});
+        std::vector<SceneObject::StoredHEFace> sf;
+        for (const auto& f : heFaces) sf.push_back({f.halfEdgeIndex, f.vertexCount, f.selected});
+        obj->setEditableMeshData(sv, she, sf);
+
+        AABB bounds;
+        bounds.min = glm::vec3(INFINITY);
+        bounds.max = glm::vec3(-INFINITY);
+        for (const auto& v : vertices) {
+            bounds.min = glm::min(bounds.min, v.position);
+            bounds.max = glm::max(bounds.max, v.position);
+        }
+        obj->setLocalBounds(bounds);
+
+        return obj;
+    };
+
+    SceneObject* extractedObj = createExtractObject(extractedMesh, "_extracted");
+    SceneObject* remainingObj = createExtractObject(remainingMesh, "_remaining");
+
+    // Hide original
+    m_retopologyLiveObj->setVisible(false);
+
+    // Select the extracted piece
+    if (extractedObj) {
+        m_ctx.selectedObject = extractedObj;
+        m_ctx.editableMesh = extractedMesh;
+        m_ctx.meshDirty = false;
+
+        m_ctx.faceToTriangles.clear();
+        uint32_t triIndex = 0;
+        for (uint32_t faceIdx = 0; faceIdx < m_ctx.editableMesh.getFaceCount(); ++faceIdx) {
+            uint32_t vc = m_ctx.editableMesh.getFace(faceIdx).vertexCount;
+            uint32_t triCount = (vc >= 3) ? (vc - 2) : 0;
+            for (uint32_t ti = 0; ti < triCount; ++ti) {
+                m_ctx.faceToTriangles[faceIdx].push_back(triIndex++);
+            }
+        }
+        m_ctx.selectedFaces.clear();
+        m_ctx.hiddenFaces.clear();
+        invalidateWireframeCache();
+    }
+
+    std::cout << "[Extract] Done: " << underCount << " faces extracted, "
+              << (faceCount - underCount) << " remaining" << std::endl;
 }
