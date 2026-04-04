@@ -271,17 +271,80 @@ void ModelingMode::createRetopologyQuad() {
 }
 
 void ModelingMode::finalizeRetopologyMesh() {
-    if (m_retopologyVerts.empty() || m_scatterEdges.empty()) {
-        // Fallback: use old quad-based method if no scatter data
-        if (!m_retopologyQuads.empty()) {
-            std::cout << "[Retopo] Finalizing from quads (no scatter data)" << std::endl;
-        } else {
-            std::cout << "[Retopo] Nothing to finalize" << std::endl;
-            return;
-        }
+    bool hasScatterData = !m_scatterEdges.empty() && !m_retopologyVerts.empty();
+    bool hasQuadData = !m_retopologyQuads.empty();
+
+    if (!hasScatterData && !hasQuadData) {
+        std::cout << "[Retopo] Nothing to finalize" << std::endl;
+        return;
     }
 
     EditableMesh retopoMesh;
+
+    // ── Manual retopo path: build from quads directly (old method) ──
+    if (!hasScatterData && hasQuadData) {
+        std::cout << "[Retopo] Finalizing from " << m_retopologyQuads.size() << " quads (manual retopo)" << std::endl;
+
+        std::vector<glm::vec3> uniquePositions;
+        std::vector<std::vector<uint32_t>> quadIndices;
+        const float mergeThreshold = 0.001f;
+
+        for (const auto& quad : m_retopologyQuads) {
+            std::vector<uint32_t> faceIdx;
+            for (int i = 0; i < 4; ++i) {
+                uint32_t foundIdx = UINT32_MAX;
+                for (size_t vi = 0; vi < uniquePositions.size(); ++vi) {
+                    if (glm::length(uniquePositions[vi] - quad.verts[i]) < mergeThreshold) {
+                        foundIdx = static_cast<uint32_t>(vi); break;
+                    }
+                }
+                if (foundIdx == UINT32_MAX) {
+                    foundIdx = static_cast<uint32_t>(uniquePositions.size());
+                    uniquePositions.push_back(quad.verts[i]);
+                }
+                faceIdx.push_back(foundIdx);
+            }
+            quadIndices.push_back(faceIdx);
+        }
+
+        // Compute mesh center for outward winding
+        glm::vec3 meshCenter(0.0f);
+        for (const auto& p : uniquePositions) meshCenter += p;
+        meshCenter /= static_cast<float>(uniquePositions.size());
+
+        // Add vertices
+        for (const auto& pos : uniquePositions) {
+            HEVertex v;
+            v.position = pos;
+            v.normal = glm::vec3(0, 1, 0);
+            v.uv = glm::vec2(0);
+            v.color = glm::vec4(0.7f, 0.7f, 0.7f, 1.0f);
+            v.halfEdgeIndex = UINT32_MAX;
+            v.selected = false;
+            retopoMesh.addVertex(v);
+        }
+
+        // Add faces with outward winding
+        for (auto& fi : quadIndices) {
+            glm::vec3 fc(0);
+            for (uint32_t idx : fi) fc += uniquePositions[idx];
+            fc /= static_cast<float>(fi.size());
+            glm::vec3 e1 = uniquePositions[fi[1]] - uniquePositions[fi[0]];
+            glm::vec3 e2 = uniquePositions[fi[fi.size()-1]] - uniquePositions[fi[0]];
+            if (glm::dot(glm::cross(e1, e2), fc - meshCenter) < 0.0f)
+                std::reverse(fi.begin(), fi.end());
+            retopoMesh.addQuadFace(fi);
+        }
+
+        std::cout << "[Retopo] Built " << retopoMesh.getFaceCount() << " faces, "
+                  << uniquePositions.size() << " vertices" << std::endl;
+
+        // Skip to scene object creation (jump past scatter-specific code)
+        goto createSceneObject;
+    }
+
+    // ── Scatter retopo path: build from edge graph ──
+    {
     size_t N = m_retopologyVerts.size();
 
     // ── Build directly from scatter vertices and edges ──
@@ -501,7 +564,9 @@ void ModelingMode::finalizeRetopologyMesh() {
             retopoMesh.addFace(fi);
         }
     }
+    } // end scatter path
 
+    createSceneObject:
     // Find or create the retopo scene object
     SceneObject* retopoObj = nullptr;
     for (auto& obj : m_ctx.sceneObjects) {
@@ -605,6 +670,6 @@ void ModelingMode::finalizeRetopologyMesh() {
     m_retopologyVertMeshIdx.clear();
     m_retopologyObjCreated = false;
     std::cout << "[Retopo] Finalized retopo mesh: " << retopoMesh.getFaceCount()
-              << " faces, " << N << " vertices, "
+              << " faces, " << retopoMesh.getVertexCount() << " vertices, "
               << indices.size() / 3 << " triangles" << std::endl;
 }

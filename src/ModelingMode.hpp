@@ -374,6 +374,10 @@ private:
     int m_slicePresetAxis = 1;            // 0=X, 1=Y, 2=Z
     bool m_sliceCapHoles = false;         // Fill holes after slicing
 
+    // Quad direction edge for face extrude
+    int m_faceDirectionEdge = 0;          // Which edge of the selected face is the extrude direction
+    void quadMidAirExtrude();             // Create new quad off the direction edge (retopo path)
+
     // Extract: pull faces under retopo grid off the original mesh
     enum class ExtractMode { IncludePartial = 0, ExcludePartial = 1 };
     ExtractMode m_extractMode = ExtractMode::IncludePartial;

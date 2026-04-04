@@ -2574,6 +2574,94 @@ void ModelingMode::subdivideSelectedQuad() {
               << m_retopologyVerts.size() << " total verts)" << std::endl;
 }
 
+void ModelingMode::quadMidAirExtrude() {
+    // Retopo quad mid-air extrude — placeholder for future retopo integration
+    // Currently face extrude is handled in processModelingInput via X key
+    return;
+    /* TODO: re-enable when retopo quad selection is implemented
+
+    const auto& srcQuad = m_retopologyQuads[m_quadMidAirSelectedQuad];
+    int e = m_quadMidAirDirectionEdge;
+    int e1 = (e + 1) % 4;
+
+    // The green edge goes from verts[e] to verts[e1]
+    glm::vec3 edgeA = srcQuad.verts[e];
+    glm::vec3 edgeB = srcQuad.verts[e1];
+
+    // Compute quad normal
+    glm::vec3 qe1 = srcQuad.verts[1] - srcQuad.verts[0];
+    glm::vec3 qe2 = srcQuad.verts[3] - srcQuad.verts[0];
+    glm::vec3 quadNormal = glm::normalize(glm::cross(qe1, qe2));
+
+    // Direction to extrude: perpendicular to the green edge, in the quad plane, pointing outward
+    glm::vec3 edgeDir = glm::normalize(edgeB - edgeA);
+    glm::vec3 extrudeDir = glm::normalize(glm::cross(edgeDir, quadNormal));
+
+    // Make sure extrude dir points away from quad center
+    glm::vec3 quadCenter = (srcQuad.verts[0] + srcQuad.verts[1] + srcQuad.verts[2] + srcQuad.verts[3]) * 0.25f;
+    glm::vec3 edgeMid = (edgeA + edgeB) * 0.5f;
+    if (glm::dot(extrudeDir, edgeMid - quadCenter) < 0.0f)
+        extrudeDir = -extrudeDir;
+
+    // Compute edge length for new quad size
+    float edgeLen = glm::length(edgeB - edgeA);
+
+    // Compute average quad edge length for depth
+    float avgEdge = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        avgEdge += glm::length(srcQuad.verts[(i+1)%4] - srcQuad.verts[i]);
+    }
+    avgEdge /= 4.0f;
+
+    // New quad: attached to green edge, extruded outward
+    // newC and newD are the two new vertices
+    glm::vec3 newC = edgeB + extrudeDir * avgEdge;
+    glm::vec3 newD = edgeA + extrudeDir * avgEdge;
+
+    // Create the new quad: edgeA, edgeB, newC, newD
+    RetopologyQuad newQuad;
+    newQuad.verts[0] = edgeA;
+    newQuad.verts[1] = edgeB;
+    newQuad.verts[2] = newC;
+    newQuad.verts[3] = newD;
+    m_retopologyQuads.push_back(newQuad);
+
+    // Add vertices if they don't exist
+    auto findOrAddVert = [&](const glm::vec3& pos) -> size_t {
+        for (size_t vi = 0; vi < m_retopologyVerts.size(); vi++) {
+            if (glm::length(m_retopologyVerts[vi] - pos) < 0.001f) return vi;
+        }
+        size_t idx = m_retopologyVerts.size();
+        m_retopologyVerts.push_back(pos);
+        m_retopologyNormals.push_back(quadNormal);
+        m_retopologyVertMeshIdx.push_back(UINT32_MAX);
+        return idx;
+    };
+
+    size_t idxA = findOrAddVert(edgeA);
+    size_t idxB = findOrAddVert(edgeB);
+    size_t idxC = findOrAddVert(newC);
+    size_t idxD = findOrAddVert(newD);
+
+    // Add edges
+    auto addEdge = [&](size_t a, size_t b) {
+        for (const auto& e : m_scatterEdges)
+            if ((e.a == a && e.b == b) || (e.a == b && e.b == a)) return;
+        m_scatterEdges.push_back({a, b});
+    };
+    addEdge(idxA, idxB);
+    addEdge(idxB, idxC);
+    addEdge(idxC, idxD);
+    addEdge(idxD, idxA);
+
+    // Select the new quad and set direction to the opposite edge (continuing forward)
+    m_quadMidAirSelectedQuad = static_cast<int>(m_retopologyQuads.size()) - 1;
+    m_quadMidAirDirectionEdge = 2;  // Opposite edge = continue forward
+
+    std::cout << "[MidAir] Extruded quad " << m_retopologyQuads.size() << std::endl;
+    */
+}
+
 void ModelingMode::alignScatterAnchors() {
     if (m_scatterRings.empty()) return;
 

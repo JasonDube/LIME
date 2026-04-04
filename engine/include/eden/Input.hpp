@@ -45,6 +45,7 @@ public:
     static constexpr int KEY_F = 70;
     static constexpr int KEY_G = 71;
     static constexpr int KEY_I = 73;
+    static constexpr int KEY_J = 74;
     static constexpr int KEY_R = 82;
     static constexpr int KEY_N = 78;
     static constexpr int KEY_Y = 89;

@@ -530,6 +530,83 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
         drawList->AddCircle(ImVec2(mousePos.x, mousePos.y), m_ctx.paintSelectRadius, brushColor, 32, 2.0f);
     }
 
+    // Draw face direction arrow (when a single face is selected in face mode)
+    if (!m_retopologyMode && m_ctx.modelingSelectionMode == eden::ModelingSelectionMode::Face &&
+        m_ctx.editableMesh.isValid() && m_ctx.selectedObject) {
+        auto selFaces = m_ctx.editableMesh.getSelectedFaces();
+        int selectedFaceIdx = (selFaces.size() == 1) ? static_cast<int>(selFaces[0]) : -1;
+        if (selectedFaceIdx >= 0 && selectedFaceIdx < static_cast<int>(m_ctx.editableMesh.getFaceCount())) {
+        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+        drawList->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+
+        glm::mat4 view = activeCamera.getViewMatrix();
+        float ar = vpW / vpH;
+        glm::mat4 proj = activeCamera.getProjectionMatrix(ar);
+        glm::mat4 vp = proj * view;
+        glm::mat4 modelMat = m_ctx.selectedObject->getTransform().getMatrix();
+
+        auto w2s = [&](const glm::vec3& wp) -> ImVec2 {
+            glm::vec4 clip = vp * glm::vec4(wp, 1.0f);
+            if (clip.w <= 0.0f) return ImVec2(-1000, -1000);
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            return ImVec2(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+        };
+
+        auto faceVertIds = m_ctx.editableMesh.getFaceVertices(static_cast<uint32_t>(selectedFaceIdx));
+        std::vector<glm::vec3> fverts;
+        for (uint32_t vi : faceVertIds) {
+            fverts.push_back(glm::vec3(modelMat * glm::vec4(m_ctx.editableMesh.getVertex(vi).position, 1.0f)));
+        }
+
+        if (fverts.size() >= 3) {
+            int numV = static_cast<int>(fverts.size());
+            int dirEdge = m_faceDirectionEdge % numV;
+            int dirEdge1 = (dirEdge + 1) % numV;
+            ImU32 edgeColor = IM_COL32(255, 255, 100, 200);
+            ImU32 greenColor = IM_COL32(0, 255, 0, 255);
+
+            // Draw face edges
+            for (int i = 0; i < numV; i++) {
+                int j = (i + 1) % numV;
+                ImVec2 a = w2s(fverts[i]);
+                ImVec2 b = w2s(fverts[j]);
+                if (a.x > -500 && b.x > -500) {
+                    drawList->AddLine(a, b, (i == dirEdge) ? greenColor : edgeColor,
+                                      (i == dirEdge) ? 4.0f : 2.0f);
+                }
+            }
+
+            // Draw arrow showing extrude direction
+            glm::vec3 edgeMid = (fverts[dirEdge] + fverts[dirEdge1]) * 0.5f;
+            glm::vec3 fc(0); for (const auto& v : fverts) fc += v;
+            fc /= static_cast<float>(numV);
+
+            glm::vec3 fn = m_ctx.editableMesh.getFaceNormal(static_cast<uint32_t>(selectedFaceIdx));
+            fn = glm::normalize(glm::vec3(modelMat * glm::vec4(fn, 0.0f)));
+            glm::vec3 edgeDir = glm::normalize(fverts[dirEdge1] - fverts[dirEdge]);
+            glm::vec3 extDir = glm::normalize(glm::cross(edgeDir, fn));
+            if (glm::dot(extDir, edgeMid - fc) < 0.0f) extDir = -extDir;
+
+            float arrowLen = glm::length(fverts[dirEdge1] - fverts[dirEdge]) * 0.4f;
+            glm::vec3 arrowTip = edgeMid + extDir * arrowLen;
+            glm::vec3 arrowLeft = arrowTip - extDir * arrowLen * 0.3f + edgeDir * arrowLen * 0.15f;
+            glm::vec3 arrowRight = arrowTip - extDir * arrowLen * 0.3f - edgeDir * arrowLen * 0.15f;
+
+            ImVec2 tipS = w2s(arrowTip);
+            ImVec2 midS = w2s(edgeMid);
+            ImVec2 leftS = w2s(arrowLeft);
+            ImVec2 rightS = w2s(arrowRight);
+            if (tipS.x > -500 && midS.x > -500) {
+                drawList->AddLine(midS, tipS, greenColor, 3.0f);
+                drawList->AddLine(tipS, leftS, greenColor, 3.0f);
+                drawList->AddLine(tipS, rightS, greenColor, 3.0f);
+            }
+        }
+
+        drawList->PopClipRect();
+        }
+    }
+
     // Draw selection outline for all selected objects (in object mode)
     if (m_ctx.objectMode && !m_ctx.selectedObjects.empty()) {
         ImDrawList* drawList = ImGui::GetBackgroundDrawList();
@@ -5229,10 +5306,69 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         }
     }
 
-    // Repeat last operation (X)
+    // Repeat last operation / Face direction extrude (X)
     if (Input::isKeyPressed(Input::KEY_X) && !Input::isKeyDown(Input::KEY_LEFT_SHIFT)
         && !Input::isKeyDown(Input::KEY_LEFT_CONTROL) && !ImGui::GetIO().WantTextInput) {
-        if (m_lastOp == LastOp::ExtrudeEdge && !m_ctx.editableMesh.getSelectedEdges().empty()) {
+        // Face mode with selection: extrude new quad off direction edge
+        auto selectedFaces = m_ctx.editableMesh.getSelectedFaces();
+        if (m_ctx.modelingSelectionMode == eden::ModelingSelectionMode::Face
+            && selectedFaces.size() == 1 && m_ctx.editableMesh.isValid()) {
+            uint32_t fi = selectedFaces[0];
+            auto faceVerts = m_ctx.editableMesh.getFaceVertices(fi);
+            if (faceVerts.size() >= 3) {
+                m_ctx.editableMesh.saveState();
+                int numV = static_cast<int>(faceVerts.size());
+                int e = m_faceDirectionEdge % numV;
+                int e1 = (e + 1) % numV;
+
+                glm::vec3 edgeA = m_ctx.editableMesh.getVertex(faceVerts[e]).position;
+                glm::vec3 edgeB = m_ctx.editableMesh.getVertex(faceVerts[e1]).position;
+                glm::vec3 fn = m_ctx.editableMesh.getFaceNormal(fi);
+                glm::vec3 edgeDir = glm::normalize(edgeB - edgeA);
+                glm::vec3 extrudeDir = glm::normalize(glm::cross(edgeDir, fn));
+                glm::vec3 faceCenter = m_ctx.editableMesh.getFaceCenter(fi);
+                glm::vec3 edgeMid = (edgeA + edgeB) * 0.5f;
+                if (glm::dot(extrudeDir, edgeMid - faceCenter) < 0.0f)
+                    extrudeDir = -extrudeDir;
+
+                float avgEdge = 0.0f;
+                for (int i = 0; i < numV; i++) {
+                    int j = (i + 1) % numV;
+                    avgEdge += glm::length(m_ctx.editableMesh.getVertex(faceVerts[j]).position -
+                                           m_ctx.editableMesh.getVertex(faceVerts[i]).position);
+                }
+                avgEdge /= static_cast<float>(numV);
+
+                glm::vec3 newC = edgeB + extrudeDir * avgEdge;
+                glm::vec3 newD = edgeA + extrudeDir * avgEdge;
+
+                eden::HEVertex vc, vd;
+                vc.position = newC; vc.normal = fn; vc.uv = glm::vec2(0);
+                vc.color = glm::vec4(0.7f); vc.halfEdgeIndex = UINT32_MAX; vc.selected = false;
+                vd.position = newD; vd.normal = fn; vd.uv = glm::vec2(0);
+                vd.color = glm::vec4(0.7f); vd.halfEdgeIndex = UINT32_MAX; vd.selected = false;
+
+                uint32_t idxC = m_ctx.editableMesh.addVertex(vc);
+                uint32_t idxD = m_ctx.editableMesh.addVertex(vd);
+
+                glm::vec3 newNormal = glm::cross(edgeB - edgeA, newD - edgeA);
+                std::vector<uint32_t> newFace;
+                if (glm::dot(newNormal, fn) >= 0.0f)
+                    newFace = {faceVerts[e], faceVerts[e1], idxC, idxD};
+                else
+                    newFace = {faceVerts[e], idxD, idxC, faceVerts[e1]};
+
+                // Deselect old face, add and select new face
+                m_ctx.editableMesh.getFace(fi).selected = false;
+                m_ctx.editableMesh.addFace(newFace);
+                uint32_t newFi = static_cast<uint32_t>(m_ctx.editableMesh.getFaceCount()) - 1;
+                m_ctx.editableMesh.getFace(newFi).selected = true;
+                m_faceDirectionEdge = 2;  // Opposite edge = continue forward
+
+                m_ctx.meshDirty = true;
+                invalidateWireframeCache();
+            }
+        } else if (m_lastOp == LastOp::ExtrudeEdge && !m_ctx.editableMesh.getSelectedEdges().empty()) {
             m_ctx.editableMesh.saveState();
             int count = std::max(1, m_ctx.extrudeCount);
             float stepDist = m_ctx.extrudeDistance / static_cast<float>(count);
@@ -5550,6 +5686,18 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         // Auto-create quad as soon as 4th vertex is placed
         if (m_retopologyVerts.size() == 4) {
             createRetopologyQuad();
+        }
+    }
+
+    // Face direction edge: arrow keys rotate which edge is the extrude direction
+    // Works whenever faces are selected in face mode
+    if (!m_retopologyMode && m_ctx.modelingSelectionMode == eden::ModelingSelectionMode::Face
+        && !ImGui::GetIO().WantTextInput && !mouseOverImGui) {
+        if (Input::isKeyPressed(Input::KEY_RIGHT)) {
+            m_faceDirectionEdge = (m_faceDirectionEdge + 1) % 4;
+        }
+        if (Input::isKeyPressed(Input::KEY_LEFT)) {
+            m_faceDirectionEdge = (m_faceDirectionEdge + 3) % 4;
         }
     }
 
