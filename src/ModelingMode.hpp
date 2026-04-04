@@ -374,8 +374,25 @@ private:
     int m_slicePresetAxis = 1;            // 0=X, 1=Y, 2=Z
     bool m_sliceCapHoles = false;         // Fill holes after slicing
 
+    bool m_showVertexNumbers = false;     // Display vertex indices in viewport
+    bool m_showFaceNumbers = false;       // Display face indices in viewport
+    bool m_showFacePreview = true;        // Show face extrude preview on mouse hover
+
+    // Edge node dragging (green arrow edge vertex manipulation)
+    int m_edgeNodeDrag = -1;              // -1=none, 0=vertA, 1=vertB, 2=both (arrow)
+    glm::vec3 m_edgeNodeDragStart;        // Mouse world pos at drag start
+
     // Quad direction edge for face extrude
     int m_faceDirectionEdge = 0;          // Which edge of the selected face is the extrude direction
+    // Face extrude preview (mouse-guided)
+    bool m_faceExtrudePreviewValid = false;
+    glm::vec3 m_faceExtrudePreview[4];    // Preview quad corners (world space)
+    uint32_t m_previewStitchA = UINT32_MAX;
+    uint32_t m_previewStitchB = UINT32_MAX;
+    int m_prevPreviewEdge = -1;           // Which edge was shown last frame
+    int m_previewOptionIndex = 0;         // Which option to show for this edge
+    struct PreviewOption { uint32_t stitchA, stitchB; glm::vec3 pC, pD; };
+    std::vector<PreviewOption> m_previewOptions;
     void quadMidAirExtrude();             // Create new quad off the direction edge (retopo path)
 
     // Extract: pull faces under retopo grid off the original mesh

@@ -2580,7 +2580,7 @@ MeshRayHit EditableMesh::raycastFace(const glm::vec3& origin, const glm::vec3& d
             glm::vec3 h = glm::cross(dir, edge2);
             float a = glm::dot(edge1, h);
 
-            if (std::abs(a) < 0.0001f) continue;
+            if (std::abs(a) < 1e-7f) continue;
 
             float f = 1.0f / a;
             glm::vec3 s = origin - v0;
@@ -2633,7 +2633,7 @@ MeshRayHit EditableMesh::raycastFace(const glm::vec3& origin, const glm::vec3& d
             glm::vec3 h = glm::cross(dir, edge2);
             float a = glm::dot(edge1, h);
 
-            if (std::abs(a) < 0.0001f) continue;
+            if (std::abs(a) < 1e-7f) continue;
 
             float f = 1.0f / a;
             glm::vec3 s = origin - v0;

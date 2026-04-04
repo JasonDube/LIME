@@ -504,6 +504,81 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
         drawFaceNormalsOverlay(activeCamera, vpX, vpY, vpW, vpH);
     }
 
+    // Draw vertex numbers on all mesh vertices
+    if (m_showVertexNumbers && m_ctx.editableMesh.isValid() && m_ctx.selectedObject) {
+        {
+            ImDrawList* dl = ImGui::GetBackgroundDrawList();
+            dl->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+            glm::mat4 view = activeCamera.getViewMatrix();
+            float ar = vpW / vpH;
+            glm::mat4 proj = activeCamera.getProjectionMatrix(ar);
+            glm::mat4 vp2 = proj * view;
+            glm::mat4 mdl = m_ctx.selectedObject->getTransform().getMatrix();
+            glm::vec3 camP = activeCamera.getPosition();
+
+            for (uint32_t vi = 0; vi < m_ctx.editableMesh.getVertexCount(); vi++) {
+                glm::vec3 wp = glm::vec3(mdl * glm::vec4(m_ctx.editableMesh.getVertex(vi).position, 1.0f));
+                // Simple backface cull using vertex normal
+                glm::vec3 vn = m_ctx.editableMesh.getVertex(vi).normal;
+                if (glm::length(vn) > 0.001f && glm::dot(vn, camP - wp) < 0.0f) continue;
+
+                glm::vec4 clip = vp2 * glm::vec4(wp, 1.0f);
+                if (clip.w <= 0.0f) continue;
+                glm::vec3 ndc = glm::vec3(clip) / clip.w;
+                ImVec2 sp(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+                if (sp.x < vpX || sp.x > vpX + vpW || sp.y < vpY || sp.y > vpY + vpH) continue;
+
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%u", vi);
+                ImVec2 ts = ImGui::CalcTextSize(buf);
+                dl->AddRectFilled(ImVec2(sp.x - 1, sp.y - 1), ImVec2(sp.x + ts.x + 1, sp.y + ts.y + 1),
+                                  IM_COL32(0, 0, 0, 150), 1.0f);
+                dl->AddText(sp, IM_COL32(200, 200, 200, 255), buf);
+            }
+            dl->PopClipRect();
+        }
+    }
+
+    // Draw face numbers at face centers
+    if (m_showFaceNumbers && m_ctx.editableMesh.isValid() && m_ctx.selectedObject) {
+        {
+            ImDrawList* dl = ImGui::GetBackgroundDrawList();
+            dl->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+            glm::mat4 view = activeCamera.getViewMatrix();
+            float ar = vpW / vpH;
+            glm::mat4 proj = activeCamera.getProjectionMatrix(ar);
+            glm::mat4 vp2 = proj * view;
+            glm::mat4 mdl = m_ctx.selectedObject->getTransform().getMatrix();
+            glm::vec3 camP = activeCamera.getPosition();
+
+            for (uint32_t fi = 0; fi < m_ctx.editableMesh.getFaceCount(); fi++) {
+                glm::vec3 fc = m_ctx.editableMesh.getFaceCenter(fi);
+                glm::vec3 fn = m_ctx.editableMesh.getFaceNormal(fi);
+                glm::vec3 wfc = glm::vec3(mdl * glm::vec4(fc, 1.0f));
+                glm::vec3 wfn = glm::normalize(glm::vec3(mdl * glm::vec4(fn, 0.0f)));
+
+                // Backface cull
+                if (glm::dot(wfn, camP - wfc) < 0.0f) continue;
+
+                glm::vec4 clip = vp2 * glm::vec4(wfc, 1.0f);
+                if (clip.w <= 0.0f) continue;
+                glm::vec3 ndc = glm::vec3(clip) / clip.w;
+                ImVec2 sp(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+                if (sp.x < vpX || sp.x > vpX + vpW || sp.y < vpY || sp.y > vpY + vpH) continue;
+
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%u", fi);
+                ImVec2 ts = ImGui::CalcTextSize(buf);
+                dl->AddRectFilled(ImVec2(sp.x - ts.x * 0.5f - 2, sp.y - ts.y * 0.5f - 1),
+                                  ImVec2(sp.x + ts.x * 0.5f + 2, sp.y + ts.y * 0.5f + 1),
+                                  IM_COL32(0, 0, 0, 160), 2.0f);
+                dl->AddText(ImVec2(sp.x - ts.x * 0.5f, sp.y - ts.y * 0.5f),
+                           IM_COL32(255, 200, 100, 255), buf);
+            }
+            dl->PopClipRect();
+        }
+    }
+
     // Draw reference images for ortho views
     drawReferenceImages(activeCamera, vpX, vpY, vpW, vpH);
 
@@ -528,6 +603,51 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
         ImU32 brushColor = IM_COL32(255, 200, 100, 150);
         glm::vec2 mousePos = Input::getMousePosition();
         drawList->AddCircle(ImVec2(mousePos.x, mousePos.y), m_ctx.paintSelectRadius, brushColor, 32, 2.0f);
+    }
+
+    // Draw face extrude preview (translucent quad showing where the new face will go)
+    if (m_faceExtrudePreviewValid && !m_retopologyMode && m_ctx.selectedObject) {
+        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+        drawList->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+        glm::mat4 view = activeCamera.getViewMatrix();
+        float ar = vpW / vpH;
+        glm::mat4 proj = activeCamera.getProjectionMatrix(ar);
+        glm::mat4 vp = proj * view;
+
+        auto w2s = [&](const glm::vec3& wp) -> ImVec2 {
+            glm::vec4 clip = vp * glm::vec4(wp, 1.0f);
+            if (clip.w <= 0.0f) return ImVec2(-1000, -1000);
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            return ImVec2(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+        };
+
+        ImVec2 p0 = w2s(m_faceExtrudePreview[0]);
+        ImVec2 p1 = w2s(m_faceExtrudePreview[1]);
+        ImVec2 p2 = w2s(m_faceExtrudePreview[2]);
+        ImVec2 p3 = w2s(m_faceExtrudePreview[3]);
+
+        if (p0.x > -500 && p1.x > -500 && p2.x > -500 && p3.x > -500) {
+            // Filled — two triangles for reliability (QuadFilled can fail on non-planar quads)
+            ImU32 fillColor = IM_COL32(0, 200, 100, 100);
+            drawList->AddTriangleFilled(p0, p1, p2, fillColor);
+            drawList->AddTriangleFilled(p0, p2, p3, fillColor);
+            // Outline
+            ImU32 outlineColor = IM_COL32(0, 255, 100, 255);
+            drawList->AddLine(p0, p1, outlineColor, 3.0f);  // Source edge
+            drawList->AddLine(p1, p2, outlineColor, 3.0f);  // Side
+            drawList->AddLine(p2, p3, outlineColor, 3.0f);  // Target edge
+            drawList->AddLine(p3, p0, outlineColor, 3.0f);  // Side
+
+            // Highlight target edge (thick green)
+            drawList->AddLine(p2, p3, IM_COL32(0, 255, 0, 255), 4.0f);
+            // Mark target verts
+            drawList->AddCircleFilled(p2, 8.0f, IM_COL32(0, 255, 0, 255));
+            drawList->AddCircleFilled(p3, 8.0f, IM_COL32(0, 255, 0, 255));
+            // Mark source verts
+            drawList->AddCircleFilled(p0, 6.0f, IM_COL32(255, 255, 0, 255));
+            drawList->AddCircleFilled(p1, 6.0f, IM_COL32(255, 255, 0, 255));
+        }
+        drawList->PopClipRect();
     }
 
     // Draw face direction arrow (when a single face is selected in face mode)
@@ -601,6 +721,7 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
                 drawList->AddLine(tipS, leftS, greenColor, 3.0f);
                 drawList->AddLine(tipS, rightS, greenColor, 3.0f);
             }
+
         }
 
         drawList->PopClipRect();
@@ -2921,6 +3042,19 @@ void ModelingMode::renderModelingEditorUI() {
             ImGui::SetTooltip("Flood-fill to make all faces wind the same way.\nPress once = consistent. Press again = all flipped.");
         }
 
+        if (ImGui::Button("Rebuild Mesh")) {
+            m_ctx.editableMesh.linkTwinsByPosition();
+            m_ctx.editableMesh.rebuildEdgeMap();
+            m_ctx.editableMesh.recalculateNormals();
+            m_ctx.meshDirty = true;
+            invalidateWireframeCache();
+            std::cout << "[Rebuild] Full mesh rebuild: " << m_ctx.editableMesh.getFaceCount()
+                      << " faces, " << m_ctx.editableMesh.getVertexCount() << " verts" << std::endl;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Force rebuild topology, normals, and face mapping");
+        }
+
         if (ImGui::Button("Inset (I)")) {
             if (!m_ctx.editableMesh.getSelectedFaces().empty()) {
                 m_ctx.editableMesh.saveState();
@@ -3458,6 +3592,9 @@ void ModelingMode::renderModelingEditorUI() {
         ImGui::Checkbox("Wireframe", &m_ctx.showModelingWireframe);
         ImGui::Checkbox("Face Normals", &m_ctx.showFaceNormals);
         ImGui::Checkbox("Grid", &m_ctx.showGrid);
+        ImGui::Checkbox("Vertex Numbers", &m_showVertexNumbers);
+        ImGui::Checkbox("Face Numbers", &m_showFaceNumbers);
+        ImGui::Checkbox("Face Preview", &m_showFacePreview);
 
         if (m_ctx.modelingSelectionMode == ModelingSelectionMode::Vertex) {
             ImGui::SliderFloat("Vertex Size", &m_ctx.vertexDisplaySize, 0.01f, 0.2f, "%.2f");
@@ -5331,6 +5468,7 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                 if (glm::dot(extrudeDir, edgeMid - faceCenter) < 0.0f)
                     extrudeDir = -extrudeDir;
 
+                // Simple mid-air extrude — no neighbor attachment
                 float avgEdge = 0.0f;
                 for (int i = 0; i < numV; i++) {
                     int j = (i + 1) % numV;
@@ -5339,19 +5477,15 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                 }
                 avgEdge /= static_cast<float>(numV);
 
-                glm::vec3 newC = edgeB + extrudeDir * avgEdge;
-                glm::vec3 newD = edgeA + extrudeDir * avgEdge;
-
                 eden::HEVertex vc, vd;
-                vc.position = newC; vc.normal = fn; vc.uv = glm::vec2(0);
+                vc.position = edgeB + extrudeDir * avgEdge; vc.normal = fn; vc.uv = glm::vec2(0);
                 vc.color = glm::vec4(0.7f); vc.halfEdgeIndex = UINT32_MAX; vc.selected = false;
-                vd.position = newD; vd.normal = fn; vd.uv = glm::vec2(0);
+                vd.position = edgeA + extrudeDir * avgEdge; vd.normal = fn; vd.uv = glm::vec2(0);
                 vd.color = glm::vec4(0.7f); vd.halfEdgeIndex = UINT32_MAX; vd.selected = false;
-
                 uint32_t idxC = m_ctx.editableMesh.addVertex(vc);
                 uint32_t idxD = m_ctx.editableMesh.addVertex(vd);
 
-                glm::vec3 newNormal = glm::cross(edgeB - edgeA, newD - edgeA);
+                glm::vec3 newNormal = glm::cross(edgeB - edgeA, vd.position - edgeA);
                 std::vector<uint32_t> newFace;
                 if (glm::dot(newNormal, fn) >= 0.0f)
                     newFace = {faceVerts[e], faceVerts[e1], idxC, idxD};
@@ -5361,9 +5495,23 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                 // Deselect old face, add and select new face
                 m_ctx.editableMesh.getFace(fi).selected = false;
                 m_ctx.editableMesh.addFace(newFace);
+
+                // Rebuild topology so next extrude can find neighbors
+                m_ctx.editableMesh.linkTwinsByPosition();
+                m_ctx.editableMesh.rebuildEdgeMap();
+
                 uint32_t newFi = static_cast<uint32_t>(m_ctx.editableMesh.getFaceCount()) - 1;
                 m_ctx.editableMesh.getFace(newFi).selected = true;
-                m_faceDirectionEdge = 2;  // Opposite edge = continue forward
+                // Set direction to the far edge of the new face (opposite the shared edge)
+                // Find the edge that has NO vertices from the original selected face
+                auto newFaceVerts2 = m_ctx.editableMesh.getFaceVertices(newFi);
+                m_faceDirectionEdge = 0;
+                for (int ni = 0; ni < static_cast<int>(newFaceVerts2.size()); ni++) {
+                    int nj = (ni + 1) % static_cast<int>(newFaceVerts2.size());
+                    bool v0OnOld = (newFaceVerts2[ni] == faceVerts[e] || newFaceVerts2[ni] == faceVerts[e1]);
+                    bool v1OnOld = (newFaceVerts2[nj] == faceVerts[e] || newFaceVerts2[nj] == faceVerts[e1]);
+                    if (!v0OnOld && !v1OnOld) { m_faceDirectionEdge = ni; break; }
+                }
 
                 m_ctx.meshDirty = true;
                 invalidateWireframeCache();
@@ -5388,12 +5536,16 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         }
     }
 
-    // Merge vertices (Alt+M)
-    if (Input::isKeyPressed(Input::KEY_M) && Input::isKeyDown(Input::KEY_LEFT_ALT)) {
+    // Merge vertices (M)
+    if (Input::isKeyPressed(Input::KEY_M) && !Input::isKeyDown(Input::KEY_LEFT_ALT)
+        && !Input::isKeyDown(Input::KEY_LEFT_CONTROL) && !ImGui::GetIO().WantTextInput) {
         if (m_ctx.editableMesh.getSelectedVertices().size() >= 2) {
             m_ctx.editableMesh.saveState();
             m_ctx.editableMesh.mergeSelectedVertices();
             m_ctx.meshDirty = true;
+            invalidateWireframeCache();
+            // Clear selection state to remove lingering vertex display
+            m_ctx.editableMesh.clearSelection();
         }
     }
 
@@ -5699,6 +5851,251 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         if (Input::isKeyPressed(Input::KEY_LEFT)) {
             m_faceDirectionEdge = (m_faceDirectionEdge + 3) % 4;
         }
+
+        // Mouse-guided extrude preview (disabled when Ctrl is held for selection)
+        bool ctrlHeldNow = Input::isKeyDown(Input::KEY_LEFT_CONTROL) || Input::isKeyDown(Input::KEY_RIGHT_CONTROL);
+        auto selFaces = m_ctx.editableMesh.getSelectedFaces();
+        if (m_showFacePreview && !ctrlHeldNow && selFaces.size() == 1 && m_ctx.selectedObject) {
+            uint32_t selFi = selFaces[0];
+            auto fvs = m_ctx.editableMesh.getFaceVertices(selFi);
+            if (fvs.size() >= 3) {
+                glm::mat4 mdl = m_ctx.selectedObject->getTransform().getMatrix();
+                Camera& cam = m_ctx.getActiveCamera();
+                float ar = static_cast<float>(m_ctx.window.getWidth()) / m_ctx.window.getHeight();
+                glm::mat4 vpm = cam.getProjectionMatrix(ar) * cam.getViewMatrix();
+                float vpW = static_cast<float>(m_ctx.window.getWidth());
+                float vpH = static_cast<float>(m_ctx.window.getHeight());
+                ImVec2 mouse = ImGui::GetMousePos();
+
+                // Green arrow follows mouse: find which edge midpoint is most
+                // in the direction from face center to mouse (in screen space)
+                int numV = static_cast<int>(fvs.size());
+                std::vector<glm::vec3> worldVerts(numV);
+                for (int i = 0; i < numV; i++)
+                    worldVerts[i] = glm::vec3(mdl * glm::vec4(m_ctx.editableMesh.getVertex(fvs[i]).position, 1.0f));
+
+                // Project face center to screen
+                glm::vec3 wCenter(0);
+                for (auto& wv : worldVerts) wCenter += wv;
+                wCenter /= static_cast<float>(numV);
+                glm::vec4 centerClip = vpm * glm::vec4(wCenter, 1.0f);
+                glm::vec2 centerScreen(0);
+                if (centerClip.w > 0.0f) {
+                    centerScreen = glm::vec2((centerClip.x/centerClip.w+1)*0.5f*vpW,
+                                             (1-centerClip.y/centerClip.w)*0.5f*vpH);
+                }
+
+                // Direction from center to mouse
+                glm::vec2 mouseDir = glm::vec2(mouse.x, mouse.y) - centerScreen;
+                if (glm::length(mouseDir) > 0.001f) mouseDir = glm::normalize(mouseDir);
+
+                int bestEdge = 0;
+                float bestEdgeDist = -FLT_MAX;
+                for (int i = 0; i < numV; i++) {
+                    int j = (i + 1) % numV;
+                    glm::vec3 mid = (worldVerts[i] + worldVerts[j]) * 0.5f;
+                    glm::vec4 clip = vpm * glm::vec4(mid, 1.0f);
+                    if (clip.w <= 0.0f) continue;
+                    glm::vec2 sp((clip.x / clip.w + 1.0f) * 0.5f * vpW,
+                                 (1.0f - clip.y / clip.w) * 0.5f * vpH);
+                    // Score: how much is this edge midpoint in the mouse direction from center?
+                    glm::vec2 edgeDir = sp - centerScreen;
+                    if (glm::length(edgeDir) > 0.001f) edgeDir = glm::normalize(edgeDir);
+                    float score = glm::dot(edgeDir, mouseDir);
+                    if (score > bestEdgeDist) { bestEdgeDist = score; bestEdge = i; }
+                }
+                m_faceDirectionEdge = bestEdge;
+
+                // Mouse picks the TARGET edge — find closest edge to mouse cursor
+                // Search ALL edges on the mesh (excluding selected face's own edges)
+                float bestTargetDist = FLT_MAX;
+                uint32_t targetV0 = UINT32_MAX, targetV1 = UINT32_MAX;
+                std::set<uint32_t> selFaceVertSet(fvs.begin(), fvs.end());
+                std::set<uint64_t> seenEdges;
+
+                for (uint32_t fi2 = 0; fi2 < m_ctx.editableMesh.getFaceCount(); fi2++) {
+                    if (fi2 == selFi) continue;
+                    auto fv2 = m_ctx.editableMesh.getFaceVertices(fi2);
+                    for (size_t ei = 0; ei < fv2.size(); ei++) {
+                        uint32_t va = fv2[ei], vb = fv2[(ei+1) % fv2.size()];
+                        if (selFaceVertSet.count(va) && selFaceVertSet.count(vb)) continue;
+                        uint64_t eKey = (uint64_t)std::min(va,vb) << 32 | std::max(va,vb);
+                        if (seenEdges.count(eKey)) continue;
+                        seenEdges.insert(eKey);
+
+                        // Skip closed edges (face on both sides)
+                        // Default: assume boundary (show it). Only skip if confirmed closed.
+                        bool isClosed = false;
+                        auto vaEdges = m_ctx.editableMesh.getVertexEdges(va);
+                        for (uint32_t heIdx : vaEdges) {
+                            auto [ev0, ev1] = m_ctx.editableMesh.getEdgeVertices(heIdx);
+                            if ((ev0 == va && ev1 == vb) || (ev0 == vb && ev1 == va)) {
+                                const auto& he = m_ctx.editableMesh.getHalfEdge(heIdx);
+                                if (he.twinIndex != UINT32_MAX) {
+                                    const auto& twin = m_ctx.editableMesh.getHalfEdge(he.twinIndex);
+                                    if (he.faceIndex != UINT32_MAX && twin.faceIndex != UINT32_MAX) {
+                                        isClosed = true;
+                                    }
+                                }
+                                break;  // Found the edge, stop searching
+                            }
+                        }
+                        if (isClosed) continue;
+
+                        glm::vec3 mid = (m_ctx.editableMesh.getVertex(va).position +
+                                         m_ctx.editableMesh.getVertex(vb).position) * 0.5f;
+                        glm::vec3 wMid = glm::vec3(mdl * glm::vec4(mid, 1.0f));
+                        glm::vec4 clip = vpm * glm::vec4(wMid, 1.0f);
+                        if (clip.w <= 0.0f) continue;
+                        glm::vec2 sp((clip.x/clip.w+1)*0.5f*vpW, (1-clip.y/clip.w)*0.5f*vpH);
+                        float d = glm::length(sp - glm::vec2(mouse.x, mouse.y));
+                        if (d < bestTargetDist && d < 40.0f) {
+                            bestTargetDist = d;
+                            targetV0 = va;
+                            targetV1 = vb;
+                        }
+                    }
+                }
+
+                m_faceExtrudePreviewValid = false;
+                if (targetV0 != UINT32_MAX && targetV1 != UINT32_MAX) {
+                    // Source edge: controlled by arrow keys
+                    int srcEdge = m_faceDirectionEdge % numV;
+                    int srcE1 = (srcEdge + 1) % numV;
+                    uint32_t srcA = fvs[srcEdge], srcB = fvs[srcE1];
+
+                    std::cout << "[Preview] Source edge: " << srcA << " → " << srcB
+                              << "  Target edge: " << targetV0 << " → " << targetV1 << std::endl;
+
+                    // We have 4 vertices: srcA, srcB (source), targetV0, targetV1 (target)
+                    // Some may overlap (shared vertex) — that's OK, just make the quad
+                    // Match: srcA → closest target, srcB → the other
+                    float d00 = glm::length(m_ctx.editableMesh.getVertex(targetV0).position -
+                                            m_ctx.editableMesh.getVertex(srcA).position);
+                    float d01 = glm::length(m_ctx.editableMesh.getVertex(targetV0).position -
+                                            m_ctx.editableMesh.getVertex(srcB).position);
+                    uint32_t tA, tB;
+                    if (d00 < d01) { tA = targetV0; tB = targetV1; }
+                    else { tA = targetV1; tB = targetV0; }
+
+                    // Check for shared vertex (only 3 unique) — need to create 4th
+                    glm::vec3 pSrcA = worldVerts[srcEdge];
+                    glm::vec3 pSrcB = worldVerts[srcE1];
+                    glm::vec3 pTgtA = glm::vec3(mdl * glm::vec4(m_ctx.editableMesh.getVertex(tA).position, 1.0f));
+                    glm::vec3 pTgtB = glm::vec3(mdl * glm::vec4(m_ctx.editableMesh.getVertex(tB).position, 1.0f));
+
+                    if (srcA == tA) {
+                        // srcA and tA are the same vertex — create 4th: srcB + (tB - tA)
+                        glm::vec3 fourth = pSrcB + (pTgtB - pTgtA);
+                        m_faceExtrudePreview[0] = pSrcA;  // shared
+                        m_faceExtrudePreview[1] = pTgtB;  // target free
+                        m_faceExtrudePreview[2] = fourth;  // new mid-air
+                        m_faceExtrudePreview[3] = pSrcB;  // source free
+                        m_previewStitchA = tA;  // shared vert
+                        m_previewStitchB = tB;  // target vert
+                        std::cout << "[Preview] 3 unique verts (shared=" << srcA << "), 4th=mid-air" << std::endl;
+                    } else if (srcA == tB) {
+                        glm::vec3 fourth = pSrcB + (pTgtA - pTgtB);
+                        m_faceExtrudePreview[0] = pSrcA;
+                        m_faceExtrudePreview[1] = pTgtA;
+                        m_faceExtrudePreview[2] = fourth;
+                        m_faceExtrudePreview[3] = pSrcB;
+                        m_previewStitchA = tB;
+                        m_previewStitchB = tA;
+                        std::cout << "[Preview] 3 unique verts (shared=" << srcA << "), 4th=mid-air" << std::endl;
+                    } else if (srcB == tA) {
+                        glm::vec3 fourth = pSrcA + (pTgtB - pTgtA);
+                        m_faceExtrudePreview[0] = pSrcA;
+                        m_faceExtrudePreview[1] = pSrcB;
+                        m_faceExtrudePreview[2] = pTgtB;
+                        m_faceExtrudePreview[3] = fourth;
+                        m_previewStitchA = tA;
+                        m_previewStitchB = tB;
+                        std::cout << "[Preview] 3 unique verts (shared=" << srcB << "), 4th=mid-air" << std::endl;
+                    } else if (srcB == tB) {
+                        glm::vec3 fourth = pSrcA + (pTgtA - pTgtB);
+                        m_faceExtrudePreview[0] = pSrcA;
+                        m_faceExtrudePreview[1] = pSrcB;
+                        m_faceExtrudePreview[2] = pTgtA;
+                        m_faceExtrudePreview[3] = fourth;
+                        m_previewStitchA = tB;
+                        m_previewStitchB = tA;
+                        std::cout << "[Preview] 3 unique verts (shared=" << srcB << "), 4th=mid-air" << std::endl;
+                    } else {
+                        // 4 unique verts — straightforward quad
+                        m_faceExtrudePreview[0] = pSrcA;
+                        m_faceExtrudePreview[1] = pSrcB;
+                        m_faceExtrudePreview[2] = pTgtB;
+                        m_faceExtrudePreview[3] = pTgtA;
+                        m_previewStitchA = tA;
+                        m_previewStitchB = tB;
+                        std::cout << "[Preview] 4 unique verts" << std::endl;
+                    }
+
+                    m_faceExtrudePreviewValid = true;
+                } else {
+                    // No target found under mouse
+                }
+
+                // F key: commit the current preview
+                if ((Input::isMouseButtonPressed(Input::MOUSE_RIGHT) || Input::isKeyPressed(Input::KEY_F))
+                    && m_faceExtrudePreviewValid) {
+                    m_ctx.editableMesh.saveState();
+                    glm::mat4 invMdl = glm::inverse(mdl);
+                    glm::vec3 faceNrm = m_ctx.editableMesh.getFaceNormal(selFi);
+
+                    // For each of the 4 preview corners, find existing vert or create new
+                    auto findOrCreateVert = [&](const glm::vec3& worldPos) -> uint32_t {
+                        glm::vec3 localPos = glm::vec3(invMdl * glm::vec4(worldPos, 1.0f));
+                        // Check existing verts
+                        for (uint32_t vi = 0; vi < m_ctx.editableMesh.getVertexCount(); vi++) {
+                            if (glm::length(m_ctx.editableMesh.getVertex(vi).position - localPos) < 0.0005f)
+                                return vi;
+                        }
+                        // Create new
+                        eden::HEVertex v;
+                        v.position = localPos; v.normal = faceNrm;
+                        v.uv = glm::vec2(0); v.color = glm::vec4(0.7f);
+                        v.halfEdgeIndex = UINT32_MAX; v.selected = false;
+                        return m_ctx.editableMesh.addVertex(v);
+                    };
+
+                    uint32_t cA = findOrCreateVert(m_faceExtrudePreview[0]);
+                    uint32_t cB = findOrCreateVert(m_faceExtrudePreview[1]);
+                    uint32_t cC = findOrCreateVert(m_faceExtrudePreview[2]);
+                    uint32_t cD = findOrCreateVert(m_faceExtrudePreview[3]);
+
+                    glm::vec3 newN = glm::cross(
+                        m_ctx.editableMesh.getVertex(cB).position - m_ctx.editableMesh.getVertex(cA).position,
+                        m_ctx.editableMesh.getVertex(cD).position - m_ctx.editableMesh.getVertex(cA).position);
+                    std::vector<uint32_t> newFace;
+                    if (glm::dot(newN, m_ctx.editableMesh.getFaceNormal(selFi)) >= 0.0f)
+                        newFace = {cA, cB, cC, cD};
+                    else
+                        newFace = {cA, cD, cC, cB};
+
+                    m_ctx.editableMesh.getFace(selFi).selected = false;
+                    m_ctx.editableMesh.addFace(newFace);
+                    m_ctx.editableMesh.linkTwinsByPosition();
+                    m_ctx.editableMesh.rebuildEdgeMap();
+                    uint32_t newFi = static_cast<uint32_t>(m_ctx.editableMesh.getFaceCount()) - 1;
+                    m_ctx.editableMesh.getFace(newFi).selected = true;
+                    m_ctx.meshDirty = true;
+                    invalidateWireframeCache();
+                    m_faceExtrudePreviewValid = false;
+
+                    std::cout << "[Extrude] Committed face. StitchA="
+                              << (m_previewStitchA != UINT32_MAX ? std::to_string(m_previewStitchA) : "mid-air")
+                              << " StitchB=" << (m_previewStitchB != UINT32_MAX ? std::to_string(m_previewStitchB) : "mid-air") << std::endl;
+                }
+            } else {
+                m_faceExtrudePreviewValid = false;
+            }
+        } else {
+            m_faceExtrudePreviewValid = false;
+        }
+    } else {
+        m_faceExtrudePreviewValid = false;
     }
 
     // Scatter point selection: LMB click to toggle select (up to 4) for subdivide
@@ -7790,6 +8187,19 @@ void ModelingMode::updateMeshFromEditable() {
     m_ctx.selectedObject->setIndexCount(static_cast<uint32_t>(indices.size()));
     m_ctx.selectedObject->setVertexCount(static_cast<uint32_t>(vertices.size()));
     m_ctx.selectedObject->setMeshData(vertices, indices);
+
+    // Rebuild faceToTriangles mapping (required for face selection raycasting)
+    m_ctx.faceToTriangles.clear();
+    {
+        uint32_t triIndex = 0;
+        for (uint32_t faceIdx = 0; faceIdx < m_ctx.editableMesh.getFaceCount(); ++faceIdx) {
+            uint32_t vc = m_ctx.editableMesh.getFace(faceIdx).vertexCount;
+            uint32_t triCount = (vc >= 3) ? (vc - 2) : 0;
+            for (uint32_t ti = 0; ti < triCount; ++ti) {
+                m_ctx.faceToTriangles[faceIdx].push_back(triIndex++);
+            }
+        }
+    }
 
     // If skeleton exists, also create skinned model and store skeleton on SceneObject
     if (hasSkeleton) {
