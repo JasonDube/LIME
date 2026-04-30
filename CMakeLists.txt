@@ -146,6 +146,8 @@ set(LIME_SOURCES
     src/ModelingMode_PathTube.cpp
     src/ModelingMode_Slice.cpp
     src/ModelingMode_Rigging.cpp
+    src/ModelingMode_Timeline.cpp
+    engine/Editor/GLBLoader_Skinned.cpp
     src/PaintBrushRing.cpp
     src/MCPServer.cpp
 )

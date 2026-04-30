@@ -19,6 +19,7 @@
 #include "Renderer/SkinnedModelRenderer.hpp"
 #include "Editor/SceneObject.hpp"
 #include "Editor/GLBLoader.hpp"
+#include "Editor/SkinnedGLBLoader.hpp"
 
 #include "IEditorMode.hpp"
 #include "EditorContext.hpp"
@@ -43,6 +44,7 @@
 #include <stb_image_write.h>
 
 #include <iostream>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <algorithm>
@@ -100,6 +102,9 @@ protected:
 
         // Initialize library path from project source directory
         m_libraryPath = std::string(CMAKE_SOURCE_DIR) + "/library";
+
+        // Load project config (persisted project directory)
+        loadProjectConfig();
 
         // Initialize MCP server
         initMCPServer();
@@ -1421,6 +1426,7 @@ private:
             .pendingTextureDelete = m_pendingTextureDelete,
             .currentFilePath = m_currentFilePath,
             .currentFileFormat = m_currentFileFormat,
+            .projectPath = m_projectPath,
             .loadReferenceImageCallback = [this](int viewIndex, const std::string& path) {
                 return loadReferenceImageFile(viewIndex, path);
             },
@@ -1799,10 +1805,16 @@ private:
     void renderUI() {
         ImGui::NewFrame();
 
-        // Create dockspace over the entire viewport (below menu bar)
+        // Create dockspace over the viewport (below menu bar) — but reserve
+        // room at the bottom for the always-visible animation timeline strip.
+        // Without this reservation, anything docked left/right grows full
+        // height and overlaps the timeline.
         ImGuiViewport* viewport = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(viewport->WorkPos);
-        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImVec2 dockPos = viewport->WorkPos;
+        ImVec2 dockSize = viewport->WorkSize;
+        dockSize.y = std::max(120.0f, dockSize.y - ModelingMode::kTimelineHeight - 4.0f);
+        ImGui::SetNextWindowPos(dockPos);
+        ImGui::SetNextWindowSize(dockSize);
         ImGui::SetNextWindowViewport(viewport->ID);
         ImGuiWindowFlags dockspaceFlags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoTitleBar |
             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -1866,6 +1878,27 @@ private:
                 if (ImGui::MenuItem("Export Texture as PNG...", nullptr, false, hasTexture)) {
                     if (m_modelingMode) {
                         m_modelingMode->exportTextureAsPNG();
+                    }
+                }
+                ImGui::Separator();
+                // Project directory
+                if (ImGui::MenuItem("Set Project Folder...")) {
+                    nfdchar_t* folderPath = nullptr;
+                    const char* startPath = m_projectPath.empty() ? nullptr : m_projectPath.c_str();
+                    if (NFD_PickFolder(&folderPath, startPath) == NFD_OKAY) {
+                        m_projectPath = folderPath;
+                        NFD_FreePath(folderPath);
+                        saveProjectConfig();
+                        std::cout << "Project folder set to: " << m_projectPath << std::endl;
+                    }
+                }
+                if (!m_projectPath.empty()) {
+                    std::string label = "Project: " + fs::path(m_projectPath).filename().string();
+                    ImGui::MenuItem(label.c_str(), nullptr, false, false);  // Display-only
+                    if (ImGui::MenuItem("Clear Project")) {
+                        m_projectPath.clear();
+                        saveProjectConfig();
+                        std::cout << "Project folder cleared" << std::endl;
                     }
                 }
                 ImGui::Separator();
@@ -3016,7 +3049,8 @@ private:
             {"OBJ Models", "obj"}
         };
 
-        nfdresult_t result = NFD_OpenDialog(&outPath, filters, 2, nullptr);
+        const char* defaultDir = m_projectPath.empty() ? nullptr : m_projectPath.c_str();
+        nfdresult_t result = NFD_OpenDialog(&outPath, filters, 2, defaultDir);
 
         if (result == NFD_OKAY) {
             loadModel(outPath);
@@ -3082,6 +3116,18 @@ private:
         // Rebuild editable mesh if in modeling mode
         if (m_currentModeType == EditorModeType::ModelingEditor && m_modelingMode) {
             m_modelingMode->buildEditableMeshFromObject();
+        }
+
+        // Also load skeleton/skin data if present — GLBLoader::load above only reads mesh.
+        if (SkinnedGLBLoader::hasSkeleton(path)) {
+            SkinnedLoadResult skinned = SkinnedGLBLoader::load(path);
+            if (skinned.success && skinned.skeleton && !skinned.skeleton->bones.empty()) {
+                m_editableMesh.setSkeleton(*skinned.skeleton);
+                std::cout << "Imported skeleton: " << skinned.skeleton->bones.size()
+                          << " bones, " << skinned.animations.size() << " animations" << std::endl;
+            } else if (!skinned.success) {
+                std::cout << "Skeleton present but failed to load: " << skinned.error << std::endl;
+            }
         }
 
         // Switch to object mode with move gizmo for immediate positioning
@@ -4843,7 +4889,7 @@ private:
     glm::vec3 m_gizmoDragStart = glm::vec3(0.0f);
     glm::vec3 m_gizmoDragStartPos = glm::vec3(0.0f);
     glm::vec3 m_gizmoOriginalObjPos = glm::vec3(0.0f);  // Original object position for snap
-    float m_gizmoSize = 1.0f;
+    float m_gizmoSize = 0.4f;
     glm::vec3 m_gizmoOffset = glm::vec3(0.0f);
     bool m_gizmoLocalSpace = false;
 
@@ -4932,6 +4978,42 @@ private:
     // Quick save state (for F5)
     std::string m_currentFilePath;
     int m_currentFileFormat = 0;  // 0=none, 1=OBJ, 2=LIME, 3=GLB
+
+    // Project directory (used as default path for all file dialogs)
+    std::string m_projectPath;
+
+    std::string getConfigPath() const {
+        const char* home = getenv("HOME");
+        if (!home) home = "/tmp";
+        return std::string(home) + "/.config/lime";
+    }
+
+    void loadProjectConfig() {
+        std::string configFile = getConfigPath() + "/config.txt";
+        std::ifstream in(configFile);
+        if (!in.is_open()) return;
+
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.rfind("project=", 0) == 0) {
+                m_projectPath = line.substr(8);
+                if (!m_projectPath.empty() && !fs::exists(m_projectPath)) {
+                    std::cout << "Project path no longer exists: " << m_projectPath << std::endl;
+                    m_projectPath.clear();
+                }
+            }
+        }
+    }
+
+    void saveProjectConfig() {
+        std::string configDir = getConfigPath();
+        fs::create_directories(configDir);
+        std::string configFile = configDir + "/config.txt";
+        std::ofstream out(configFile);
+        if (out.is_open()) {
+            out << "project=" << m_projectPath << "\n";
+        }
+    }
 };
 
 // EditorContext helper method implementations

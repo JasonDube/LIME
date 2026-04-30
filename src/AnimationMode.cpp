@@ -788,7 +788,7 @@ void AnimationMode::openSkinnedModelDialog() {
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"GLB Models", "glb"}};
 
-    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, m_ctx.projectPath.empty() ? nullptr : m_ctx.projectPath.c_str());
 
     if (result == NFD_OKAY) {
         loadSkinnedModel(outPath);
@@ -879,7 +879,7 @@ void AnimationMode::addAnimationDialog() {
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"GLB Animation", "glb"}};
 
-    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, m_ctx.projectPath.empty() ? nullptr : m_ctx.projectPath.c_str());
 
     if (result == NFD_OKAY) {
         addAnimationFromFile(outPath);
@@ -1037,7 +1037,7 @@ void AnimationMode::exportCombinedGLB() {
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"GLB Model", "glb"}};
 
-    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nullptr, "combined.glb");
+    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, m_ctx.projectPath.empty() ? nullptr : m_ctx.projectPath.c_str(), "combined.glb");
 
     if (result == NFD_OKAY) {
         exportToGLB(outPath);

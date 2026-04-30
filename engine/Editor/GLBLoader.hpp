@@ -2,6 +2,7 @@
 
 #include "SceneObject.hpp"
 #include "Renderer/ModelRenderer.hpp"
+#include "eden/Animation.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -75,6 +76,28 @@ public:
                      int textureWidth,
                      int textureHeight,
                      const std::string& meshName = "mesh");
+
+    // Export a skinned + animated mesh as glTF/GLB (translation-only bone
+    // animation — LIME's rig is translation-only). Vertices are the bind-pose
+    // (rest) positions. perVertexBoneIndices/Weights provide a uvec4/vec4
+    // pair per vertex. animBoneWorldPosPerKey[k][i] is the world-space
+    // position of bone i at keyframe k; the function converts to per-parent
+    // local translations on export. Pass an empty animTimes to export a
+    // skinned mesh with no animation clip.
+    static bool saveSkinnedAnimated(const std::string& filepath,
+                     const std::vector<ModelVertex>& vertices,
+                     const std::vector<uint32_t>& indices,
+                     const std::vector<glm::ivec4>& perVertexBoneIndices,
+                     const std::vector<glm::vec4>& perVertexBoneWeights,
+                     const Skeleton& skeleton,
+                     const std::vector<glm::vec3>& bindBoneWorldPos,
+                     const std::vector<float>& animTimes,
+                     const std::vector<std::vector<glm::vec3>>& animBoneWorldPosPerKey,
+                     const unsigned char* textureData,
+                     int textureWidth,
+                     int textureHeight,
+                     const std::string& meshName = "mesh",
+                     const std::string& animName = "Take 001");
 
 private:
     static glm::vec3 calculateNormal(

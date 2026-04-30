@@ -48,10 +48,59 @@ public:
     // Reference image operations
     void loadReferenceImage(int viewIndex);
 
+public:
+    static constexpr float kTimelineHeight = 110.0f;  // Shared with main.cpp dockspace reservation
+
 private:
     void renderModelingEditorUI();
     void duplicateSelectedObject();  // Duplicate with random color and select
     void renderModelingUVWindow();
+    void renderAnimationTimeline();              // Always-visible timeline strip pinned to bottom
+    void clampWindowAboveTimeline(const char* name); // Call BEFORE ImGui::Begin(name, ...)
+    void requestLayoutReset() { m_layoutResetPending = true; }
+    bool m_layoutResetPending = true;  // True on first frame so the layout self-corrects on launch
+
+    // Animation timeline state (persistent across modes; will hold per-skeleton clips later)
+    float m_timelineDuration = 5.0f;
+    float m_timelineCurrentTime = 0.0f;
+    bool  m_timelinePlaying = false;
+    float m_timelineZoom = 1.0f;
+    float m_timelinePanX = 0.0f;
+    float m_timelineLastAppliedTime = -1.0f;  // Last time we applied animated transforms
+
+    // Per-object animation track. Keyframes share timestamps for pos/rot/scale
+    // so "Set Key" records all three at once (simplest possible authoring).
+    // For rigged models with a bind pose set, each keyframe also stores
+    // bone editor-positions (world space, ~12 bytes × bone count). No vert
+    // snapshots — playback re-skins from m_bindPoseVerts using bone deltas,
+    // which keeps per-key memory tiny and matches GPU skinning math.
+    struct ObjectAnimTrack {
+        std::vector<float>     times;
+        std::vector<glm::vec3> positions;
+        std::vector<glm::quat> rotations;
+        std::vector<glm::vec3> scales;
+        std::vector<std::vector<glm::vec3>> bonePositionsPerKey;  // empty for un-rigged objects
+    };
+    std::unordered_map<SceneObject*, ObjectAnimTrack> m_objectAnims;
+
+    // Bind pose for the currently selected rigged object. Populated by the
+    // "Set Bind Pose" button in the rigging panel. After this is set, bone
+    // gizmo drags stop baking deformation into vertex positions — the mesh
+    // is re-skinned from the bind pose every frame using current bone
+    // deltas, which is the same math GPU skinning will use after export.
+    bool m_hasBindPose = false;
+    SceneObject* m_bindPoseOwner = nullptr;        // bind pose belongs to this object
+    std::vector<glm::vec3> m_bindPoseVerts;        // rest-pose vertex positions
+    std::vector<glm::vec3> m_bindPoseBonePositions; // rest-pose bone positions (world)
+
+    void setBindPose();           // Snapshot current verts/bones as rest pose, recompute IBMs
+    void clearBindPose();
+    void reskinFromBoneDeltas();  // Recompute deformed verts from bind + current bone positions
+    void exportSkinnedAnimatedGLB(); // Save the rigged + animated selected object
+
+    void setKeyOnSelected();             // Records selected object's current transform at m_timelineCurrentTime
+    void deleteKeyOnSelectedNearTime();  // Removes the closest key within a small time threshold
+    void applyAnimatedTransforms();      // Lerp/slerp all tracked objects to m_timelineCurrentTime
     void renderImageRefWindow();  // Clone source images window
     void createPerspectiveCorrectedStamp(const CloneSourceImage& img);  // Perspective correction
     void processModelingInput(float deltaTime, bool gizmoActive = false);
@@ -378,6 +427,18 @@ private:
     bool m_showFaceNumbers = false;       // Display face indices in viewport
     bool m_showFacePreview = true;        // Show face extrude preview on mouse hover
 
+    // G-grab free move in component mode
+    bool m_componentGrabbing = false;
+    glm::vec3 m_grabPlaneOrigin;
+    glm::vec3 m_grabPlaneNormal;
+    glm::vec3 m_grabStartHit;
+    std::vector<std::pair<uint32_t, glm::vec3>> m_grabOrigPositions;
+
+    // Lasso selection
+    bool m_isLassoSelecting = false;
+    bool m_selectionBackfaceCull = true;
+    std::vector<glm::vec2> m_lassoPoints;
+
     // Edge node dragging (green arrow edge vertex manipulation)
     int m_edgeNodeDrag = -1;              // -1=none, 0=vertA, 1=vertB, 2=both (arrow)
     glm::vec3 m_edgeNodeDragStart;        // Mouse world pos at drag start
@@ -420,6 +481,26 @@ private:
     float m_boneInsetDepth = 0.2f;   // How far to push bone inward along surface normal
     std::vector<glm::vec3> m_bonePositions;  // Editor-side head positions per bone
     char m_newBoneName[64] = "Bone";
+    glm::vec3 m_skeletonOffset{0.0f};        // Cumulative offset applied via "Move Skeleton" — drag changes are applied as deltas to all bones
+
+    // Pre-rigging state — restored by cancelRiggingMode so exiting rigging
+    // doesn't leave the user stuck in component+vertex mode (which triggers
+    // expensive per-frame hover picking on dense meshes)
+    bool m_preRiggingObjectMode = true;
+    bool m_preRiggingShowWireframe = false;
+    ModelingSelectionMode m_preRiggingSelectionMode = ModelingSelectionMode::Vertex;
+
+    // When true, the bone Move gizmo drags in the camera-facing plane instead
+    // of locking to a single world axis — easier for rough placement.
+    bool m_riggingCameraMove = true;
+
+    // Vertices weighted to the bones affected by the current bone-gizmo drag.
+    // Built once at drag-start so the per-frame deform loop doesn't iterate
+    // every vertex on dense meshes (a freshly-added bone has zero weights, so
+    // this list is empty and the deform/upload work is skipped entirely).
+    // Each entry pairs the vertex index with its summed weight against the
+    // affected bone set, so the inner-loop weight test is also avoided.
+    std::vector<std::pair<uint32_t, float>> m_riggingDragWeightedVerts;
 
     void drawSkeletonOverlay(float vpX, float vpY, float vpW, float vpH);
     void cancelRiggingMode();

@@ -21,6 +21,11 @@
 
 using namespace eden;
 
+// Helper: get project path as C string for NFD dialogs (nullptr if not set)
+static const char* nfdDefaultDir(const std::string& projectPath) {
+    return projectPath.empty() ? nullptr : projectPath.c_str();
+}
+
 // Base64 encoding/decoding for .limes texture embedding
 static const char* limes_b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -107,6 +112,15 @@ void ModelingMode::update(float deltaTime) {
         m_saveNotificationTimer -= deltaTime;
     }
 
+    // Drive any object animation tracks. Skip work when nothing is keyed
+    // and the time hasn't moved since last apply (avoids stomping the user's
+    // gizmo edits when the timeline is just sitting at t=0).
+    if (!m_objectAnims.empty() &&
+        (m_timelinePlaying || m_timelineCurrentTime != m_timelineLastAppliedTime)) {
+        applyAnimatedTransforms();
+        m_timelineLastAppliedTime = m_timelineCurrentTime;
+    }
+
     // Process deferred mesh updates (must happen before rendering, not during)
     if (m_ctx.meshDirty) {
         invalidateWireframeCache();
@@ -140,6 +154,10 @@ void ModelingMode::update(float deltaTime) {
 }
 
 void ModelingMode::renderUI() {
+    // Render the always-visible timeline first so other panels stack above
+    // it (combined with ImGuiWindowFlags_NoBringToFrontOnFocus on the timeline).
+    renderAnimationTimeline();
+
     // Display mode notification overlay
     if (m_modeNotificationTimer > 0.0f) {
         const char* modeText = m_ctx.objectMode ? "OBJECT MODE" : "COMPONENT MODE";
@@ -597,6 +615,31 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
         drawList->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY), borderColor, 0.0f, 0, 2.0f);
     }
 
+    // Draw lasso selection polygon
+    if (m_isLassoSelecting && m_lassoPoints.size() >= 2) {
+        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+        ImU32 lassoLine = IM_COL32(100, 200, 255, 220);
+        ImU32 lassoFill = IM_COL32(100, 200, 255, 30);
+
+        // Draw filled polygon
+        if (m_lassoPoints.size() >= 3) {
+            std::vector<ImVec2> pts;
+            for (const auto& p : m_lassoPoints) pts.push_back(ImVec2(p.x, p.y));
+            drawList->AddConvexPolyFilled(pts.data(), static_cast<int>(pts.size()), lassoFill);
+        }
+
+        // Draw outline
+        for (size_t i = 0; i < m_lassoPoints.size() - 1; i++) {
+            drawList->AddLine(ImVec2(m_lassoPoints[i].x, m_lassoPoints[i].y),
+                             ImVec2(m_lassoPoints[i+1].x, m_lassoPoints[i+1].y), lassoLine, 2.0f);
+        }
+        // Close to start
+        if (m_lassoPoints.size() >= 3) {
+            drawList->AddLine(ImVec2(m_lassoPoints.back().x, m_lassoPoints.back().y),
+                             ImVec2(m_lassoPoints[0].x, m_lassoPoints[0].y), lassoLine, 1.5f);
+        }
+    }
+
     // Draw paint select brush cursor
     if (m_ctx.selectionTool == SelectionTool::Paint && !m_ctx.isPainting) {
         ImDrawList* drawList = ImGui::GetBackgroundDrawList();
@@ -847,6 +890,7 @@ void ModelingMode::renderModelingEditorUI() {
     ImGui::SetNextWindowPos(ImVec2(0, 20), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(250, 350), ImGuiCond_FirstUseEver);
 
+    clampWindowAboveTimeline("Scene");
     if (m_ctx.showSceneWindow) {
     if (ImGui::Begin("Scene", &m_ctx.showSceneWindow)) {
         // Object list
@@ -1888,6 +1932,10 @@ void ModelingMode::renderModelingEditorUI() {
 
                 ImGui::Checkbox("Show Skeleton", &m_showSkeleton);
                 ImGui::Checkbox("Show Bone Names", &m_showBoneNames);
+                ImGui::Checkbox("Camera-relative Move", &m_riggingCameraMove);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Move gizmo drags in the screen plane instead of along a single world axis.");
+                }
 
                 // Add bone
                 ImGui::InputText("##bonename", m_newBoneName, sizeof(m_newBoneName));
@@ -1955,10 +2003,14 @@ void ModelingMode::renderModelingEditorUI() {
                     if (m_selectedBone >= 0 && m_selectedBone < numBones) {
                         ImGui::Text("Selected: %s", skel.bones[m_selectedBone].name.c_str());
 
-                        // Position
+                        // Position. Bone-only change — mesh geometry is unchanged, so do
+                        // NOT set meshDirty (would trigger a full GPU re-upload of the mesh
+                        // and texture every frame the user holds the drag).
                         if (m_selectedBone < static_cast<int>(m_bonePositions.size())) {
                             if (ImGui::DragFloat3("Position", &m_bonePositions[m_selectedBone].x, 0.01f)) {
-                                m_ctx.meshDirty = true;
+                                int b = m_selectedBone;
+                                skel.bones[b].localTransform = glm::translate(glm::mat4(1.0f), m_bonePositions[b]);
+                                skel.bones[b].inverseBindMatrix = glm::inverse(skel.bones[b].localTransform);
                             }
                         }
 
@@ -2005,6 +2057,75 @@ void ModelingMode::renderModelingEditorUI() {
 
                     ImGui::Separator();
 
+                    // Snap skeleton to selected mesh — aligns floor-centers (XZ midpoint, min Y).
+                    // Use after importing a new mesh whose origin differs from the bones' mesh-space.
+                    if (ImGui::Button("Snap Skeleton to Mesh")) {
+                        if (m_bonePositions.empty()) {
+                            std::cout << "[Rigging] No bones to snap" << std::endl;
+                        } else if (m_ctx.editableMesh.getVertexCount() == 0) {
+                            std::cout << "[Rigging] No mesh to snap to" << std::endl;
+                        } else {
+                            // Mesh AABB
+                            glm::vec3 mMin(FLT_MAX), mMax(-FLT_MAX);
+                            const auto& verts = m_ctx.editableMesh.getVerticesData();
+                            for (const auto& v : verts) {
+                                mMin = glm::min(mMin, v.position);
+                                mMax = glm::max(mMax, v.position);
+                            }
+                            // Skeleton AABB (from current bone positions)
+                            glm::vec3 sMin(FLT_MAX), sMax(-FLT_MAX);
+                            for (const auto& bp : m_bonePositions) {
+                                sMin = glm::min(sMin, bp);
+                                sMax = glm::max(sMax, bp);
+                            }
+                            glm::vec3 meshFloor((mMin.x + mMax.x) * 0.5f, mMin.y, (mMin.z + mMax.z) * 0.5f);
+                            glm::vec3 skelFloor((sMin.x + sMax.x) * 0.5f, sMin.y, (sMin.z + sMax.z) * 0.5f);
+                            glm::vec3 delta = meshFloor - skelFloor;
+
+                            for (size_t i = 0; i < m_bonePositions.size() && i < skel.bones.size(); ++i) {
+                                m_bonePositions[i] += delta;
+                                skel.bones[i].localTransform = glm::translate(glm::mat4(1.0f), m_bonePositions[i]);
+                                skel.bones[i].inverseBindMatrix = glm::inverse(skel.bones[i].localTransform);
+                            }
+                            m_skeletonOffset = glm::vec3(0.0f);  // re-anchor, future drags are relative to snapped pose
+                            // Bone-only change: skip meshDirty/wireframe invalidate (mesh unchanged).
+                            std::cout << "[Rigging] Snapped skeleton by ("
+                                      << delta.x << ", " << delta.y << ", " << delta.z << ")" << std::endl;
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Translate the whole skeleton so its floor-center matches the mesh's floor-center.\nUse after importing a new mesh whose origin differs from the bones' coordinate system.");
+                    }
+
+                    // Manual whole-skeleton translation. DragFloat3 is bound to a cumulative offset;
+                    // each frame the value changes, the delta is applied to every bone position.
+                    glm::vec3 prevOffset = m_skeletonOffset;
+                    if (ImGui::DragFloat3("Move Skeleton", &m_skeletonOffset.x, 0.005f, 0.0f, 0.0f, "%.3f")) {
+                        glm::vec3 frameDelta = m_skeletonOffset - prevOffset;
+                        for (size_t i = 0; i < m_bonePositions.size() && i < skel.bones.size(); ++i) {
+                            m_bonePositions[i] += frameDelta;
+                            skel.bones[i].localTransform = glm::translate(glm::mat4(1.0f), m_bonePositions[i]);
+                            skel.bones[i].inverseBindMatrix = glm::inverse(skel.bones[i].localTransform);
+                        }
+                        // Bone-only change: skip meshDirty/wireframe invalidate (mesh unchanged).
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Drag to translate the whole skeleton. Useful for fine-tuning alignment after Snap.");
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset Move")) {
+                        glm::vec3 frameDelta = -m_skeletonOffset;
+                        for (size_t i = 0; i < m_bonePositions.size() && i < skel.bones.size(); ++i) {
+                            m_bonePositions[i] += frameDelta;
+                            skel.bones[i].localTransform = glm::translate(glm::mat4(1.0f), m_bonePositions[i]);
+                            skel.bones[i].inverseBindMatrix = glm::inverse(skel.bones[i].localTransform);
+                        }
+                        m_skeletonOffset = glm::vec3(0.0f);
+                        // Bone-only change: skip meshDirty/wireframe invalidate (mesh unchanged).
+                    }
+
+                    ImGui::Separator();
+
                     // Auto-weights
                     if (ImGui::Button("Auto Weights")) {
                         m_ctx.editableMesh.saveState();
@@ -2024,6 +2145,23 @@ void ModelingMode::renderModelingEditorUI() {
                     }
 
                     ImGui::SameLine();
+                    bool bindActive = m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject;
+                    if (bindActive) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.55f, 0.2f, 1.0f));
+                    }
+                    if (ImGui::Button(bindActive ? "Bind Pose Set" : "Set Bind Pose")) {
+                        if (bindActive) {
+                            clearBindPose();
+                        } else {
+                            setBindPose();
+                        }
+                    }
+                    if (bindActive) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Capture current verts + bones as the rest pose. After this,\nbone moves re-skin the mesh instead of baking into vertices.\nRequired before keying animation for skinned GLB export.");
+                    }
+
+                    ImGui::SameLine();
                     if (ImGui::Button("Clear Weights")) {
                         m_ctx.editableMesh.saveState();
                         m_ctx.editableMesh.clearBoneWeights();
@@ -2037,7 +2175,7 @@ void ModelingMode::renderModelingEditorUI() {
                     if (ImGui::Button("Save Skeleton")) {
                         nfdchar_t* outPath = nullptr;
                         nfdfilteritem_t filters[1] = {{"Skeleton", "limesk"}};
-                        if (NFD_SaveDialog(&outPath, filters, 1, nullptr, "skeleton.limesk") == NFD_OKAY) {
+                        if (NFD_SaveDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath), "skeleton.limesk") == NFD_OKAY) {
                             std::ofstream file(outPath);
                             if (file.is_open()) {
                                 file << "# LIMESK v1.0\n";
@@ -2064,12 +2202,20 @@ void ModelingMode::renderModelingEditorUI() {
                     }
 
                     ImGui::SameLine();
+                    if (ImGui::Button("Export Skinned GLB")) {
+                        exportSkinnedAnimatedGLB();
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Save mesh + skeleton + weights + keyframed animation\nas a GLB the engine can play with GPU skinning.\nRequires Set Bind Pose + at least one keyframe.");
+                    }
+
+                    ImGui::SameLine();
 
                     // Load skeleton from .limesk
                     if (ImGui::Button("Load Skeleton")) {
                         nfdchar_t* outPath = nullptr;
                         nfdfilteritem_t filters[1] = {{"Skeleton", "limesk"}};
-                        if (NFD_OpenDialog(&outPath, filters, 1, nullptr) == NFD_OKAY) {
+                        if (NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
                             std::ifstream file(outPath);
                             if (file.is_open()) {
                                 std::string line;
@@ -2292,6 +2438,11 @@ void ModelingMode::renderModelingEditorUI() {
                 }
             } else {
                 if (ImGui::Button("Enter Rigging Mode")) {
+                    // Snapshot current view state so cancelRiggingMode can restore it.
+                    m_preRiggingObjectMode = m_ctx.objectMode;
+                    m_preRiggingShowWireframe = m_ctx.showModelingWireframe;
+                    m_preRiggingSelectionMode = m_ctx.modelingSelectionMode;
+
                     m_riggingMode = true;
                     m_selectedBone = -1;
                     m_placingBone = false;
@@ -2300,12 +2451,31 @@ void ModelingMode::renderModelingEditorUI() {
                     m_ctx.objectMode = false;
                     m_ctx.modelingSelectionMode = ModelingSelectionMode::Vertex;
                     m_ctx.showModelingWireframe = true;
-                    // Sync bone positions from existing skeleton
+                    // Sync bone positions from existing skeleton.
+                    // localTransform is relative to parent — taking [3] alone collapses
+                    // a hierarchical skeleton into a vertical stack. Use inverse(IBM) for
+                    // the bind-pose world position (mesh-space). Fall back to walking the
+                    // parent chain if IBM is identity (loader didn't populate it).
                     auto& skel = m_ctx.editableMesh.getSkeleton();
                     m_bonePositions.clear();
+                    m_bonePositions.reserve(skel.bones.size());
+                    bool ibmValid = false;
                     for (const auto& bone : skel.bones) {
-                        // Extract position from localTransform
-                        m_bonePositions.push_back(glm::vec3(bone.localTransform[3]));
+                        if (bone.inverseBindMatrix != glm::mat4(1.0f)) { ibmValid = true; break; }
+                    }
+                    if (ibmValid) {
+                        for (const auto& bone : skel.bones) {
+                            glm::mat4 worldBind = glm::inverse(bone.inverseBindMatrix);
+                            m_bonePositions.push_back(glm::vec3(worldBind[3]));
+                        }
+                    } else {
+                        std::vector<glm::mat4> worldXf(skel.bones.size(), glm::mat4(1.0f));
+                        for (size_t i = 0; i < skel.bones.size(); ++i) {
+                            int p = skel.bones[i].parentIndex;
+                            glm::mat4 parent = (p >= 0 && p < (int)i) ? worldXf[p] : glm::mat4(1.0f);
+                            worldXf[i] = parent * skel.bones[i].localTransform;
+                            m_bonePositions.push_back(glm::vec3(worldXf[i][3]));
+                        }
                     }
                     // Disable conflicting modes
                     if (m_pathTubeMode) cancelPathTubeMode();
@@ -2734,6 +2904,7 @@ void ModelingMode::renderModelingEditorUI() {
     ImGui::SetNextWindowPos(ImVec2(0, 380), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(250, 400), ImGuiCond_FirstUseEver);
 
+    clampWindowAboveTimeline("Tools");
     if (m_ctx.showToolsWindow) {
     if (ImGui::Begin("Tools", &m_ctx.showToolsWindow)) {
         // Selection mode section
@@ -2764,6 +2935,13 @@ void ModelingMode::renderModelingEditorUI() {
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Click to select, drag for rectangle select");
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Lasso", m_ctx.selectionTool == SelectionTool::Lasso)) {
+            m_ctx.selectionTool = SelectionTool::Lasso;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Draw freeform shape to select elements inside");
         }
         ImGui::SameLine();
         if (ImGui::RadioButton("Paint", m_ctx.selectionTool == SelectionTool::Paint)) {
@@ -3595,6 +3773,7 @@ void ModelingMode::renderModelingEditorUI() {
         ImGui::Checkbox("Vertex Numbers", &m_showVertexNumbers);
         ImGui::Checkbox("Face Numbers", &m_showFaceNumbers);
         ImGui::Checkbox("Face Preview", &m_showFacePreview);
+        ImGui::Checkbox("Selection Backface Cull", &m_selectionBackfaceCull);
 
         if (m_ctx.modelingSelectionMode == ModelingSelectionMode::Vertex) {
             ImGui::SliderFloat("Vertex Size", &m_ctx.vertexDisplaySize, 0.01f, 0.2f, "%.2f");
@@ -3718,7 +3897,7 @@ void ModelingMode::renderModelingEditorUI() {
             if (ImGui::Button("Load Stamp...")) {
                 nfdchar_t* outPath = nullptr;
                 nfdfilteritem_t filters[1] = {{"Image", "png,jpg,jpeg,bmp,tga"}};
-                if (NFD_OpenDialog(&outPath, filters, 1, nullptr) == NFD_OKAY) {
+                if (NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
                     int w, h, channels;
                     unsigned char* data = stbi_load(outPath, &w, &h, &channels, 4);
                     if (data) {
@@ -4222,6 +4401,7 @@ void ModelingMode::renderModelingEditorUI() {
     if (m_ctx.showAIGenerateWindow) {
     ImGui::SetNextWindowPos(ImVec2(400, 100), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(520, 620), ImGuiCond_FirstUseEver);
+    clampWindowAboveTimeline("AI Generate (Hunyuan3D)##window");
     if (ImGui::Begin("AI Generate (Hunyuan3D)##window", &m_ctx.showAIGenerateWindow)) {
 
         // -- Server control row --
@@ -4262,7 +4442,7 @@ void ModelingMode::renderModelingEditorUI() {
                 if (ImGui::Button("Browse##single")) {
                     nfdchar_t* outPath = nullptr;
                     nfdfilteritem_t filters[1] = {{"Images", "png,jpg,jpeg,bmp"}};
-                    if (NFD_OpenDialog(&outPath, filters, 1, nullptr) == NFD_OKAY) {
+                    if (NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
                         m_generateImagePath = outPath;
                         NFD_FreePath(outPath);
                     }
@@ -4282,7 +4462,8 @@ void ModelingMode::renderModelingEditorUI() {
                 m_generateMultiView = true;
 
                 // Helper lambda for browse + display
-                auto browseSlot = [](const char* label, const char* btnId, const char* clrId,
+                const char* projDir = nfdDefaultDir(m_ctx.projectPath);
+                auto browseSlot = [projDir](const char* label, const char* btnId, const char* clrId,
                                      std::string& path, bool required) {
                     ImGui::Text("%s", label);
                     ImGui::SameLine(80);
@@ -4290,7 +4471,7 @@ void ModelingMode::renderModelingEditorUI() {
                     if (ImGui::SmallButton(browseLabel.c_str())) {
                         nfdchar_t* outPath = nullptr;
                         nfdfilteritem_t filters[1] = {{"Images", "png,jpg,jpeg,bmp"}};
-                        if (NFD_OpenDialog(&outPath, filters, 1, nullptr) == NFD_OKAY) {
+                        if (NFD_OpenDialog(&outPath, filters, 1, projDir) == NFD_OKAY) {
                             path = outPath;
                             NFD_FreePath(outPath);
                         }
@@ -4442,6 +4623,7 @@ void ModelingMode::renderModelingEditorUI() {
     ImGui::SetNextWindowPos(ImVec2(static_cast<float>(m_ctx.window.getWidth()) - 220.0f, 20), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(220, 280), ImGuiCond_FirstUseEver);
 
+    clampWindowAboveTimeline("Camera");
     if (m_ctx.showCameraWindow) {
     if (ImGui::Begin("Camera", &m_ctx.showCameraWindow)) {
         bool isPerspective = m_ctx.camera.getProjectionMode() == ProjectionMode::Perspective;
@@ -4611,6 +4793,9 @@ void ModelingMode::renderModelingEditorUI() {
             drawList->AddText(ImVec2(centerX + 10, 40), IM_COL32(150, 150, 150, 150), "(inactive)");
         }
     }
+
+    // All panels have had their chance to react to the reset flag this frame.
+    m_layoutResetPending = false;
 }
 
 
@@ -5710,9 +5895,14 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
             // Inset along surface normal so bone ends up inside the mesh
             glm::vec3 placedPos = hit.position - hit.normal * m_boneInsetDepth;
             m_bonePositions[m_selectedBone] = placedPos;
+            // Keep skeleton transforms in sync with editor-side bone position.
+            auto& skelM = m_ctx.editableMesh.getSkeleton();
+            if (m_selectedBone < static_cast<int>(skelM.bones.size())) {
+                skelM.bones[m_selectedBone].localTransform = glm::translate(glm::mat4(1.0f), placedPos);
+                skelM.bones[m_selectedBone].inverseBindMatrix = glm::inverse(skelM.bones[m_selectedBone].localTransform);
+            }
             m_placingBone = false;
-            m_ctx.meshDirty = true;
-            invalidateWireframeCache();
+            // Bone-only change: skip meshDirty/wireframe invalidate (mesh unchanged).
             std::cout << "[Rigging] Placed bone " << m_ctx.editableMesh.getSkeleton().bones[m_selectedBone].name
                       << " at (" << placedPos.x << ", " << placedPos.y << ", " << placedPos.z
                       << ") inset=" << m_boneInsetDepth << std::endl;
@@ -5838,6 +6028,96 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         // Auto-create quad as soon as 4th vertex is placed
         if (m_retopologyVerts.size() == 4) {
             createRetopologyQuad();
+        }
+    }
+
+    // G-grab: free move selected components on the view plane
+    if (!m_retopologyMode && !m_ctx.objectMode && m_ctx.editableMesh.isValid()
+        && m_ctx.selectedObject && !ImGui::GetIO().WantTextInput) {
+
+        if (!m_componentGrabbing && Input::isKeyPressed(Input::KEY_G)
+            && !Input::isKeyDown(Input::KEY_LEFT_CONTROL)
+            && m_ctx.editableMesh.hasSelection()) {
+            // Start grab
+            m_componentGrabbing = true;
+            m_ctx.editableMesh.saveState();
+
+            glm::mat4 mdl = m_ctx.selectedObject->getTransform().getMatrix();
+            Camera& cam = m_ctx.getActiveCamera();
+
+            // Get all affected vertices and store originals
+            m_grabOrigPositions.clear();
+            auto selVerts = m_ctx.editableMesh.getSelectedVertices();
+            auto selEdges = m_ctx.editableMesh.getSelectedEdges();
+            auto selFaces = m_ctx.editableMesh.getSelectedFaces();
+            std::set<uint32_t> affectedVerts;
+            for (uint32_t v : selVerts) affectedVerts.insert(v);
+            for (uint32_t he : selEdges) {
+                auto [v0, v1] = m_ctx.editableMesh.getEdgeVertices(he);
+                affectedVerts.insert(v0); affectedVerts.insert(v1);
+            }
+            for (uint32_t fi : selFaces) {
+                auto fv = m_ctx.editableMesh.getFaceVertices(fi);
+                for (uint32_t v : fv) affectedVerts.insert(v);
+            }
+            for (uint32_t v : affectedVerts) {
+                m_grabOrigPositions.push_back({v, m_ctx.editableMesh.getVertex(v).position});
+            }
+
+            // Compute grab plane: through selection center, facing camera
+            glm::vec3 selCenter = m_ctx.editableMesh.getSelectionCenter();
+            m_grabPlaneOrigin = glm::vec3(mdl * glm::vec4(selCenter, 1.0f));
+            m_grabPlaneNormal = glm::normalize(cam.getPosition() - m_grabPlaneOrigin);
+
+            // Initial mouse hit on plane
+            glm::vec3 rayO, rayD;
+            m_ctx.getMouseRay(rayO, rayD);
+            float denom = glm::dot(rayD, m_grabPlaneNormal);
+            if (std::abs(denom) > 0.0001f) {
+                float t = glm::dot(m_grabPlaneOrigin - rayO, m_grabPlaneNormal) / denom;
+                m_grabStartHit = rayO + rayD * t;
+            } else {
+                m_grabStartHit = m_grabPlaneOrigin;
+            }
+        }
+
+        if (m_componentGrabbing) {
+            // Move components
+            glm::vec3 rayO, rayD;
+            m_ctx.getMouseRay(rayO, rayD);
+            float denom = glm::dot(rayD, m_grabPlaneNormal);
+            if (std::abs(denom) > 0.0001f) {
+                float t = glm::dot(m_grabPlaneOrigin - rayO, m_grabPlaneNormal) / denom;
+                glm::vec3 currentHit = rayO + rayD * t;
+                glm::vec3 worldDelta = currentHit - m_grabStartHit;
+
+                // Convert to local space
+                glm::mat4 invMdl = glm::inverse(m_ctx.selectedObject->getTransform().getMatrix());
+                glm::vec3 localDelta = glm::vec3(invMdl * glm::vec4(worldDelta, 0.0f));
+
+                // Apply delta to all affected vertices
+                for (auto& [vi, origPos] : m_grabOrigPositions) {
+                    m_ctx.editableMesh.setVertexPosition(vi, origPos + localDelta);
+                }
+                m_ctx.meshDirty = true;
+            }
+
+            // LMB confirms
+            if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
+                m_componentGrabbing = false;
+                invalidateWireframeCache();
+            }
+
+            // ESC or RMB cancels
+            if (Input::isKeyPressed(Input::KEY_ESCAPE) || Input::isMouseButtonPressed(Input::MOUSE_RIGHT)) {
+                // Restore original positions
+                for (auto& [vi, origPos] : m_grabOrigPositions) {
+                    m_ctx.editableMesh.setVertexPosition(vi, origPos);
+                }
+                m_componentGrabbing = false;
+                m_ctx.meshDirty = true;
+                invalidateWireframeCache();
+            }
         }
     }
 
@@ -6690,9 +6970,16 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
 
         auto hit = m_ctx.editableMesh.raycast(localRayOrigin, localRayDir, m_ctx.modelingSelectionMode, threshold, m_ctx.hiddenFaces);
 
+        // Screen-space picking refinement is O(faces + edges/verts) per frame and
+        // dominates frame time on dense meshes. Above this threshold the basic
+        // raycast result is good enough; users with high-poly meshes rarely care
+        // about pixel-accurate edge/vertex hover anyway.
+        constexpr uint32_t HOVER_REFINEMENT_FACE_LIMIT = 100000;
+
         // For edge and vertex modes, override with screen-space picking for accuracy
-        if (m_ctx.modelingSelectionMode == ModelingSelectionMode::Edge ||
-            m_ctx.modelingSelectionMode == ModelingSelectionMode::Vertex) {
+        if ((m_ctx.modelingSelectionMode == ModelingSelectionMode::Edge ||
+             m_ctx.modelingSelectionMode == ModelingSelectionMode::Vertex) &&
+            m_ctx.editableMesh.getFaceCount() <= HOVER_REFINEMENT_FACE_LIMIT) {
             float fullW = static_cast<float>(m_ctx.window.getWidth());
             float fullH = static_cast<float>(m_ctx.window.getHeight());
             float vpX = 0.0f, vpW = fullW, vpH = fullH;
@@ -7067,6 +7354,106 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                     }
                 }
             }
+        }
+    }
+
+    // Lasso selection tool
+    if (m_ctx.selectionTool == SelectionTool::Lasso && !mouseOverImGui && !m_ctx.isPainting
+        && m_ctx.editableMesh.isValid() && m_ctx.selectedObject) {
+        if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
+            m_isLassoSelecting = true;
+            m_lassoPoints.clear();
+            m_lassoPoints.push_back(Input::getMousePosition());
+        }
+        if (m_isLassoSelecting && Input::isMouseButtonDown(Input::MOUSE_LEFT)) {
+            glm::vec2 mp = Input::getMousePosition();
+            // Only add point if moved enough from last point
+            if (m_lassoPoints.empty() || glm::length(mp - m_lassoPoints.back()) > 3.0f) {
+                m_lassoPoints.push_back(mp);
+            }
+        }
+        if (m_isLassoSelecting && !Input::isMouseButtonDown(Input::MOUSE_LEFT)) {
+            m_isLassoSelecting = false;
+
+            if (m_lassoPoints.size() >= 3) {
+                // Point-in-polygon test (2D, ray casting method)
+                auto pointInLasso = [&](const glm::vec2& p) -> bool {
+                    int crossings = 0;
+                    size_t n = m_lassoPoints.size();
+                    for (size_t i = 0; i < n; i++) {
+                        size_t j = (i + 1) % n;
+                        float yi = m_lassoPoints[i].y, yj = m_lassoPoints[j].y;
+                        if ((yi <= p.y && yj > p.y) || (yj <= p.y && yi > p.y)) {
+                            float xi = m_lassoPoints[i].x + (p.y - yi) / (yj - yi) *
+                                       (m_lassoPoints[j].x - m_lassoPoints[i].x);
+                            if (p.x < xi) crossings++;
+                        }
+                    }
+                    return (crossings % 2) == 1;
+                };
+
+                bool shiftHeld = Input::isKeyDown(Input::KEY_LEFT_SHIFT) || Input::isKeyDown(Input::KEY_RIGHT_SHIFT);
+                if (!shiftHeld) m_ctx.editableMesh.clearSelection();
+
+                // Project elements to screen and test against lasso polygon
+                float fullW = static_cast<float>(m_ctx.window.getWidth());
+                float fullH = static_cast<float>(m_ctx.window.getHeight());
+                float vpX2 = 0.0f, vpW2 = fullW, vpH2 = fullH;
+                bool useRight = false;
+                if (m_ctx.splitView) {
+                    vpW2 = fullW / 2.0f;
+                    if (m_lassoPoints[0].x >= fullW / 2.0f) { vpX2 = fullW / 2.0f; useRight = true; }
+                }
+                Camera& cam = (m_ctx.splitView && useRight) ? m_ctx.camera2 : m_ctx.camera;
+                glm::mat4 mvp = cam.getProjectionMatrix(vpW2 / vpH2) * cam.getViewMatrix() *
+                                m_ctx.selectedObject->getTransform().getMatrix();
+                glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(
+                    m_ctx.selectedObject->getTransform().getMatrix())));
+                glm::vec3 camPos = cam.getPosition();
+
+                auto toScreen = [&](const glm::vec3& localPos) -> glm::vec2 {
+                    glm::vec4 clip = mvp * glm::vec4(localPos, 1.0f);
+                    if (clip.w <= 0.0f) return glm::vec2(-10000);
+                    glm::vec3 ndc = glm::vec3(clip) / clip.w;
+                    return glm::vec2(vpX2 + (ndc.x * 0.5f + 0.5f) * vpW2,
+                                     (1.0f - (ndc.y * 0.5f + 0.5f)) * vpH2);
+                };
+
+                if (m_ctx.modelingSelectionMode == ModelingSelectionMode::Vertex) {
+                    for (uint32_t i = 0; i < m_ctx.editableMesh.getVertexCount(); i++) {
+                        glm::vec2 sp = toScreen(m_ctx.editableMesh.getVertex(i).position);
+                        if (sp.x > -5000 && pointInLasso(sp)) {
+                            m_ctx.editableMesh.selectVertex(i, true);
+                        }
+                    }
+                } else if (m_ctx.modelingSelectionMode == ModelingSelectionMode::Face) {
+                    for (uint32_t i = 0; i < m_ctx.editableMesh.getFaceCount(); i++) {
+                        if (m_selectionBackfaceCull) {
+                            glm::vec3 fn = m_ctx.editableMesh.getFaceNormal(i);
+                            glm::vec3 fc2 = m_ctx.editableMesh.getFaceCenter(i);
+                            glm::vec3 wc = glm::vec3(m_ctx.selectedObject->getTransform().getMatrix() * glm::vec4(fc2, 1.0f));
+                            glm::vec3 wn = glm::normalize(normalMat * fn);
+                            if (glm::dot(wn, camPos - wc) <= 0.0f) continue;
+                        }
+
+                        glm::vec2 sp = toScreen(m_ctx.editableMesh.getFaceCenter(i));
+                        if (sp.x > -5000 && pointInLasso(sp)) {
+                            m_ctx.editableMesh.selectFace(i, true);
+                        }
+                    }
+                } else if (m_ctx.modelingSelectionMode == ModelingSelectionMode::Edge) {
+                    for (uint32_t i = 0; i < m_ctx.editableMesh.getHalfEdgeCount(); i++) {
+                        auto [v0, v1] = m_ctx.editableMesh.getEdgeVertices(i);
+                        glm::vec3 mid = (m_ctx.editableMesh.getVertex(v0).position +
+                                         m_ctx.editableMesh.getVertex(v1).position) * 0.5f;
+                        glm::vec2 sp = toScreen(mid);
+                        if (sp.x > -5000 && pointInLasso(sp)) {
+                            m_ctx.editableMesh.selectEdge(i, true);
+                        }
+                    }
+                }
+            }
+            m_lassoPoints.clear();
         }
     }
 
@@ -8637,7 +9024,7 @@ void ModelingMode::saveEditableMeshAsGLB() {
 
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"GLB Model", "glb"}};
-    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nullptr, defaultName.c_str());
+    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath), defaultName.c_str());
 
     if (result == NFD_OKAY) {
         std::string filepath = outPath;
@@ -8693,7 +9080,7 @@ void ModelingMode::saveEditableMeshAsOBJ() {
 
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"OBJ Model", "obj"}};
-    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nullptr, defaultName.c_str());
+    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath), defaultName.c_str());
 
     if (result == NFD_OKAY) {
         std::string filepath = outPath;
@@ -8714,7 +9101,7 @@ void ModelingMode::saveEditableMeshAsOBJ() {
 void ModelingMode::loadOBJFile() {
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"OBJ Model", "obj"}};
-    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath));
 
     if (result == NFD_OKAY) {
         std::string filepath = outPath;
@@ -8804,7 +9191,7 @@ void ModelingMode::saveEditableMeshAsLime() {
 
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"LIME Model", "lime"}};
-    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nullptr, defaultName.c_str());
+    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath), defaultName.c_str());
 
     if (result == NFD_OKAY) {
         std::string filepath = outPath;
@@ -8854,7 +9241,7 @@ void ModelingMode::exportTextureAsPNG() {
 
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"PNG Image", "png"}};
-    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nullptr, defaultName.c_str());
+    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath), defaultName.c_str());
 
     if (result == NFD_OKAY) {
         std::string filepath = outPath;
@@ -8879,7 +9266,7 @@ void ModelingMode::exportTextureAsPNG() {
 void ModelingMode::loadLimeFile() {
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"LIME Model", "lime"}};
-    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath));
 
     if (result == NFD_OKAY) {
         std::string filepath = outPath;
@@ -9198,7 +9585,7 @@ void ModelingMode::saveLimeScene() {
 
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"LIME Scene", "limes"}};
-    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nullptr, "scene.limes");
+    nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath), "scene.limes");
 
     if (result != NFD_OKAY) return;
 
@@ -9325,7 +9712,7 @@ void ModelingMode::saveLimeScene() {
 void ModelingMode::loadLimeScene() {
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filters[1] = {{"LIME Scene", "limes"}};
-    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nullptr);
+    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath));
 
     if (result != NFD_OKAY) return;
 
@@ -9919,7 +10306,7 @@ void ModelingMode::loadReferenceImage(int viewIndex) {
     nfdchar_t* outPath = nullptr;
     nfdfilteritem_t filterItem[1] = {{"Images", "png,jpg,jpeg,bmp,tga"}};
 
-    nfdresult_t result = NFD_OpenDialog(&outPath, filterItem, 1, nullptr);
+    nfdresult_t result = NFD_OpenDialog(&outPath, filterItem, 1, nfdDefaultDir(m_ctx.projectPath));
 
     if (result == NFD_OKAY && outPath) {
         if (m_ctx.loadReferenceImageCallback) {

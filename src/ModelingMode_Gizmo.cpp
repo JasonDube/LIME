@@ -341,6 +341,50 @@ bool ModelingMode::processGizmoInput() {
             glm::vec3 gizmoXAxis, gizmoYAxis, gizmoZAxis;
             getGizmoAxes(gizmoXAxis, gizmoYAxis, gizmoZAxis);
 
+            // Camera-relative bone move: ignore the picked axis and drag the
+            // bone (+ descendants + cached weighted verts) in the camera-facing
+            // plane through the original bone position. Easier than aligning
+            // three world-axis drags for rough placement.
+            if (riggingBoneSelected && m_ctx.selectedObject &&
+                m_ctx.gizmoMode == GizmoMode::Move && m_riggingCameraMove) {
+                Camera& cam = m_ctx.getActiveCamera();
+                glm::vec3 planeNormal = cam.getFront();
+                float denom = glm::dot(rayDir, planeNormal);
+                if (std::abs(denom) > 0.0001f) {
+                    float t = glm::dot(m_ctx.gizmoDragStartPos - rayOrigin, planeNormal) / denom;
+                    glm::vec3 currentPoint = rayOrigin + rayDir * t;
+                    glm::vec3 delta = currentPoint - m_ctx.gizmoDragStart;
+
+                    if (glm::length(delta) > 0.0001f) {
+                        glm::mat4 invModel = glm::inverse(m_ctx.selectedObject->getTransform().getMatrix());
+                        glm::vec3 localDelta = glm::vec3(invModel * glm::vec4(delta, 0.0f));
+
+                        m_bonePositions[m_selectedBone] += localDelta;
+                        auto descendants = getDescendantBones(m_selectedBone);
+                        for (int di : descendants) {
+                            if (di < static_cast<int>(m_bonePositions.size())) {
+                                m_bonePositions[di] += localDelta;
+                            }
+                        }
+
+                        if (m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject) {
+                            // Re-skin from rest pose; no destructive bake.
+                            reskinFromBoneDeltas();
+                        } else if (!m_riggingDragWeightedVerts.empty()) {
+                            for (const auto& [vi, w] : m_riggingDragWeightedVerts) {
+                                m_ctx.editableMesh.getVertex(vi).position += localDelta * w;
+                            }
+                            m_ctx.meshDirty = true;
+                            invalidateWireframeCache();
+                        }
+
+                        m_ctx.gizmoDragStart = currentPoint;
+                        m_ctx.gizmoDragStartPos = getGizmoPosition();
+                    }
+                }
+                return true;
+            }
+
             // Handle OrthoFree drag: project mouse delta onto 2 visible axes
             if (m_ctx.gizmoActiveAxis == GizmoAxis::OrthoFree) {
                 glm::vec3 orthoAxis1, orthoAxis2;
@@ -430,25 +474,26 @@ bool ModelingMode::processGizmoInput() {
                             }
                         }
 
-                        // Deform weighted vertices
-                        std::set<int> affectedSet(descendants.begin(), descendants.end());
-                        affectedSet.insert(m_selectedBone);
-                        for (size_t vi = 0; vi < m_ctx.editableMesh.getVertexCount(); ++vi) {
-                            auto& v = m_ctx.editableMesh.getVertex(static_cast<uint32_t>(vi));
-                            float totalAffectedWeight = 0.0f;
-                            for (int j = 0; j < 4; ++j) {
-                                if (v.boneWeights[j] > 0.0f && affectedSet.count(v.boneIndices[j])) {
-                                    totalAffectedWeight += v.boneWeights[j];
-                                }
-                            }
-                            if (totalAffectedWeight > 0.001f) {
+                        // Translation-only re-skin doesn't capture rotations
+                        // accurately; we still bake rotation into verts when
+                        // bind pose is set, but the bone's "world position"
+                        // contribution gets re-skinned next frame from
+                        // m_bindPoseBonePositions. Acceptable approximation
+                        // for pure-translation rigs (which is what LIME does
+                        // today). A future change would store full bone
+                        // transforms for proper hierarchical rotation skinning.
+                        if (m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject) {
+                            reskinFromBoneDeltas();
+                        } else if (!m_riggingDragWeightedVerts.empty()) {
+                            for (const auto& [vi, w] : m_riggingDragWeightedVerts) {
+                                auto& v = m_ctx.editableMesh.getVertex(vi);
                                 glm::vec3 rel = v.position - pivot;
                                 glm::vec3 rotatedPos = pivot + glm::vec3(rotMat * glm::vec4(rel, 1.0f));
-                                v.position = glm::mix(v.position, rotatedPos, totalAffectedWeight);
+                                v.position = glm::mix(v.position, rotatedPos, w);
                             }
+                            m_ctx.meshDirty = true;
+                            invalidateWireframeCache();
                         }
-                        m_ctx.meshDirty = true;
-                        invalidateWireframeCache();
                     } else if (m_ctx.objectMode && m_ctx.selectedObject) {
                         // Object mode: rotate the object's transform
                         m_ctx.selectedObject->getTransform().rotate(angle, axisDir);
@@ -551,23 +596,15 @@ bool ModelingMode::processGizmoInput() {
                         }
                     }
 
-                    // Deform weighted vertices proportional to bone weights
-                    std::set<int> affectedSet(descendants.begin(), descendants.end());
-                    affectedSet.insert(m_selectedBone);
-                    for (size_t vi = 0; vi < m_ctx.editableMesh.getVertexCount(); ++vi) {
-                        auto& v = m_ctx.editableMesh.getVertex(static_cast<uint32_t>(vi));
-                        float totalAffectedWeight = 0.0f;
-                        for (int j = 0; j < 4; ++j) {
-                            if (v.boneWeights[j] > 0.0f && affectedSet.count(v.boneIndices[j])) {
-                                totalAffectedWeight += v.boneWeights[j];
-                            }
+                    if (m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject) {
+                        reskinFromBoneDeltas();
+                    } else if (!m_riggingDragWeightedVerts.empty()) {
+                        for (const auto& [vi, w] : m_riggingDragWeightedVerts) {
+                            m_ctx.editableMesh.getVertex(vi).position += localDelta * w;
                         }
-                        if (totalAffectedWeight > 0.001f) {
-                            v.position += localDelta * totalAffectedWeight;
-                        }
+                        m_ctx.meshDirty = true;
+                        invalidateWireframeCache();
                     }
-                    m_ctx.meshDirty = true;
-                    invalidateWireframeCache();
 
                     // Update drag start for incremental movement
                     m_ctx.gizmoDragStart = currentPoint;
@@ -714,6 +751,33 @@ bool ModelingMode::processGizmoInput() {
             m_ctx.gizmoActiveAxis = m_ctx.gizmoHoveredAxis;
             m_ctx.gizmoDragStartPos = gizmoPos;
 
+            // Cache the vertices the bone-gizmo will deform. The per-frame
+            // deform loop reads this list, so iterating all mesh vertices on
+            // dense meshes is avoided (a bone with no weights yields an
+            // empty list and the deform path becomes a no-op).
+            m_riggingDragWeightedVerts.clear();
+            if (riggingBoneSelected) {
+                std::set<int> affectedSet;
+                affectedSet.insert(m_selectedBone);
+                auto descendants = getDescendantBones(m_selectedBone);
+                for (int di : descendants) affectedSet.insert(di);
+
+                uint32_t vertCount = m_ctx.editableMesh.getVertexCount();
+                m_riggingDragWeightedVerts.reserve(vertCount / 8);
+                for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                    const auto& v = m_ctx.editableMesh.getVertex(vi);
+                    float total = 0.0f;
+                    for (int j = 0; j < 4; ++j) {
+                        if (v.boneWeights[j] > 0.0f && affectedSet.count(v.boneIndices[j])) {
+                            total += v.boneWeights[j];
+                        }
+                    }
+                    if (total > 0.001f) {
+                        m_riggingDragWeightedVerts.emplace_back(vi, total);
+                    }
+                }
+            }
+
             // Find initial point on axis - use local or world space axes
             glm::vec3 gizmoXAxis, gizmoYAxis, gizmoZAxis;
             getGizmoAxes(gizmoXAxis, gizmoYAxis, gizmoZAxis);
@@ -732,6 +796,17 @@ bool ModelingMode::processGizmoInput() {
                 glm::vec3 orthoAxis1, orthoAxis2;
                 getOrthoAxes(orthoAxis1, orthoAxis2);
                 glm::vec3 planeNormal = glm::normalize(glm::cross(orthoAxis1, orthoAxis2));
+                float denom = glm::dot(rayDir, planeNormal);
+                if (std::abs(denom) > 0.0001f) {
+                    float t = glm::dot(gizmoPos - rayOrigin, planeNormal) / denom;
+                    m_ctx.gizmoDragStart = rayOrigin + rayDir * t;
+                } else {
+                    m_ctx.gizmoDragStart = gizmoPos;
+                }
+            } else if (riggingBoneSelected && m_ctx.gizmoMode == GizmoMode::Move && m_riggingCameraMove) {
+                // Camera-relative bone move: drag start is the ray hit on the
+                // camera-facing plane through the bone position.
+                glm::vec3 planeNormal = m_ctx.getActiveCamera().getFront();
                 float denom = glm::dot(rayDir, planeNormal);
                 if (std::abs(denom) > 0.0001f) {
                     float t = glm::dot(gizmoPos - rayOrigin, planeNormal) / denom;

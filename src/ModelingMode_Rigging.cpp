@@ -1,15 +1,180 @@
 #include "ModelingMode.hpp"
 #include "EditableMesh.hpp"
+#include "Editor/GLBLoader.hpp"
 #include <imgui.h>
+#include <nfd.h>
 #include <iostream>
 
 using namespace eden;
+
+// Local copy of the NFD default-dir helper from ModelingMode.cpp; trivially
+// small and avoids exposing the file-static there.
+static const char* riggingNfdDefaultDir(const std::string& projectPath) {
+    return projectPath.empty() ? nullptr : projectPath.c_str();
+}
+
+void ModelingMode::setBindPose() {
+    if (!m_ctx.selectedObject || !m_ctx.editableMesh.isValid()) return;
+
+    m_bindPoseOwner = m_ctx.selectedObject;
+    const auto& verts = m_ctx.editableMesh.getVerticesData();
+    m_bindPoseVerts.resize(verts.size());
+    for (size_t i = 0; i < verts.size(); ++i) m_bindPoseVerts[i] = verts[i].position;
+    m_bindPoseBonePositions = m_bonePositions;
+
+    // Recompute IBMs from the bind-pose bone world positions, walking the
+    // hierarchy so child bones correctly capture their parent's rest world
+    // transform. (Translation-only rig: localTransform = translate(world_i - world_parent).)
+    auto& skel = m_ctx.editableMesh.getSkeleton();
+    std::vector<glm::mat4> worldXf(skel.bones.size(), glm::mat4(1.0f));
+    for (size_t i = 0; i < skel.bones.size() && i < m_bindPoseBonePositions.size(); ++i) {
+        int p = skel.bones[i].parentIndex;
+        glm::vec3 parentPos(0.0f);
+        if (p >= 0 && p < static_cast<int>(i) && p < static_cast<int>(m_bindPoseBonePositions.size())) {
+            parentPos = m_bindPoseBonePositions[p];
+        }
+        glm::vec3 localPos = m_bindPoseBonePositions[i] - parentPos;
+        skel.bones[i].localTransform = glm::translate(glm::mat4(1.0f), localPos);
+        worldXf[i] = glm::translate(glm::mat4(1.0f), m_bindPoseBonePositions[i]);
+        skel.bones[i].inverseBindMatrix = glm::inverse(worldXf[i]);
+    }
+
+    m_hasBindPose = true;
+    std::cout << "[Rigging] Bind pose set: " << m_bindPoseVerts.size() << " verts, "
+              << m_bindPoseBonePositions.size() << " bones" << std::endl;
+}
+
+void ModelingMode::clearBindPose() {
+    m_hasBindPose = false;
+    m_bindPoseOwner = nullptr;
+    m_bindPoseVerts.clear();
+    m_bindPoseBonePositions.clear();
+}
+
+void ModelingMode::reskinFromBoneDeltas() {
+    if (!m_hasBindPose || m_bindPoseOwner != m_ctx.selectedObject) return;
+    if (!m_ctx.editableMesh.isValid()) return;
+
+    const uint32_t vertCount = m_ctx.editableMesh.getVertexCount();
+    if (m_bindPoseVerts.size() != vertCount) return;
+    if (m_bindPoseBonePositions.size() != m_bonePositions.size()) return;
+
+    // Translation-only skinning: deformed = rest + sum(weight_i * (bone_i - bind_bone_i))
+    // Matches LIME's existing translate-by-weighted-delta deform model and
+    // is what GPU skinning will compute when bones have only translation.
+    for (uint32_t vi = 0; vi < vertCount; ++vi) {
+        auto& v = m_ctx.editableMesh.getVertex(vi);
+        glm::vec3 delta(0.0f);
+        for (int j = 0; j < 4; ++j) {
+            if (v.boneWeights[j] <= 0.0f) continue;
+            int b = v.boneIndices[j];
+            if (b < 0 || b >= static_cast<int>(m_bonePositions.size())) continue;
+            delta += v.boneWeights[j] * (m_bonePositions[b] - m_bindPoseBonePositions[b]);
+        }
+        v.position = m_bindPoseVerts[vi] + delta;
+    }
+
+    // Push to GPU via the in-place fast path so we don't rebuild buffers.
+    uint32_t handle = m_bindPoseOwner->getBufferHandle();
+    if (handle != UINT32_MAX && handle != 0) {
+        std::vector<ModelVertex> verts;
+        std::vector<uint32_t> idx;
+        m_ctx.editableMesh.triangulate(verts, idx, m_ctx.hiddenFaces);
+        m_ctx.modelRenderer.updateModelBuffer(handle, verts);
+        m_bindPoseOwner->setMeshData(verts, idx);
+    }
+}
+
+void ModelingMode::exportSkinnedAnimatedGLB() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) {
+        std::cout << "[Export] No object selected" << std::endl;
+        return;
+    }
+    if (!m_hasBindPose || m_bindPoseOwner != obj) {
+        std::cout << "[Export] Set Bind Pose first (rigging panel)" << std::endl;
+        return;
+    }
+    if (!m_ctx.editableMesh.isValid()) return;
+
+    // Build bind-pose mesh (positions = m_bindPoseVerts, other attrs from current
+    // editable mesh — bind pose was the snapshot of those at "Set Bind Pose" time
+    // and the topology hasn't changed since, so cached normals/uvs/colors apply).
+    std::vector<ModelVertex> verts;
+    std::vector<uint32_t> indices;
+    m_ctx.editableMesh.triangulate(verts, indices, m_ctx.hiddenFaces);
+    if (verts.size() != m_bindPoseVerts.size()) {
+        std::cout << "[Export] Vertex count changed since Set Bind Pose; re-bind first" << std::endl;
+        return;
+    }
+    for (size_t i = 0; i < verts.size(); ++i) {
+        verts[i].position = m_bindPoseVerts[i];
+    }
+
+    // Per-vertex bone indices/weights from the editable mesh.
+    const auto& heVerts = m_ctx.editableMesh.getVerticesData();
+    std::vector<glm::ivec4> boneIdx(heVerts.size());
+    std::vector<glm::vec4>  boneWts(heVerts.size());
+    for (size_t i = 0; i < heVerts.size(); ++i) {
+        boneIdx[i] = heVerts[i].boneIndices;
+        boneWts[i] = heVerts[i].boneWeights;
+    }
+
+    // Animation: gather track for this object, if any.
+    std::vector<float> animTimes;
+    std::vector<std::vector<glm::vec3>> animBonePerKey;
+    auto it = m_objectAnims.find(obj);
+    if (it != m_objectAnims.end()) {
+        const auto& tr = it->second;
+        for (size_t k = 0; k < tr.times.size(); ++k) {
+            // Only include keys that have a bone snapshot (rigged keys).
+            if (k < tr.bonePositionsPerKey.size() && !tr.bonePositionsPerKey[k].empty()) {
+                animTimes.push_back(tr.times[k]);
+                animBonePerKey.push_back(tr.bonePositionsPerKey[k]);
+            }
+        }
+    }
+
+    // Texture (optional).
+    const unsigned char* texData = nullptr;
+    int texW = 0, texH = 0;
+    if (obj->hasTextureData()) {
+        texData = obj->getTextureData().data();
+        texW = obj->getTextureWidth();
+        texH = obj->getTextureHeight();
+    }
+
+    nfdchar_t* outPath = nullptr;
+    nfdfilteritem_t filters[1] = {{"GLB Skinned Model", "glb"}};
+    std::string defaultName = obj->getName() + "_skinned.glb";
+    if (NFD_SaveDialog(&outPath, filters, 1, riggingNfdDefaultDir(m_ctx.projectPath), defaultName.c_str()) != NFD_OKAY) {
+        return;
+    }
+    std::string filepath = outPath;
+    NFD_FreePath(outPath);
+    if (filepath.size() < 4 || filepath.substr(filepath.size() - 4) != ".glb") filepath += ".glb";
+
+    bool ok = GLBLoader::saveSkinnedAnimated(
+        filepath, verts, indices, boneIdx, boneWts,
+        m_ctx.editableMesh.getSkeleton(),
+        m_bindPoseBonePositions,
+        animTimes, animBonePerKey,
+        texData, texW, texH,
+        obj->getName(), "Take 001");
+    std::cout << (ok ? "[Export] OK: " : "[Export] FAILED: ") << filepath << std::endl;
+}
 
 void ModelingMode::cancelRiggingMode() {
     m_riggingMode = false;
     m_selectedBone = -1;
     m_placingBone = false;
     m_showSkeleton = false;
+    // Restore the view state captured when rigging was entered.
+    // Without this the user stays in component+vertex+wireframe, which keeps
+    // the per-frame hover picking running on dense meshes.
+    m_ctx.objectMode = m_preRiggingObjectMode;
+    m_ctx.modelingSelectionMode = m_preRiggingSelectionMode;
+    m_ctx.showModelingWireframe = m_preRiggingShowWireframe;
 }
 
 int ModelingMode::pickBoneAtScreenPos(const glm::vec2& screenPos, float threshold) {

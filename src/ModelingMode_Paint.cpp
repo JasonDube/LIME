@@ -22,7 +22,7 @@ void ModelingMode::renderImageRefWindow() {
         if (ImGui::Button("Load Image...")) {
             nfdchar_t* outPath = nullptr;
             nfdfilteritem_t filters[1] = {{"Image", "png,jpg,jpeg,bmp,tga"}};
-            if (NFD_OpenDialog(&outPath, filters, 1, nullptr) == NFD_OKAY) {
+            if (NFD_OpenDialog(&outPath, filters, 1, m_ctx.projectPath.empty() ? nullptr : m_ctx.projectPath.c_str()) == NFD_OKAY) {
                 int w, h, channels;
                 unsigned char* data = stbi_load(outPath, &w, &h, &channels, 4);
                 if (data) {

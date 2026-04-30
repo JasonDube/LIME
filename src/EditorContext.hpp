@@ -86,6 +86,7 @@ enum class EditMode {
 // Selection tool types
 enum class SelectionTool {
     Normal,     // Click to select single element, drag for rectangle select
+    Lasso,      // Freeform lasso selection
     Paint       // Paint/brush to select elements under cursor
 };
 
@@ -346,6 +347,9 @@ struct EditorContext {
     // Quick save state (for F5)
     std::string& currentFilePath;  // Full path to the currently loaded file
     int& currentFileFormat;        // 0=none, 1=OBJ, 2=LIME, 3=GLB
+
+    // Project directory (default path for file dialogs)
+    std::string& projectPath;
 
     // Reference image callbacks (set by main editor)
     std::function<bool(int, const std::string&)> loadReferenceImageCallback;
