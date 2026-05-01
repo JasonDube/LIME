@@ -98,9 +98,40 @@ private:
     void reskinFromBoneDeltas();  // Recompute deformed verts from bind + current bone positions
     void exportSkinnedAnimatedGLB(); // Save the rigged + animated selected object
 
+    // Weight heatmap: colors mesh verts by their weight on the selected bone
+    // (blue=0 → green=0.5 → red=1). Pushes overridden vertex colors via the
+    // in-place updateModelBuffer fast-path; toggling off restores the
+    // editable mesh's stored colors.
+    bool m_showWeightHeatMap = false;
+    int  m_lastHeatMapBone = -1;
+    bool m_heatMapDirty = false;  // forces a re-push next update tick
+    void applyHeatMapToVerts(std::vector<ModelVertex>& verts);  // overrides .color in-place
+    void pushMeshWithHeatMap();  // triangulate + (optional heatmap) + updateModelBuffer
+
+    // Weight paint brush. Active when m_weightPaintMode is true and a bone
+    // is selected. LMB adds, Ctrl+LMB subtracts. `[` / `]` resize radius.
+    bool  m_weightPaintMode = false;
+    float m_weightPaintRadius = 0.3f;     // model-space radius
+    float m_weightPaintStrength = 0.5f;   // weight delta applied per stroke-tick
+    bool  m_weightPaintingActive = false; // edge-detect to save undo state once per stroke
+
     void setKeyOnSelected();             // Records selected object's current transform at m_timelineCurrentTime
     void deleteKeyOnSelectedNearTime();  // Removes the closest key within a small time threshold
     void applyAnimatedTransforms();      // Lerp/slerp all tracked objects to m_timelineCurrentTime
+    void jumpToPrevKey();                // Move playhead to the previous key time on the selected object's track
+    void jumpToNextKey();                // ...or the next one
+    void copyKeyAtCurrentTime();         // Snapshot the closest key on the selected track into a clipboard
+    void pasteKeyAtCurrentTime();        // Insert (or overwrite) a key at the playhead from the clipboard
+
+    // Single-slot keyframe clipboard (one entry across all objects/tracks).
+    struct KeyClipboard {
+        bool        valid = false;
+        glm::vec3   position{0.0f};
+        glm::quat   rotation{1.0f, 0.0f, 0.0f, 0.0f};
+        glm::vec3   scale{1.0f};
+        std::vector<glm::vec3> bonePositions;  // empty for un-rigged objects
+    };
+    KeyClipboard m_keyClipboard;
     void renderImageRefWindow();  // Clone source images window
     void createPerspectiveCorrectedStamp(const CloneSourceImage& img);  // Perspective correction
     void processModelingInput(float deltaTime, bool gizmoActive = false);
@@ -490,9 +521,13 @@ private:
     bool m_preRiggingShowWireframe = false;
     ModelingSelectionMode m_preRiggingSelectionMode = ModelingSelectionMode::Vertex;
 
-    // When true, the bone Move gizmo drags in the camera-facing plane instead
-    // of locking to a single world axis — easier for rough placement.
-    bool m_riggingCameraMove = true;
+    // Direct bone-marker drag in the rigging skeleton overlay. Pressing on a
+    // bone joint dot picks the bone AND starts a camera-plane drag — release
+    // ends it. Gizmo arrow drags stay world-axis-locked, so picking the
+    // interaction target chooses the constraint (no checkbox).
+    int       m_riggingBoneDragIdx = -1;
+    glm::vec3 m_riggingBoneDragPrevPoint{0.0f};
+    glm::vec3 m_riggingBoneDragPlaneNormal{0.0f, 0.0f, 1.0f};
 
     // Vertices weighted to the bones affected by the current bone-gizmo drag.
     // Built once at drag-start so the per-frame deform loop doesn't iterate

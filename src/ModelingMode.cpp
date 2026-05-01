@@ -99,7 +99,12 @@ void ModelingMode::onDeactivate() {
 }
 
 void ModelingMode::processInput(float deltaTime) {
-    bool gizmoConsumedInput = processGizmoInput();
+    // In weight paint mode, the gizmo would steal LMB drags meant for paint
+    // strokes. Skip its input pass and only run the modeling/paint handler.
+    bool gizmoConsumedInput = false;
+    if (!m_weightPaintMode) {
+        gizmoConsumedInput = processGizmoInput();
+    }
     processModelingInput(deltaTime, gizmoConsumedInput);
 }
 
@@ -119,6 +124,18 @@ void ModelingMode::update(float deltaTime) {
         (m_timelinePlaying || m_timelineCurrentTime != m_timelineLastAppliedTime)) {
         applyAnimatedTransforms();
         m_timelineLastAppliedTime = m_timelineCurrentTime;
+    }
+
+    // Weight heatmap: re-push the mesh when the toggle flips, the selected
+    // bone changes, or somebody invalidated it (e.g. weight slider edit).
+    if (m_riggingMode && m_ctx.selectedObject) {
+        bool needPush = m_heatMapDirty ||
+                        (m_showWeightHeatMap && m_selectedBone != m_lastHeatMapBone);
+        if (needPush) {
+            pushMeshWithHeatMap();
+            m_lastHeatMapBone = m_selectedBone;
+            m_heatMapDirty = false;
+        }
     }
 
     // Process deferred mesh updates (must happen before rendering, not during)
@@ -338,6 +355,47 @@ void ModelingMode::renderUI() {
             drawList->AddCircle(mousePos, screenRadius, circleColor, 32, 2.0f);
             // Add white outline for visibility
             drawList->AddCircle(mousePos, screenRadius + 1, IM_COL32(255, 255, 255, 150), 32, 1.0f);
+        }
+    }
+
+    // Weight paint brush cursor — green ring for add, red ring for subtract.
+    if (m_weightPaintMode && m_riggingMode && m_ctx.selectedObject &&
+        m_ctx.editableMesh.isValid()) {
+        bool mouseOverImGui = ImGui::GetIO().WantCaptureMouse;
+        if (!mouseOverImGui) {
+            ImVec2 mousePos = ImGui::GetMousePos();
+            glm::vec3 rayOrigin, rayDir;
+            m_ctx.getMouseRay(rayOrigin, rayDir);
+            glm::mat4 modelMatrix = m_ctx.selectedObject->getTransform().getMatrix();
+            glm::mat4 invModel = glm::inverse(modelMatrix);
+            glm::vec3 localOrigin = glm::vec3(invModel * glm::vec4(rayOrigin, 1.0f));
+            glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(rayDir, 0.0f)));
+            auto hit = m_ctx.editableMesh.raycastFace(localOrigin, localDir);
+
+            float screenRadius = 20.0f;
+            if (hit.hit) {
+                glm::vec3 worldHitPos = glm::vec3(modelMatrix * glm::vec4(hit.position, 1.0f));
+                glm::vec3 scale = m_ctx.selectedObject->getTransform().getScale();
+                float avgScale = (scale.x + scale.y + scale.z) / 3.0f;
+                float worldRadius = m_weightPaintRadius * avgScale;
+                Camera& cam = m_ctx.getActiveCamera();
+                float screenWidth = static_cast<float>(m_ctx.window.getWidth());
+                float screenHeight = static_cast<float>(m_ctx.window.getHeight());
+                glm::mat4 viewProj = cam.getProjectionMatrix(screenWidth / screenHeight) * cam.getViewMatrix();
+                glm::vec4 cc = viewProj * glm::vec4(worldHitPos, 1.0f);
+                glm::vec4 co = viewProj * glm::vec4(worldHitPos + cam.getRight() * worldRadius, 1.0f);
+                if (cc.w > 0.001f && co.w > 0.001f) {
+                    glm::vec2 sc = (glm::vec2(cc) / cc.w * 0.5f + 0.5f) * glm::vec2(screenWidth, screenHeight);
+                    glm::vec2 so = (glm::vec2(co) / co.w * 0.5f + 0.5f) * glm::vec2(screenWidth, screenHeight);
+                    screenRadius = glm::length(so - sc);
+                }
+            }
+            if (screenRadius < 5.0f) screenRadius = 5.0f;
+
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            ImU32 ring = ctrlHeld ? IM_COL32(255, 80, 80, 220) : IM_COL32(80, 220, 100, 220);
+            dl->AddCircle(mousePos, screenRadius, ring, 48, 2.0f);
+            dl->AddCircle(mousePos, screenRadius + 1, IM_COL32(0, 0, 0, 160), 48, 1.0f);
         }
     }
 
@@ -1932,10 +1990,31 @@ void ModelingMode::renderModelingEditorUI() {
 
                 ImGui::Checkbox("Show Skeleton", &m_showSkeleton);
                 ImGui::Checkbox("Show Bone Names", &m_showBoneNames);
-                ImGui::Checkbox("Camera-relative Move", &m_riggingCameraMove);
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Move gizmo drags in the screen plane instead of along a single world axis.");
+                if (ImGui::Checkbox("Weight Heatmap", &m_showWeightHeatMap)) {
+                    m_heatMapDirty = true;
                 }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Color verts by their weight on the selected bone\n"
+                                      "(blue 0 -> green 0.5 -> red 1).");
+                }
+
+                ImGui::SameLine();
+                ImGui::Checkbox("Weight Paint", &m_weightPaintMode);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("LMB drag: add weight to selected bone\n"
+                                      "Ctrl+LMB drag: subtract weight\n"
+                                      "[ / ] : resize brush");
+                }
+                if (m_weightPaintMode) {
+                    ImGui::Indent(12.0f);
+                    ImGui::SetNextItemWidth(140);
+                    ImGui::SliderFloat("Radius##wp", &m_weightPaintRadius, 0.01f, 5.0f, "%.2f");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::SliderFloat("Strength##wp", &m_weightPaintStrength, 0.01f, 1.0f, "%.2f");
+                    ImGui::Unindent(12.0f);
+                }
+                ImGui::TextDisabled("Tip: drag a bone joint dot for camera-plane move; gizmo arrows stay world-axis.");
 
                 // Add bone
                 ImGui::InputText("##bonename", m_newBoneName, sizeof(m_newBoneName));
@@ -1958,6 +2037,63 @@ void ModelingMode::renderModelingEditorUI() {
                     snprintf(m_newBoneName, sizeof(m_newBoneName), "Bone.%03d", newIdx + 1);
                     m_ctx.meshDirty = true;
                     invalidateWireframeCache();
+                }
+
+                ImGui::SameLine();
+                if (ImGui::Button("Load Skeleton")) {
+                    nfdchar_t* outPath = nullptr;
+                    nfdfilteritem_t filters[1] = {{"Skeleton", "limesk"}};
+                    if (NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
+                        std::ifstream file(outPath);
+                        if (file.is_open()) {
+                            std::string line;
+                            std::getline(file, line); // header
+                            std::getline(file, line); // comment
+                            int boneCount = 0;
+                            if (std::getline(file, line)) {
+                                sscanf(line.c_str(), "bones: %d", &boneCount);
+                            }
+
+                            Skeleton newSkel;
+                            std::vector<glm::vec3> newPositions;
+                            for (int i = 0; i < boneCount; ++i) {
+                                if (!std::getline(file, line)) break;
+                                Bone bone;
+                                int idx = 0, parentIdx = -1;
+                                char nameBuffer[256] = {};
+                                float px = 0, py = 0, pz = 0;
+                                const char* nameStart = strchr(line.c_str(), '"');
+                                const char* nameEnd = nameStart ? strchr(nameStart + 1, '"') : nullptr;
+                                if (nameStart && nameEnd) {
+                                    size_t nameLen = std::min<size_t>(nameEnd - nameStart - 1, 255);
+                                    strncpy(nameBuffer, nameStart + 1, nameLen);
+                                    nameBuffer[nameLen] = '\0';
+                                }
+                                sscanf(line.c_str(), "bone %d: %d", &idx, &parentIdx);
+                                const char* pipePos = strchr(line.c_str(), '|');
+                                if (pipePos) sscanf(pipePos + 1, " %f %f %f", &px, &py, &pz);
+                                bone.name = nameBuffer;
+                                bone.parentIndex = parentIdx;
+                                bone.localTransform = glm::translate(glm::mat4(1.0f), glm::vec3(px, py, pz));
+                                bone.inverseBindMatrix = glm::inverse(bone.localTransform);
+                                newSkel.bones.push_back(bone);
+                                newSkel.boneNameToIndex[bone.name] = i;
+                                newPositions.push_back(glm::vec3(px, py, pz));
+                            }
+                            file.close();
+                            m_ctx.editableMesh.setSkeleton(newSkel);
+                            m_bonePositions = newPositions;
+                            m_selectedBone = newPositions.empty() ? -1 : 0;
+                            snprintf(m_newBoneName, sizeof(m_newBoneName), "Bone.%03d", boneCount);
+                            m_ctx.meshDirty = true;
+                            invalidateWireframeCache();
+                            std::cout << "[Rigging] Loaded skeleton (" << boneCount << " bones) from " << outPath << std::endl;
+                        }
+                        NFD_FreePath(outPath);
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Load a saved .limesk skeleton onto the current mesh.");
                 }
 
                 // Bone list with inline parent dropdowns
@@ -2138,6 +2274,7 @@ void ModelingMode::renderModelingEditorUI() {
                         m_ctx.editableMesh.generateAutoWeights(m_bonePositions);
                         m_ctx.meshDirty = true;
                         invalidateWireframeCache();
+                        m_heatMapDirty = true;
                         std::cout << "[Rigging] Auto weights generated" << std::endl;
                     }
                     if (ImGui::IsItemHovered()) {
@@ -2167,6 +2304,7 @@ void ModelingMode::renderModelingEditorUI() {
                         m_ctx.editableMesh.clearBoneWeights();
                         m_ctx.meshDirty = true;
                         invalidateWireframeCache();
+                        m_heatMapDirty = true;
                     }
 
                     ImGui::Separator();
@@ -2207,72 +2345,6 @@ void ModelingMode::renderModelingEditorUI() {
                     }
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Save mesh + skeleton + weights + keyframed animation\nas a GLB the engine can play with GPU skinning.\nRequires Set Bind Pose + at least one keyframe.");
-                    }
-
-                    ImGui::SameLine();
-
-                    // Load skeleton from .limesk
-                    if (ImGui::Button("Load Skeleton")) {
-                        nfdchar_t* outPath = nullptr;
-                        nfdfilteritem_t filters[1] = {{"Skeleton", "limesk"}};
-                        if (NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
-                            std::ifstream file(outPath);
-                            if (file.is_open()) {
-                                std::string line;
-                                std::getline(file, line); // header
-                                std::getline(file, line); // comment
-                                int boneCount = 0;
-                                if (std::getline(file, line)) {
-                                    sscanf(line.c_str(), "bones: %d", &boneCount);
-                                }
-
-                                Skeleton newSkel;
-                                std::vector<glm::vec3> newPositions;
-
-                                for (int i = 0; i < boneCount; ++i) {
-                                    if (!std::getline(file, line)) break;
-                                    Bone bone;
-                                    int idx, parentIdx;
-                                    char nameBuffer[256] = {};
-                                    float px, py, pz;
-
-                                    // Parse: bone 0: -1 "Bone.000" | 0.0 1.0 2.0
-                                    const char* nameStart = strchr(line.c_str(), '"');
-                                    const char* nameEnd = nameStart ? strchr(nameStart + 1, '"') : nullptr;
-                                    if (nameStart && nameEnd) {
-                                        size_t nameLen = std::min<size_t>(nameEnd - nameStart - 1, 255);
-                                        strncpy(nameBuffer, nameStart + 1, nameLen);
-                                        nameBuffer[nameLen] = '\0';
-                                    }
-
-                                    sscanf(line.c_str(), "bone %d: %d", &idx, &parentIdx);
-
-                                    const char* pipePos = strchr(line.c_str(), '|');
-                                    px = py = pz = 0.0f;
-                                    if (pipePos) {
-                                        sscanf(pipePos + 1, " %f %f %f", &px, &py, &pz);
-                                    }
-
-                                    bone.name = nameBuffer;
-                                    bone.parentIndex = parentIdx;
-                                    bone.localTransform = glm::translate(glm::mat4(1.0f), glm::vec3(px, py, pz));
-                                    bone.inverseBindMatrix = glm::inverse(bone.localTransform);
-                                    newSkel.bones.push_back(bone);
-                                    newSkel.boneNameToIndex[bone.name] = i;
-                                    newPositions.push_back(glm::vec3(px, py, pz));
-                                }
-                                file.close();
-
-                                m_ctx.editableMesh.setSkeleton(newSkel);
-                                m_bonePositions = newPositions;
-                                m_selectedBone = newPositions.empty() ? -1 : 0;
-                                snprintf(m_newBoneName, sizeof(m_newBoneName), "Bone.%03d", boneCount);
-                                m_ctx.meshDirty = true;
-                                invalidateWireframeCache();
-                                std::cout << "[Rigging] Loaded skeleton (" << boneCount << " bones) from " << outPath << std::endl;
-                            }
-                            NFD_FreePath(outPath);
-                        }
                     }
                 }
 
@@ -2375,6 +2447,7 @@ void ModelingMode::renderModelingEditorUI() {
                                 }
                                 m_ctx.meshDirty = true;
                                 invalidateWireframeCache();
+                                m_heatMapDirty = true;
                             }
                             ImGui::PopID();
                         }
@@ -2424,6 +2497,7 @@ void ModelingMode::renderModelingEditorUI() {
                                     }
                                     m_ctx.meshDirty = true;
                                     invalidateWireframeCache();
+                                    m_heatMapDirty = true;
                                 }
                                 ImGui::PopID();
                             }
@@ -4820,6 +4894,100 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         quickSave();
     }
 
+    // Weight paint brush resize: GLFW bracket keys 91 (`[`) and 93 (`]`).
+    // These run BEFORE the WantCaptureKeyboard early-out so they still work
+    // while the rigging panel has focus from the slider.
+    if (m_weightPaintMode) {
+        if (Input::isKeyPressed(91)) m_weightPaintRadius = std::max(0.01f, m_weightPaintRadius * 0.85f);
+        if (Input::isKeyPressed(93)) m_weightPaintRadius = std::min(20.0f, m_weightPaintRadius * 1.15f);
+    }
+
+    // Weight painting: drag LMB to add weight on the selected bone (subtract
+    // with Ctrl). Mirrors the vertex-paint stroke flow so we save undo state
+    // once per stroke, not once per frame of dragging.
+    if (m_riggingMode && m_weightPaintMode && m_selectedBone >= 0 &&
+        m_ctx.selectedObject && m_ctx.editableMesh.isValid() && !mouseOverImGui &&
+        !m_ctx.gizmoDragging) {
+        bool lmbDown = Input::isMouseButtonDown(0);
+        bool ctrlDown = Input::isKeyDown(Input::KEY_LEFT_CONTROL) ||
+                        Input::isKeyDown(Input::KEY_RIGHT_CONTROL);
+
+        if (lmbDown) {
+            glm::vec3 rayOrigin, rayDir;
+            m_ctx.getMouseRay(rayOrigin, rayDir);
+            glm::mat4 modelMatrix = m_ctx.selectedObject->getTransform().getMatrix();
+            glm::mat4 invModel = glm::inverse(modelMatrix);
+            glm::vec3 localOrigin = glm::vec3(invModel * glm::vec4(rayOrigin, 1.0f));
+            glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(rayDir, 0.0f)));
+
+            auto hit = m_ctx.editableMesh.raycastFace(localOrigin, localDir);
+            if (hit.hit) {
+                if (!m_weightPaintingActive) {
+                    m_ctx.editableMesh.saveState();
+                    m_weightPaintingActive = true;
+                }
+
+                const glm::vec3 hitPos = hit.position;
+                const float radius = m_weightPaintRadius;
+                const float invRadius = 1.0f / std::max(1e-4f, radius);
+                const int targetBone = m_selectedBone;
+                const float sign = ctrlDown ? -1.0f : 1.0f;
+                const float strength = m_weightPaintStrength;
+                bool changed = false;
+
+                for (uint32_t vi = 0; vi < m_ctx.editableMesh.getVertexCount(); ++vi) {
+                    HEVertex& v = m_ctx.editableMesh.getVertex(vi);
+                    float dist = glm::length(v.position - hitPos);
+                    if (dist >= radius) continue;
+
+                    // Quadratic falloff (1 at center → 0 at edge).
+                    float falloff = 1.0f - dist * invRadius;
+                    falloff *= falloff;
+                    float delta = sign * strength * falloff * 0.1f;  // small step per frame
+
+                    // Find the slot already holding this bone, else the
+                    // smallest-weight slot (we'll overwrite it if delta > 0).
+                    int slot = -1;
+                    for (int j = 0; j < 4; ++j) {
+                        if (v.boneIndices[j] == targetBone && v.boneWeights[j] > 0.0f) {
+                            slot = j; break;
+                        }
+                    }
+                    if (slot < 0) {
+                        if (delta <= 0.0f) continue;  // subtracting from zero — no-op
+                        int minSlot = 0;
+                        for (int j = 1; j < 4; ++j) {
+                            if (v.boneWeights[j] < v.boneWeights[minSlot]) minSlot = j;
+                        }
+                        v.boneIndices[minSlot] = targetBone;
+                        v.boneWeights[minSlot] = 0.0f;
+                        slot = minSlot;
+                    }
+                    v.boneWeights[slot] = glm::clamp(v.boneWeights[slot] + delta, 0.0f, 1.0f);
+                    changed = true;
+
+                    // Renormalize so the four weights still sum to 1.
+                    float total = v.boneWeights[0] + v.boneWeights[1] +
+                                  v.boneWeights[2] + v.boneWeights[3];
+                    if (total > 0.001f) {
+                        v.boneWeights[0] /= total;
+                        v.boneWeights[1] /= total;
+                        v.boneWeights[2] /= total;
+                        v.boneWeights[3] /= total;
+                    } else if (delta > 0.0f) {
+                        // Shouldn't happen — clamp left us at zero. Snap fully
+                        // onto the painted bone so the vertex isn't unweighted.
+                        v.boneIndices[0] = targetBone;
+                        v.boneWeights = glm::vec4(1, 0, 0, 0);
+                    }
+                }
+                if (changed) m_heatMapDirty = true;
+            }
+        } else {
+            m_weightPaintingActive = false;
+        }
+    }
+
     if (ImGui::GetIO().WantCaptureKeyboard) return;
 
     // ESC cancels snap mode
@@ -5914,14 +6082,100 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         m_placingBone = false;
     }
 
-    // Rigging: click to select bone in viewport (when not placing and gizmo not active)
+    // Rigging: click a bone joint dot to select it. If the user keeps the
+    // mouse held and drags, translate the bone (+ descendants + skinned
+    // mesh if a bind pose is set) in the camera-facing plane through its
+    // current position. Releasing without movement is just a selection.
+    // Gizmo arrow drags stay world-axis-locked — picking the interaction
+    // target chooses the constraint, no checkbox.
+    // Disabled while weight painting so LMB drags don't move bones around.
     if (m_riggingMode && !m_placingBone && !m_ctx.gizmoDragging && !mouseOverImGui &&
-        Input::isMouseButtonPressed(Input::MOUSE_LEFT) &&
-        m_ctx.gizmoHoveredAxis == GizmoAxis::None) {
+        !m_weightPaintMode && m_ctx.gizmoHoveredAxis == GizmoAxis::None) {
         glm::vec2 mousePos = Input::getMousePosition();
-        int picked = pickBoneAtScreenPos(mousePos);
-        if (picked >= 0) {
-            m_selectedBone = picked;
+
+        if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
+            int picked = pickBoneAtScreenPos(mousePos);
+            if (picked >= 0 && picked < static_cast<int>(m_bonePositions.size())) {
+                m_selectedBone = picked;
+                m_riggingBoneDragIdx = picked;
+
+                // Anchor the drag plane through the bone (in world space).
+                glm::vec3 rayO, rayD;
+                m_ctx.getMouseRay(rayO, rayD);
+                m_riggingBoneDragPlaneNormal = m_ctx.getActiveCamera().getFront();
+                glm::mat4 worldBone(1.0f);
+                if (m_ctx.selectedObject) worldBone = m_ctx.selectedObject->getTransform().getMatrix();
+                glm::vec3 boneWorld = glm::vec3(worldBone * glm::vec4(m_bonePositions[picked], 1.0f));
+                float denom = glm::dot(rayD, m_riggingBoneDragPlaneNormal);
+                if (std::abs(denom) > 0.0001f) {
+                    float t = glm::dot(boneWorld - rayO, m_riggingBoneDragPlaneNormal) / denom;
+                    m_riggingBoneDragPrevPoint = rayO + rayD * t;
+                } else {
+                    m_riggingBoneDragPrevPoint = boneWorld;
+                }
+
+                // Build the weighted-vert cache for the cheap reskin path
+                // when there's no bind pose. (With bind pose, reskinFromBoneDeltas
+                // recomputes from scratch every frame anyway.)
+                m_riggingDragWeightedVerts.clear();
+                if (!(m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject)) {
+                    std::set<int> affected;
+                    affected.insert(picked);
+                    for (int d : getDescendantBones(picked)) affected.insert(d);
+                    uint32_t vc = m_ctx.editableMesh.getVertexCount();
+                    m_riggingDragWeightedVerts.reserve(vc / 8);
+                    for (uint32_t vi = 0; vi < vc; ++vi) {
+                        const auto& v = m_ctx.editableMesh.getVertex(vi);
+                        float total = 0.0f;
+                        for (int j = 0; j < 4; ++j) {
+                            if (v.boneWeights[j] > 0.0f && affected.count(v.boneIndices[j])) {
+                                total += v.boneWeights[j];
+                            }
+                        }
+                        if (total > 0.001f) m_riggingDragWeightedVerts.emplace_back(vi, total);
+                    }
+                }
+            }
+        }
+
+        if (m_riggingBoneDragIdx >= 0 && Input::isMouseButtonDown(Input::MOUSE_LEFT) &&
+            m_ctx.selectedObject) {
+            // Camera-plane drag — same plane normal we captured at press.
+            glm::vec3 rayO, rayD;
+            m_ctx.getMouseRay(rayO, rayD);
+            float denom = glm::dot(rayD, m_riggingBoneDragPlaneNormal);
+            if (std::abs(denom) > 0.0001f) {
+                float t = glm::dot(m_riggingBoneDragPrevPoint - rayO, m_riggingBoneDragPlaneNormal) / denom;
+                glm::vec3 currentPoint = rayO + rayD * t;
+                glm::vec3 worldDelta = currentPoint - m_riggingBoneDragPrevPoint;
+                if (glm::length(worldDelta) > 0.0001f) {
+                    glm::mat4 invModel = glm::inverse(m_ctx.selectedObject->getTransform().getMatrix());
+                    glm::vec3 localDelta = glm::vec3(invModel * glm::vec4(worldDelta, 0.0f));
+
+                    m_bonePositions[m_riggingBoneDragIdx] += localDelta;
+                    for (int d : getDescendantBones(m_riggingBoneDragIdx)) {
+                        if (d < static_cast<int>(m_bonePositions.size())) {
+                            m_bonePositions[d] += localDelta;
+                        }
+                    }
+
+                    if (m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject) {
+                        reskinFromBoneDeltas();
+                    } else if (!m_riggingDragWeightedVerts.empty()) {
+                        for (const auto& [vi, w] : m_riggingDragWeightedVerts) {
+                            m_ctx.editableMesh.getVertex(vi).position += localDelta * w;
+                        }
+                        m_ctx.meshDirty = true;
+                        invalidateWireframeCache();
+                    }
+                    m_riggingBoneDragPrevPoint = currentPoint;
+                }
+            }
+        }
+
+        if (m_riggingBoneDragIdx >= 0 && !Input::isMouseButtonDown(Input::MOUSE_LEFT)) {
+            m_riggingBoneDragIdx = -1;
+            m_riggingDragWeightedVerts.clear();
         }
     }
 
@@ -6893,7 +7147,7 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
     // Object mode viewport selection
     // Works when: Q mode (no gizmo), OR when gizmo active but clicking off the gizmo (to quickly switch objects)
     bool canSelectInViewport = m_ctx.objectMode && !mouseOverImGui && !m_ctx.gizmoDragging &&
-                               !m_retopologyMode &&
+                               !m_retopologyMode && !m_weightPaintMode &&
                                Input::isMouseButtonPressed(Input::MOUSE_LEFT) &&
                                (m_ctx.gizmoMode == GizmoMode::None || m_ctx.gizmoHoveredAxis == GizmoAxis::None);
 
@@ -7106,7 +7360,7 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         bool ctrlHeld = Input::isKeyDown(Input::KEY_LEFT_CONTROL) || Input::isKeyDown(Input::KEY_RIGHT_CONTROL);
 
         // Normal selection mode - click for point select, drag for rectangle select
-        if (m_ctx.selectionTool == SelectionTool::Normal && !m_ctx.isPainting && !m_patchBlanketMode) {
+        if (m_ctx.selectionTool == SelectionTool::Normal && !m_ctx.isPainting && !m_patchBlanketMode && !m_weightPaintMode) {
             if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
                 // Start tracking for potential rectangle selection
                 m_ctx.isRectSelecting = true;

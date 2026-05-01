@@ -120,6 +120,113 @@ void ModelingMode::deleteKeyOnSelectedNearTime() {
     if (track.times.empty()) m_objectAnims.erase(found);
 }
 
+void ModelingMode::jumpToPrevKey() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) return;
+    auto it = m_objectAnims.find(obj);
+    if (it == m_objectAnims.end() || it->second.times.empty()) return;
+    const auto& times = it->second.times;
+    // Strictly less than current time so we don't sit on the same key.
+    float best = -1.0f;
+    for (float t : times) {
+        if (t < m_timelineCurrentTime - 1e-4f && t > best) best = t;
+    }
+    if (best >= 0.0f) {
+        m_timelineCurrentTime = best;
+        m_timelinePlaying = false;
+    } else {
+        // Already at/before first key — wrap to last key.
+        m_timelineCurrentTime = times.back();
+        m_timelinePlaying = false;
+    }
+}
+
+void ModelingMode::jumpToNextKey() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) return;
+    auto it = m_objectAnims.find(obj);
+    if (it == m_objectAnims.end() || it->second.times.empty()) return;
+    const auto& times = it->second.times;
+    float best = -1.0f;
+    for (float t : times) {
+        if (t > m_timelineCurrentTime + 1e-4f && (best < 0.0f || t < best)) best = t;
+    }
+    if (best >= 0.0f) {
+        m_timelineCurrentTime = best;
+        m_timelinePlaying = false;
+    } else {
+        // Past the last key — wrap to first.
+        m_timelineCurrentTime = times.front();
+        m_timelinePlaying = false;
+    }
+}
+
+void ModelingMode::copyKeyAtCurrentTime() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) return;
+    auto it = m_objectAnims.find(obj);
+    if (it == m_objectAnims.end() || it->second.times.empty()) return;
+    const auto& tr = it->second;
+
+    // Find the key closest to the playhead within 50 ms.
+    size_t best = 0;
+    float bestDist = std::abs(tr.times[0] - m_timelineCurrentTime);
+    for (size_t i = 1; i < tr.times.size(); ++i) {
+        float d = std::abs(tr.times[i] - m_timelineCurrentTime);
+        if (d < bestDist) { bestDist = d; best = i; }
+    }
+    if (bestDist > 0.05f) return;
+
+    m_keyClipboard.valid = true;
+    m_keyClipboard.position = tr.positions[best];
+    m_keyClipboard.rotation = tr.rotations[best];
+    m_keyClipboard.scale    = tr.scales[best];
+    if (best < tr.bonePositionsPerKey.size()) {
+        m_keyClipboard.bonePositions = tr.bonePositionsPerKey[best];
+    } else {
+        m_keyClipboard.bonePositions.clear();
+    }
+}
+
+void ModelingMode::pasteKeyAtCurrentTime() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj || !m_keyClipboard.valid) return;
+
+    auto& track = m_objectAnims[obj];
+    const float t = m_timelineCurrentTime;
+    auto lb = std::lower_bound(track.times.begin(), track.times.end(), t);
+    size_t idx = static_cast<size_t>(lb - track.times.begin());
+    bool replace = (idx < track.times.size() && std::abs(track.times[idx] - t) < 1e-4f);
+
+    bool hasRig = !m_keyClipboard.bonePositions.empty();
+    if (replace) {
+        track.positions[idx] = m_keyClipboard.position;
+        track.rotations[idx] = m_keyClipboard.rotation;
+        track.scales[idx]    = m_keyClipboard.scale;
+        if (hasRig) {
+            if (track.bonePositionsPerKey.size() < track.times.size())
+                track.bonePositionsPerKey.resize(track.times.size());
+            track.bonePositionsPerKey[idx] = m_keyClipboard.bonePositions;
+        }
+    } else {
+        track.times.insert(track.times.begin() + idx, t);
+        track.positions.insert(track.positions.begin() + idx, m_keyClipboard.position);
+        track.rotations.insert(track.rotations.begin() + idx, m_keyClipboard.rotation);
+        track.scales.insert(track.scales.begin() + idx, m_keyClipboard.scale);
+        if (hasRig) {
+            if (track.bonePositionsPerKey.size() < track.times.size() - 1)
+                track.bonePositionsPerKey.resize(track.times.size() - 1);
+            track.bonePositionsPerKey.insert(track.bonePositionsPerKey.begin() + idx,
+                                             m_keyClipboard.bonePositions);
+        } else if (!track.bonePositionsPerKey.empty()) {
+            track.bonePositionsPerKey.insert(track.bonePositionsPerKey.begin() + idx,
+                                             std::vector<glm::vec3>{});
+        }
+    }
+    // Force the playback path to apply the pasted state on the next tick.
+    m_timelineLastAppliedTime = -1.0f;
+}
+
 void ModelingMode::applyAnimatedTransforms() {
     const float t = m_timelineCurrentTime;
     for (auto& [obj, track] : m_objectAnims) {
@@ -226,16 +333,39 @@ void ModelingMode::renderAnimationTimeline() {
     {
         SceneObject* obj = m_ctx.selectedObject;
         bool haveObj = (obj != nullptr);
+        auto trackIt = haveObj ? m_objectAnims.find(obj) : m_objectAnims.end();
+        bool haveKeys = (trackIt != m_objectAnims.end() && !trackIt->second.times.empty());
+
         if (!haveObj) ImGui::BeginDisabled();
         if (ImGui::Button("Set Key")) setKeyOnSelected();
         ImGui::SameLine();
         if (ImGui::Button("Delete Key")) deleteKeyOnSelectedNearTime();
         if (!haveObj) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (!haveKeys) ImGui::BeginDisabled();
+        if (ImGui::Button("|<<")) jumpToPrevKey();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to previous keyframe");
+        ImGui::SameLine();
+        if (ImGui::Button(">>|")) jumpToNextKey();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to next keyframe");
+        ImGui::SameLine();
+        if (ImGui::Button("Copy")) copyKeyAtCurrentTime();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the key nearest the playhead (within 50 ms)");
+        if (!haveKeys) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (!haveObj || !m_keyClipboard.valid) ImGui::BeginDisabled();
+        if (ImGui::Button("Paste")) pasteKeyAtCurrentTime();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Insert (or overwrite) a key at the playhead from the clipboard");
+        if (!haveObj || !m_keyClipboard.valid) ImGui::EndDisabled();
+
         ImGui::SameLine();
         if (haveObj) {
-            auto it = m_objectAnims.find(obj);
-            int n = (it != m_objectAnims.end()) ? static_cast<int>(it->second.times.size()) : 0;
-            ImGui::TextDisabled("%s [%d keys]", obj->getName().c_str(), n);
+            int n = haveKeys ? static_cast<int>(trackIt->second.times.size()) : 0;
+            ImGui::TextDisabled("%s [%d keys]%s",
+                                obj->getName().c_str(), n,
+                                m_keyClipboard.valid ? " (clipboard)" : "");
         } else {
             ImGui::TextDisabled("(select an object to key)");
         }

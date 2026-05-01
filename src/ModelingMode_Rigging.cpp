@@ -80,6 +80,7 @@ void ModelingMode::reskinFromBoneDeltas() {
         std::vector<ModelVertex> verts;
         std::vector<uint32_t> idx;
         m_ctx.editableMesh.triangulate(verts, idx, m_ctx.hiddenFaces);
+        applyHeatMapToVerts(verts);
         m_ctx.modelRenderer.updateModelBuffer(handle, verts);
         m_bindPoseOwner->setMeshData(verts, idx);
     }
@@ -162,6 +163,50 @@ void ModelingMode::exportSkinnedAnimatedGLB() {
         texData, texW, texH,
         obj->getName(), "Take 001");
     std::cout << (ok ? "[Export] OK: " : "[Export] FAILED: ") << filepath << std::endl;
+}
+
+void ModelingMode::applyHeatMapToVerts(std::vector<ModelVertex>& verts) {
+    if (!m_showWeightHeatMap || m_selectedBone < 0) return;
+    if (!m_ctx.editableMesh.isValid()) return;
+
+    const int bone = m_selectedBone;
+    const uint32_t vc = m_ctx.editableMesh.getVertexCount();
+    if (verts.size() != vc) return;
+
+    for (uint32_t vi = 0; vi < vc; ++vi) {
+        const auto& heV = m_ctx.editableMesh.getVertex(vi);
+        float w = 0.0f;
+        for (int j = 0; j < 4; ++j) {
+            if (heV.boneIndices[j] == bone) {
+                w = heV.boneWeights[j];
+                break;
+            }
+        }
+        // Blue → green → red heat ramp.
+        glm::vec3 col;
+        if (w < 0.5f) {
+            col = glm::mix(glm::vec3(0.05f, 0.05f, 0.7f),
+                           glm::vec3(0.0f,  0.7f,  0.0f), w * 2.0f);
+        } else {
+            col = glm::mix(glm::vec3(0.0f,  0.7f,  0.0f),
+                           glm::vec3(1.0f,  0.0f,  0.0f), (w - 0.5f) * 2.0f);
+        }
+        verts[vi].color = glm::vec4(col, 1.0f);
+    }
+}
+
+void ModelingMode::pushMeshWithHeatMap() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj || !m_ctx.editableMesh.isValid()) return;
+    uint32_t handle = obj->getBufferHandle();
+    if (handle == UINT32_MAX || handle == 0) return;
+
+    std::vector<ModelVertex> verts;
+    std::vector<uint32_t> idx;
+    m_ctx.editableMesh.triangulate(verts, idx, m_ctx.hiddenFaces);
+    applyHeatMapToVerts(verts);
+    m_ctx.modelRenderer.updateModelBuffer(handle, verts);
+    obj->setMeshData(verts, idx);
 }
 
 void ModelingMode::cancelRiggingMode() {
