@@ -271,7 +271,7 @@ void ModelRenderer::createPipeline(VkRenderPass renderPass, VkExtent2D extent) {
     dynamicState.pDynamicStates = dynamicStates.data();
 
     VkPushConstantRange pushConstant{};
-    pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstant.offset = 0;
     pushConstant.size = sizeof(ModelPushConstants);
 
@@ -901,7 +901,7 @@ void ModelRenderer::updateModelBuffer(uint32_t handle, const std::vector<ModelVe
 void ModelRenderer::render(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,
                            uint32_t modelHandle, const glm::mat4& modelMatrix,
                            float hueShift, float saturation, float brightness,
-                           bool twoSided) {
+                           bool twoSided, bool flatShading) {
     auto it = m_models.find(modelHandle);
     if (it == m_models.end()) return;
 
@@ -921,7 +921,9 @@ void ModelRenderer::render(VkCommandBuffer commandBuffer, const glm::mat4& viewP
     pc.mvp = viewProj * modelMatrix;
     pc.model = modelMatrix;
     pc.colorAdjust = glm::vec4(hueShift, saturation, brightness, twoSided ? 0.4f : 0.0f);
-    vkCmdPushConstants(commandBuffer, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+    pc.shading = glm::vec4(flatShading ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+    vkCmdPushConstants(commandBuffer, m_pipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(ModelPushConstants), &pc);
 
     // Bind vertex/index buffers

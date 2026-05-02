@@ -27,6 +27,7 @@ struct ModelPushConstants {
     glm::mat4 mvp;
     glm::mat4 model;
     glm::vec4 colorAdjust;  // x=hue, y=saturation, z=brightness, w=alpha (0=opaque, >0=x-ray)
+    glm::vec4 shading;      // x=flatShading (0/1), yzw=reserved
 };
 
 struct WireframePushConstants {
@@ -86,7 +87,7 @@ public:
     void render(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,
                 uint32_t modelHandle, const glm::mat4& modelMatrix,
                 float hueShift = 0.0f, float saturation = 1.0f, float brightness = 1.0f,
-                bool twoSided = false);
+                bool twoSided = false, bool flatShading = false);
 
     // Render model wireframe with solid color
     void renderWireframe(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,

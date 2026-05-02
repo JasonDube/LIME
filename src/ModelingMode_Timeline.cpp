@@ -53,14 +53,21 @@ void ModelingMode::setKeyOnSelected() {
     const auto& tf = obj->getTransform();
     const float t = m_timelineCurrentTime;
 
-    // For rigged objects with a bind pose, snapshot only the bone positions.
-    // Verts are recomputed on playback via skinning from the bind pose, so
-    // per-key memory is O(bones) instead of O(verts).
+    // For rigged objects with a bind pose, snapshot bone positions AND
+    // world-space rotations. Verts are recomputed on playback via skinning
+    // from the bind pose, so per-key memory is O(bones) instead of O(verts).
     bool snapshotRig = m_hasBindPose && m_bindPoseOwner == obj &&
                        obj == m_ctx.selectedObject && m_ctx.editableMesh.isValid();
     std::vector<glm::vec3> bonesSnap;
+    std::vector<glm::quat> rotsSnap;
     if (snapshotRig) {
         bonesSnap = m_bonePositions;
+        rotsSnap  = m_boneWorldRotations;
+        // Pad with identities if rotation tracking wasn't initialized
+        // (e.g. bind pose was set before this feature shipped).
+        if (rotsSnap.size() != bonesSnap.size()) {
+            rotsSnap.assign(bonesSnap.size(), glm::quat(1, 0, 0, 0));
+        }
     }
 
     // Find the slot for this time. If a key already exists within a tiny
@@ -68,15 +75,20 @@ void ModelingMode::setKeyOnSelected() {
     auto it = std::lower_bound(track.times.begin(), track.times.end(), t);
     size_t idx = static_cast<size_t>(it - track.times.begin());
 
+    auto resizeAligned = [&](size_t target) {
+        if (track.bonePositionsPerKey.size() < target) track.bonePositionsPerKey.resize(target);
+        if (track.boneRotationsPerKey.size() < target) track.boneRotationsPerKey.resize(target);
+    };
+
     bool replace = (idx < track.times.size() && std::abs(track.times[idx] - t) < 1e-4f);
     if (replace) {
         track.positions[idx] = tf.getPosition();
         track.rotations[idx] = tf.getRotation();
         track.scales[idx]    = tf.getScale();
         if (snapshotRig) {
-            if (track.bonePositionsPerKey.size() < track.times.size())
-                track.bonePositionsPerKey.resize(track.times.size());
+            resizeAligned(track.times.size());
             track.bonePositionsPerKey[idx] = std::move(bonesSnap);
+            track.boneRotationsPerKey[idx] = std::move(rotsSnap);
         }
     } else {
         track.times.insert(track.times.begin() + idx, t);
@@ -84,11 +96,12 @@ void ModelingMode::setKeyOnSelected() {
         track.rotations.insert(track.rotations.begin() + idx, tf.getRotation());
         track.scales.insert(track.scales.begin() + idx, tf.getScale());
         if (snapshotRig) {
-            if (track.bonePositionsPerKey.size() < track.times.size() - 1)
-                track.bonePositionsPerKey.resize(track.times.size() - 1);
+            resizeAligned(track.times.size() - 1);
             track.bonePositionsPerKey.insert(track.bonePositionsPerKey.begin() + idx, std::move(bonesSnap));
-        } else if (!track.bonePositionsPerKey.empty()) {
+            track.boneRotationsPerKey.insert(track.boneRotationsPerKey.begin() + idx, std::move(rotsSnap));
+        } else if (!track.bonePositionsPerKey.empty() || !track.boneRotationsPerKey.empty()) {
             track.bonePositionsPerKey.insert(track.bonePositionsPerKey.begin() + idx, std::vector<glm::vec3>{});
+            track.boneRotationsPerKey.insert(track.boneRotationsPerKey.begin() + idx, std::vector<glm::quat>{});
         }
     }
 }
@@ -117,6 +130,8 @@ void ModelingMode::deleteKeyOnSelectedNearTime() {
     track.scales.erase(track.scales.begin() + best);
     if (best < track.bonePositionsPerKey.size())
         track.bonePositionsPerKey.erase(track.bonePositionsPerKey.begin() + best);
+    if (best < track.boneRotationsPerKey.size())
+        track.boneRotationsPerKey.erase(track.boneRotationsPerKey.begin() + best);
     if (track.times.empty()) m_objectAnims.erase(found);
 }
 
@@ -186,6 +201,11 @@ void ModelingMode::copyKeyAtCurrentTime() {
     } else {
         m_keyClipboard.bonePositions.clear();
     }
+    if (best < tr.boneRotationsPerKey.size()) {
+        m_keyClipboard.boneRotations = tr.boneRotationsPerKey[best];
+    } else {
+        m_keyClipboard.boneRotations.clear();
+    }
 }
 
 void ModelingMode::pasteKeyAtCurrentTime() {
@@ -199,14 +219,18 @@ void ModelingMode::pasteKeyAtCurrentTime() {
     bool replace = (idx < track.times.size() && std::abs(track.times[idx] - t) < 1e-4f);
 
     bool hasRig = !m_keyClipboard.bonePositions.empty();
+    auto resizeAligned = [&](size_t target) {
+        if (track.bonePositionsPerKey.size() < target) track.bonePositionsPerKey.resize(target);
+        if (track.boneRotationsPerKey.size() < target) track.boneRotationsPerKey.resize(target);
+    };
     if (replace) {
         track.positions[idx] = m_keyClipboard.position;
         track.rotations[idx] = m_keyClipboard.rotation;
         track.scales[idx]    = m_keyClipboard.scale;
         if (hasRig) {
-            if (track.bonePositionsPerKey.size() < track.times.size())
-                track.bonePositionsPerKey.resize(track.times.size());
+            resizeAligned(track.times.size());
             track.bonePositionsPerKey[idx] = m_keyClipboard.bonePositions;
+            track.boneRotationsPerKey[idx] = m_keyClipboard.boneRotations;
         }
     } else {
         track.times.insert(track.times.begin() + idx, t);
@@ -214,13 +238,16 @@ void ModelingMode::pasteKeyAtCurrentTime() {
         track.rotations.insert(track.rotations.begin() + idx, m_keyClipboard.rotation);
         track.scales.insert(track.scales.begin() + idx, m_keyClipboard.scale);
         if (hasRig) {
-            if (track.bonePositionsPerKey.size() < track.times.size() - 1)
-                track.bonePositionsPerKey.resize(track.times.size() - 1);
+            resizeAligned(track.times.size() - 1);
             track.bonePositionsPerKey.insert(track.bonePositionsPerKey.begin() + idx,
                                              m_keyClipboard.bonePositions);
+            track.boneRotationsPerKey.insert(track.boneRotationsPerKey.begin() + idx,
+                                             m_keyClipboard.boneRotations);
         } else if (!track.bonePositionsPerKey.empty()) {
             track.bonePositionsPerKey.insert(track.bonePositionsPerKey.begin() + idx,
                                              std::vector<glm::vec3>{});
+            track.boneRotationsPerKey.insert(track.boneRotationsPerKey.begin() + idx,
+                                             std::vector<glm::quat>{});
         }
     }
     // Force the playback path to apply the pasted state on the next tick.
@@ -266,11 +293,27 @@ void ModelingMode::applyAnimatedTransforms() {
         if (bonesA.empty() || bonesB.empty() || bonesA.size() != bonesB.size()) continue;
         if (m_bonePositions.size() != bonesA.size()) continue;
 
-        // Lerp bone world positions, sync skeleton localTransforms (relative
-        // to parent — matches the bind-pose hierarchy we computed earlier).
+        // Lerp bone world positions and slerp world rotations (when the
+        // track has rotations recorded). Sync skeleton localTransforms
+        // (relative to parent) so the skeleton overlay draws correctly.
         auto& skel = m_ctx.editableMesh.getSkeleton();
+        const bool haveRotsA = (i0 < track.boneRotationsPerKey.size() &&
+                                track.boneRotationsPerKey[i0].size() == bonesA.size());
+        const bool haveRotsB = (i1 < track.boneRotationsPerKey.size() &&
+                                track.boneRotationsPerKey[i1].size() == bonesB.size());
+        const bool slerpRots = haveRotsA && haveRotsB;
+        if (m_boneWorldRotations.size() != bonesA.size())
+            m_boneWorldRotations.assign(bonesA.size(), glm::quat(1, 0, 0, 0));
         for (size_t b = 0; b < bonesA.size(); ++b) {
             m_bonePositions[b] = glm::mix(bonesA[b], bonesB[b], u);
+            if (slerpRots) {
+                glm::quat qa = track.boneRotationsPerKey[i0][b];
+                glm::quat qb = track.boneRotationsPerKey[i1][b];
+                if (glm::dot(qa, qb) < 0.0f) qb = -qb;  // antipodal
+                m_boneWorldRotations[b] = glm::normalize(glm::slerp(qa, qb, u));
+            } else {
+                m_boneWorldRotations[b] = glm::quat(1, 0, 0, 0);
+            }
             if (b < skel.bones.size()) {
                 int p = skel.bones[b].parentIndex;
                 glm::vec3 parentPos(0.0f);
@@ -366,6 +409,21 @@ void ModelingMode::renderAnimationTimeline() {
             ImGui::TextDisabled("%s [%d keys]%s",
                                 obj->getName().c_str(), n,
                                 m_keyClipboard.valid ? " (clipboard)" : "");
+
+            // Warn when a rigged model is being keyed without a bind pose —
+            // Set Key in that case only stores the object transform, so the
+            // skeleton won't animate on playback.
+            bool isRigged = obj->hasEditorSkeleton();
+            bool bindReady = m_hasBindPose && m_bindPoseOwner == obj;
+            if (isRigged && !bindReady) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                                   "(no bind pose - bones won't animate)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Click 'Set Bind Pose' in the rigging panel\n"
+                                      "before keying so bone poses get recorded.");
+                }
+            }
         } else {
             ImGui::TextDisabled("(select an object to key)");
         }

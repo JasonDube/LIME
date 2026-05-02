@@ -1964,71 +1964,79 @@ static float pointToSegmentDistance(const glm::vec3& point, const glm::vec3& seg
     return glm::length(point - closest);
 }
 
-void EditableMesh::generateAutoWeights(const std::vector<glm::vec3>& boneHeadPositions) {
+void EditableMesh::generateAutoWeights(const std::vector<glm::vec3>& boneHeadPositions,
+                                       float maxReach) {
     if (m_skeleton.bones.empty() || boneHeadPositions.empty()) return;
 
     int numBones = static_cast<int>(m_skeleton.bones.size());
+    (void)maxReach;  // unused for now; kept in signature for callers
 
-    // Precompute children for each bone
+    // Children-of-bone lookup.
     std::vector<std::vector<int>> boneChildren(numBones);
     for (int b = 0; b < numBones; ++b) {
         int p = m_skeleton.bones[b].parentIndex;
-        if (p >= 0 && p < numBones) {
-            boneChildren[p].push_back(b);
+        if (p >= 0 && p < numBones) boneChildren[p].push_back(b);
+    }
+
+    // Each bone "owns" a single segment (Blender convention):
+    //   - non-leaf:  head -> first child's head  (the bone's body)
+    //   - leaf:      head -> head + (head - parent_head)   (virtual tail)
+    //   - lone:      degenerate point at head
+    // The vertex's distance to a bone is the point-to-segment distance.
+    // This puts each bone's "high weight" zone on the limb-segment it
+    // controls (e.g. forearm rotates with the elbow bone), which is what
+    // produces clean elbow-style bends instead of soggy mid-bone bends.
+    struct OwnedSeg { glm::vec3 a, b; };
+    std::vector<OwnedSeg> ownedSeg(numBones);
+    for (int b = 0; b < numBones; ++b) {
+        glm::vec3 head = boneHeadPositions[b];
+        int p = m_skeleton.bones[b].parentIndex;
+        if (!boneChildren[b].empty()) {
+            // Use the first child's head as the bone's tail. A bone with
+            // multiple children isn't perfectly handled (we'd need to fan
+            // ownership across them) — fine for cylinder + humanoid rigs
+            // where most bones are single-child.
+            ownedSeg[b] = {head, boneHeadPositions[boneChildren[b][0]]};
+        } else if (p >= 0) {
+            glm::vec3 dir = head - boneHeadPositions[p];
+            ownedSeg[b] = {head, head + dir};  // extend by full bone length
+        } else {
+            ownedSeg[b] = {head, head};
         }
     }
 
     for (auto& vert : m_vertices) {
-        // Each bone owns the segments toward its CHILDREN, not toward its parent
-        // This way Bone.001 owns the space from 001→002, Bone.002 owns 002→003, etc.
-        std::vector<std::pair<float, int>> distances; // (distance, boneIndex)
+        std::vector<std::pair<float, int>> distances;
+        distances.reserve(numBones);
         for (int b = 0; b < numBones; ++b) {
-            glm::vec3 head = boneHeadPositions[b];
-            float dist;
-            if (boneChildren[b].empty()) {
-                // Leaf bone: just point distance
-                dist = glm::length(vert.position - head);
-            } else {
-                // Min distance to any segment from this bone to its children
-                dist = std::numeric_limits<float>::max();
-                for (int child : boneChildren[b]) {
-                    float d = pointToSegmentDistance(vert.position, head, boneHeadPositions[child]);
-                    dist = std::min(dist, d);
-                }
-            }
-            distances.push_back({dist, b});
+            float d = pointToSegmentDistance(vert.position, ownedSeg[b].a, ownedSeg[b].b);
+            distances.push_back({d, b});
         }
-
-        // Sort by distance, take 3 closest
         std::sort(distances.begin(), distances.end());
-        int count = std::min(3, static_cast<int>(distances.size()));
 
+        // Top 2 closest segments, inverse-cube weighted.
+        const int N = std::min(2, numBones);
         glm::ivec4 indices(0);
-        glm::vec4 weights(0.0f);
-        float totalWeight = 0.0f;
-
-        for (int i = 0; i < count; ++i) {
+        glm::vec4  weights(0.0f);
+        float total = 0.0f;
+        for (int i = 0; i < N; ++i) {
             indices[i] = distances[i].second;
             float d = distances[i].first + 0.001f;
             weights[i] = 1.0f / (d * d * d);
-            totalWeight += weights[i];
+            total += weights[i];
         }
-
-        // Normalize
-        if (totalWeight > 0.0f) {
-            weights /= totalWeight;
-        } else {
-            weights = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
-        }
-        weights[3] = 0.0f;
-        indices[3] = 0;
+        if (total > 0.0f) weights /= total;
+        else              weights = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+        weights[2] = 0.0f; weights[3] = 0.0f;
+        indices[2] = 0;    indices[3] = 0;
 
         vert.boneIndices = indices;
         vert.boneWeights = weights;
     }
 
-    std::cout << "[AutoWeights] Assigned weights for " << m_vertices.size()
-              << " vertices using " << numBones << " bones" << std::endl;
+    std::cout << "[AutoWeights] " << m_vertices.size() << " verts, "
+              << numBones << " bones — top-2 segment-distance (Blender-style)"
+              << std::endl;
 }
 
 void EditableMesh::clearBoneWeights() {
@@ -4241,6 +4249,73 @@ void EditableMesh::makeNormalsConsistent() {
     std::cout << "[Normals] Done: total flipped " << totalFlipped << " / " << faceCount << std::endl;
 }
 
+void EditableMesh::recomputeSmoothNormals() {
+    const uint32_t vertCount = static_cast<uint32_t>(m_vertices.size());
+    const uint32_t faceCount = static_cast<uint32_t>(m_faces.size());
+    if (vertCount == 0 || faceCount == 0) return;
+
+    // Per-vertex accumulated unnormalized normals (area-weighted via cross
+    // product magnitude — bigger triangles contribute more, which matches
+    // standard per-vertex normal averaging).
+    std::vector<glm::vec3> accum(vertCount, glm::vec3(0.0f));
+    for (uint32_t fi = 0; fi < faceCount; ++fi) {
+        auto faceVerts = getFaceVertices(fi);
+        if (faceVerts.size() < 3) continue;
+        glm::vec3 nFace(0.0f);
+        const glm::vec3& a = m_vertices[faceVerts[0]].position;
+        for (size_t i = 1; i + 1 < faceVerts.size(); ++i) {
+            const glm::vec3& b = m_vertices[faceVerts[i]].position;
+            const glm::vec3& c = m_vertices[faceVerts[i + 1]].position;
+            nFace += glm::cross(b - a, c - a);
+        }
+        for (uint32_t vi : faceVerts) {
+            if (vi < vertCount) accum[vi] += nFace;
+        }
+    }
+
+    // Group HEVertices by world position so split duplicates smooth too.
+    auto posKey = [](const glm::vec3& p) -> uint64_t {
+        int32_t x = static_cast<int32_t>(p.x * 10000.0f);
+        int32_t y = static_cast<int32_t>(p.y * 10000.0f);
+        int32_t z = static_cast<int32_t>(p.z * 10000.0f);
+        return (static_cast<uint64_t>(x & 0xFFFFF) << 40) |
+               (static_cast<uint64_t>(y & 0xFFFFF) << 20) |
+                static_cast<uint64_t>(z & 0xFFFFF);
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+    groups.reserve(vertCount);
+    for (uint32_t vi = 0; vi < vertCount; ++vi) {
+        groups[posKey(m_vertices[vi].position)].push_back(vi);
+    }
+
+    for (auto& [_, group] : groups) {
+        glm::vec3 total(0.0f);
+        for (uint32_t vi : group) total += accum[vi];
+        glm::vec3 n = (glm::dot(total, total) > 1e-10f) ? glm::normalize(total) : glm::vec3(0, 1, 0);
+        for (uint32_t vi : group) m_vertices[vi].normal = n;
+    }
+}
+
+void EditableMesh::recomputeFlatNormals() {
+    const uint32_t faceCount = static_cast<uint32_t>(m_faces.size());
+    for (uint32_t fi = 0; fi < faceCount; ++fi) {
+        auto faceVerts = getFaceVertices(fi);
+        if (faceVerts.size() < 3) continue;
+        glm::vec3 n(0.0f);
+        const glm::vec3& a = m_vertices[faceVerts[0]].position;
+        for (size_t i = 1; i + 1 < faceVerts.size(); ++i) {
+            const glm::vec3& b = m_vertices[faceVerts[i]].position;
+            const glm::vec3& c = m_vertices[faceVerts[i + 1]].position;
+            n += glm::cross(b - a, c - a);
+        }
+        if (glm::dot(n, n) > 1e-10f) n = glm::normalize(n);
+        else n = glm::vec3(0, 1, 0);
+        for (uint32_t vi : faceVerts) {
+            if (vi < m_vertices.size()) m_vertices[vi].normal = n;
+        }
+    }
+}
+
 void EditableMesh::catmullClarkSubdivide(int levels) {
     if (m_faces.empty() || m_vertices.empty()) return;
     levels = std::max(1, std::min(levels, 3));
@@ -5282,6 +5357,8 @@ void EditableMesh::saveState() {
 
     // Clear redo stack when new action is performed
     m_redoStack.clear();
+
+    if (m_saveStateHook) m_saveStateHook();
 }
 
 bool EditableMesh::undo() {
@@ -5305,6 +5382,7 @@ bool EditableMesh::undo() {
     m_selectedEdges = std::move(undoState.selectedEdges);
     m_undoStack.pop_back();
 
+    if (m_undoHook) m_undoHook();
     return true;
 }
 
@@ -5329,6 +5407,7 @@ bool EditableMesh::redo() {
     m_selectedEdges = std::move(redoState.selectedEdges);
     m_redoStack.pop_back();
 
+    if (m_redoHook) m_redoHook();
     return true;
 }
 

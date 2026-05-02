@@ -9,6 +9,7 @@
 #include <set>
 #include <array>
 #include <cstdint>
+#include <functional>
 
 namespace eden {
 
@@ -323,6 +324,16 @@ public:
     // Press once = all consistent. Press again = all flipped.
     void makeNormalsConsistent();
 
+    // Per-vertex normals = average of adjacent face normals (area-weighted),
+    // shared across all HEVertices that occupy the same world position so
+    // split duplicate verts also smooth correctly. Result: smooth shading.
+    void recomputeSmoothNormals();
+
+    // Per-vertex normal = the face normal of one of the faces using it. Verts
+    // that are shared across faces just take whichever face touches them last,
+    // which gives the classic faceted look on low-poly meshes.
+    void recomputeFlatNormals();
+
     // Catmull-Clark subdivision - smooths mesh by splitting each face into sub-quads
     // levels: number of subdivision iterations (1-3 recommended)
     void catmullClarkSubdivide(int levels = 1);
@@ -351,7 +362,12 @@ public:
     void clearSkeleton() { m_skeleton.bones.clear(); m_skeleton.boneNameToIndex.clear(); }
 
     // Auto-weight generation: assigns 4 closest bones per vertex using inverse distance
-    void generateAutoWeights(const std::vector<glm::vec3>& boneHeadPositions);
+    // maxReach: bones further than this from a vertex get zero weight.
+    // If no bone is within reach of a vertex, the vertex is bound 100% to
+    // the root bone (index 0). Pass FLT_MAX for the old "always pick the
+    // 3 closest" behavior.
+    void generateAutoWeights(const std::vector<glm::vec3>& boneHeadPositions,
+                             float maxReach = 0.5f);
 
     // Clear all bone weights from vertices
     void clearBoneWeights();
@@ -406,6 +422,13 @@ public:
     void clearUndoHistory();
     size_t getUndoStackSize() const { return m_undoStack.size(); }
     size_t getRedoStackSize() const { return m_redoStack.size(); }
+
+    // Hooks so external state (e.g. ModelingMode's bone arrays) can be
+    // snapshotted alongside the mesh on saveState() and restored on
+    // undo()/redo(). Each hook is fired AFTER the mesh's own bookkeeping.
+    void setSaveStateHook(std::function<void()> h) { m_saveStateHook = std::move(h); }
+    void setUndoHook(std::function<void()> h)       { m_undoHook      = std::move(h); }
+    void setRedoHook(std::function<void()> h)       { m_redoHook      = std::move(h); }
 
     // Get internal data (for serialization/cloning)
     const std::vector<HEVertex>& getVerticesData() const { return m_vertices; }
@@ -486,6 +509,10 @@ private:
     std::vector<MeshState> m_undoStack;
     std::vector<MeshState> m_redoStack;
     static constexpr size_t MAX_UNDO_LEVELS = 50;
+
+    std::function<void()> m_saveStateHook;
+    std::function<void()> m_undoHook;
+    std::function<void()> m_redoHook;
 };
 
 } // namespace eden

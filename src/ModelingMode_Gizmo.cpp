@@ -421,8 +421,22 @@ bool ModelingMode::processGizmoInput() {
 
                         glm::vec3 pivot = m_bonePositions[m_selectedBone];
 
-                        // Rotate all descendant bone positions
+                        // Rotate all descendant bone positions AND accumulate
+                        // the world rotation on the selected bone + its
+                        // descendants. The skinning math reads m_boneWorldRotations
+                        // and applies them per vertex, so the deformed mesh
+                        // actually rotates around the pivot instead of just
+                        // translating.
                         auto descendants = getDescendantBones(m_selectedBone);
+                        if (m_boneWorldRotations.size() == m_bonePositions.size()) {
+                            m_boneWorldRotations[m_selectedBone] =
+                                rotation * m_boneWorldRotations[m_selectedBone];
+                            for (int di : descendants) {
+                                if (di < static_cast<int>(m_boneWorldRotations.size())) {
+                                    m_boneWorldRotations[di] = rotation * m_boneWorldRotations[di];
+                                }
+                            }
+                        }
                         for (int di : descendants) {
                             if (di < static_cast<int>(m_bonePositions.size())) {
                                 glm::vec3 rel = m_bonePositions[di] - pivot;
@@ -430,14 +444,6 @@ bool ModelingMode::processGizmoInput() {
                             }
                         }
 
-                        // Translation-only re-skin doesn't capture rotations
-                        // accurately; we still bake rotation into verts when
-                        // bind pose is set, but the bone's "world position"
-                        // contribution gets re-skinned next frame from
-                        // m_bindPoseBonePositions. Acceptable approximation
-                        // for pure-translation rigs (which is what LIME does
-                        // today). A future change would store full bone
-                        // transforms for proper hierarchical rotation skinning.
                         if (m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject) {
                             reskinFromBoneDeltas();
                         } else if (!m_riggingDragWeightedVerts.empty()) {
@@ -702,7 +708,9 @@ bool ModelingMode::processGizmoInput() {
         m_ctx.gizmoHoveredAxis = pickGizmoAxis(rayOrigin, rayDir, gizmoPos);
 
         if (Input::isMouseButtonPressed(Input::MOUSE_LEFT) && m_ctx.gizmoHoveredAxis != GizmoAxis::None) {
-            // Start drag
+            // Start drag — snapshot mesh + bone state so the whole drag is
+            // a single Ctrl+Z step.
+            m_ctx.editableMesh.saveState();
             m_ctx.gizmoDragging = true;
             m_ctx.gizmoActiveAxis = m_ctx.gizmoHoveredAxis;
             m_ctx.gizmoDragStartPos = gizmoPos;

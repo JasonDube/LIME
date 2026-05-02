@@ -85,6 +85,44 @@ static bool isSeamVertex(const EditableMesh& mesh, uint32_t vertIdx) {
 ModelingMode::ModelingMode(EditorContext& ctx)
     : IEditorMode(ctx)
 {
+    installBoneUndoHooks();
+}
+
+void ModelingMode::installBoneUndoHooks() {
+    // saveState pushes both mesh and bone state. undo/redo restore from
+    // their respective stacks. Stacks are pushed in lock-step so popping
+    // is always one-to-one with the mesh undo.
+    m_ctx.editableMesh.setSaveStateHook([this]() {
+        BoneSnapshot snap;
+        snap.positions = m_bonePositions;
+        snap.rotations = m_boneWorldRotations;
+        m_boneUndoStack.push_back(std::move(snap));
+        m_boneRedoStack.clear();
+        // Cap size to match the mesh's MAX_UNDO_LEVELS budget.
+        if (m_boneUndoStack.size() > 50) m_boneUndoStack.erase(m_boneUndoStack.begin());
+    });
+    m_ctx.editableMesh.setUndoHook([this]() {
+        if (m_boneUndoStack.empty()) return;
+        BoneSnapshot redoSnap;
+        redoSnap.positions = m_bonePositions;
+        redoSnap.rotations = m_boneWorldRotations;
+        m_boneRedoStack.push_back(std::move(redoSnap));
+        BoneSnapshot& s = m_boneUndoStack.back();
+        m_bonePositions      = std::move(s.positions);
+        m_boneWorldRotations = std::move(s.rotations);
+        m_boneUndoStack.pop_back();
+    });
+    m_ctx.editableMesh.setRedoHook([this]() {
+        if (m_boneRedoStack.empty()) return;
+        BoneSnapshot undoSnap;
+        undoSnap.positions = m_bonePositions;
+        undoSnap.rotations = m_boneWorldRotations;
+        m_boneUndoStack.push_back(std::move(undoSnap));
+        BoneSnapshot& s = m_boneRedoStack.back();
+        m_bonePositions      = std::move(s.positions);
+        m_boneWorldRotations = std::move(s.rotations);
+        m_boneRedoStack.pop_back();
+    });
 }
 
 void ModelingMode::onActivate() {
@@ -488,7 +526,7 @@ void ModelingMode::renderSceneOverlay(VkCommandBuffer cmd, const glm::mat4& view
         glm::mat4 modelMatrix = obj->getTransform().getMatrix();
         // X-ray mode disables backface culling for this object
         bool twoSided = obj->isXRay();
-        m_ctx.modelRenderer.render(cmd, viewProj, obj->getBufferHandle(), modelMatrix, 0.0f, 1.0f, 1.0f, twoSided);
+        m_ctx.modelRenderer.render(cmd, viewProj, obj->getBufferHandle(), modelMatrix, 0.0f, 1.0f, 1.0f, twoSided, obj->isFlatShaded());
     }
 
     // Render modeling overlay (selection highlighting)
@@ -2020,6 +2058,7 @@ void ModelingMode::renderModelingEditorUI() {
                 ImGui::InputText("##bonename", m_newBoneName, sizeof(m_newBoneName));
                 ImGui::SameLine();
                 if (ImGui::Button("Add Bone")) {
+                    m_ctx.editableMesh.saveState();
                     Bone newBone;
                     newBone.name = m_newBoneName;
                     newBone.parentIndex = m_selectedBone;  // parent = currently selected bone
@@ -2032,11 +2071,65 @@ void ModelingMode::renderModelingEditorUI() {
                         pos = m_bonePositions[m_selectedBone] + glm::vec3(0.0f, 0.5f, 0.0f);
                     }
                     m_bonePositions.push_back(pos);
+                    if (!m_boneWorldRotations.empty() || m_hasBindPose) {
+                        m_boneWorldRotations.push_back(glm::quat(1, 0, 0, 0));
+                    }
                     m_selectedBone = newIdx;
                     // Increment name
                     snprintf(m_newBoneName, sizeof(m_newBoneName), "Bone.%03d", newIdx + 1);
                     m_ctx.meshDirty = true;
                     invalidateWireframeCache();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Insert Bone")) {
+                    // Inserts a new bone between the selected bone and its
+                    // existing children. Result for chain A -> B with A
+                    // selected: A -> NEW -> B. Position defaults to midpoint
+                    // of A and the average of its children's heads. If A has
+                    // no children, falls back to Add-Bone behavior.
+                    if (m_selectedBone >= 0 && m_selectedBone < static_cast<int>(skel.bones.size())) {
+                        m_ctx.editableMesh.saveState();
+                        std::vector<int> children;
+                        for (int i = 0; i < static_cast<int>(skel.bones.size()); ++i) {
+                            if (skel.bones[i].parentIndex == m_selectedBone) children.push_back(i);
+                        }
+
+                        // Midpoint of parent and the centroid of its children
+                        // — falls back to Add-Bone offset when parent is a leaf.
+                        glm::vec3 newPos;
+                        if (!children.empty()) {
+                            glm::vec3 childAvg(0.0f);
+                            for (int c : children) childAvg += m_bonePositions[c];
+                            childAvg /= static_cast<float>(children.size());
+                            newPos = (m_bonePositions[m_selectedBone] + childAvg) * 0.5f;
+                        } else {
+                            newPos = m_bonePositions[m_selectedBone] + glm::vec3(0.0f, 0.5f, 0.0f);
+                        }
+
+                        Bone newBone;
+                        newBone.name = m_newBoneName;
+                        newBone.parentIndex = m_selectedBone;
+                        int newIdx = static_cast<int>(skel.bones.size());
+                        skel.bones.push_back(newBone);
+                        skel.boneNameToIndex[newBone.name] = newIdx;
+                        m_bonePositions.push_back(newPos);
+                        if (!m_boneWorldRotations.empty() || m_hasBindPose) {
+                            m_boneWorldRotations.push_back(glm::quat(1, 0, 0, 0));
+                        }
+
+                        // Reparent the old children under the new bone.
+                        for (int c : children) skel.bones[c].parentIndex = newIdx;
+
+                        m_selectedBone = newIdx;
+                        snprintf(m_newBoneName, sizeof(m_newBoneName), "Bone.%03d", newIdx + 1);
+                        m_ctx.meshDirty = true;
+                        invalidateWireframeCache();
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Insert a bone between the selected bone and its children.\n"
+                                      "A -> B  becomes  A -> NEW -> B (NEW positioned at the midpoint).\n"
+                                      "If the selected bone is a leaf, behaves like Add Bone.");
                 }
 
                 ImGui::SameLine();
@@ -2271,14 +2364,38 @@ void ModelingMode::renderModelingEditorUI() {
                                 glm::translate(glm::mat4(1.0f), m_bonePositions[i]));
                             skel.bones[i].localTransform = glm::translate(glm::mat4(1.0f), m_bonePositions[i]);
                         }
-                        m_ctx.editableMesh.generateAutoWeights(m_bonePositions);
+                        m_ctx.editableMesh.generateAutoWeights(m_bonePositions, m_autoWeightMaxReach);
                         m_ctx.meshDirty = true;
                         invalidateWireframeCache();
                         m_heatMapDirty = true;
-                        std::cout << "[Rigging] Auto weights generated" << std::endl;
+                        std::cout << "[Rigging] Auto weights generated (maxReach="
+                                  << m_autoWeightMaxReach << ")" << std::endl;
                     }
                     if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Assign bone weights to each vertex based on distance to nearest bones");
+                        ImGui::SetTooltip("Assign bone weights using the Max Reach radius below.\n"
+                                          "Bones further than that from a vertex contribute nothing;\n"
+                                          "verts with no bones in reach get bound to the root bone.");
+                    }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(140);
+                    ImGui::SliderFloat("Max Reach##aw", &m_autoWeightMaxReach, 0.05f, 5.0f, "%.2f m");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Bones further than this from a vertex contribute zero weight.\n"
+                                          "Smaller = tighter, less leakage between body parts.\n"
+                                          "Bigger = more bones blend at each vertex (smoother but soggier).");
+                    }
+
+                    if (ImGui::Checkbox("Use DQS (volume-preserving)", &m_useDQS)) {
+                        if (m_hasBindPose && m_bindPoseOwner == m_ctx.selectedObject) {
+                            reskinFromBoneDeltas();  // refresh preview immediately
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Dual-quaternion skinning blends rotations in quaternion space\n"
+                                          "instead of lerping positions, so joints don't collapse on bend.\n"
+                                          "Same weights, just better skin math.\n\n"
+                                          "Note: eden's runtime currently does LBS, so exported GLBs play\n"
+                                          "with the LBS look until eden grows DQS shader support.");
                     }
 
                     ImGui::SameLine();
@@ -3292,6 +3409,28 @@ void ModelingMode::renderModelingEditorUI() {
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Flood-fill to make all faces wind the same way.\nPress once = consistent. Press again = all flipped.");
+        }
+
+        if (m_ctx.selectedObject) {
+            bool flat = m_ctx.selectedObject->isFlatShaded();
+            if (ImGui::Button("Smooth Shade")) {
+                m_ctx.editableMesh.saveState();
+                m_ctx.editableMesh.recomputeSmoothNormals();
+                m_ctx.selectedObject->setFlatShading(false);
+                m_ctx.meshDirty = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Average adjacent face normals per vertex (area-weighted)\n"
+                                  "and tell the shader to interpolate smoothly across faces.");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(flat ? "Flat Shade [on]" : "Flat Shade")) {
+                m_ctx.selectedObject->setFlatShading(!flat);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Per-fragment face normal computed from screen-space\n"
+                                  "derivatives — true faceted look without splitting verts.");
+            }
         }
 
         if (ImGui::Button("Rebuild Mesh")) {
@@ -4943,7 +5082,7 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
                     // Quadratic falloff (1 at center → 0 at edge).
                     float falloff = 1.0f - dist * invRadius;
                     falloff *= falloff;
-                    float delta = sign * strength * falloff * 0.1f;  // small step per frame
+                    float delta = sign * strength * falloff * 0.5f;  // per-frame step (was 0.1f, bumped for snappier brush)
 
                     // Find the slot already holding this bone, else the
                     // smallest-weight slot (we'll overwrite it if delta > 0).
@@ -6096,6 +6235,8 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
             int picked = pickBoneAtScreenPos(mousePos);
             if (picked >= 0 && picked < static_cast<int>(m_bonePositions.size())) {
+                // Snapshot mesh + bone state so the whole drag is one undo step.
+                m_ctx.editableMesh.saveState();
                 m_selectedBone = picked;
                 m_riggingBoneDragIdx = picked;
 

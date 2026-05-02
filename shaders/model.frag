@@ -2,7 +2,14 @@
 
 layout(set = 0, binding = 0) uniform sampler2D texSampler;
 
-layout(location = 0) flat in vec3 fragNormal;  // flat shading - no interpolation
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    mat4 model;
+    vec4 colorAdjust;
+    vec4 shading;  // x=flatShading flag (1.0 = use derivative-based face normal)
+} pc;
+
+layout(location = 0) in vec3 fragNormal;  // interpolated; per-vertex normals control flat vs smooth look
 layout(location = 1) in vec2 fragTexCoord;
 layout(location = 2) in vec4 fragColor;
 layout(location = 3) in vec3 fragWorldPos;
@@ -59,9 +66,19 @@ void main() {
         adjustedColor = hsv2rgb(hsv);
     }
 
+    // Per-fragment normal: smooth uses the interpolated per-vertex normal,
+    // flat derives the face normal from screen-space derivatives of the
+    // world position (works without splitting verts in the source mesh).
+    vec3 N;
+    if (pc.shading.x > 0.5) {
+        N = normalize(cross(dFdx(fragWorldPos), dFdy(fragWorldPos)));
+    } else {
+        N = normalize(fragNormal);
+    }
+
     // Simple directional lighting (high ambient for flatter look)
     vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
-    float diffuse = max(dot(normalize(fragNormal), lightDir), 0.0);
+    float diffuse = max(dot(N, lightDir), 0.0);
     float ambient = 0.7;
     float lighting = ambient + diffuse * 0.3;
 

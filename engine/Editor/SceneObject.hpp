@@ -191,6 +191,12 @@ public:
     void setXRay(bool xray) { m_xray = xray; }
     bool isXRay() const { return m_xray; }
 
+    // Flat shading: fragment shader derives the face normal at draw time
+    // from screen-space derivatives, so verts don't need to be split for
+    // a faceted look.
+    void setFlatShading(bool flat) { m_flatShading = flat; }
+    bool isFlatShaded() const { return m_flatShading; }
+
     // Collision (simple built-in)
     void setAABBCollision(bool collision) { m_aabbCollision = collision; }
     bool hasAABBCollision() const { return m_aabbCollision; }
@@ -730,6 +736,7 @@ private:
     bool m_selected = false;
     bool m_visible = true;
     bool m_xray = false;             // X-Ray mode (render both sides)
+    bool m_flatShading = false;      // Flat (faceted) shading via fragment derivatives
     bool m_aabbCollision = false;    // AABB collision (default off)
     bool m_polygonCollision = false; // Polygon collision (default off)
     BulletCollisionType m_bulletCollisionType = BulletCollisionType::NONE;  // Bullet physics collision

@@ -3,7 +3,8 @@
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
     mat4 model;
-    vec4 colorAdjust;  // x=hue, y=saturation, z=brightness, w=unused
+    vec4 colorAdjust;  // x=hue, y=saturation, z=brightness, w=alpha (0=opaque, >0=x-ray)
+    vec4 shading;      // x=flatShading flag, yzw=reserved
 } pc;
 
 layout(location = 0) in vec3 inPosition;
@@ -11,7 +12,7 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inTexCoord;
 layout(location = 3) in vec4 inColor;
 
-layout(location = 0) flat out vec3 fragNormal;  // flat shading - no interpolation
+layout(location = 0) out vec3 fragNormal;  // interpolated across triangle so per-vertex smooth normals actually shade smoothly
 layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) out vec4 fragColor;
 layout(location = 3) out vec3 fragWorldPos;

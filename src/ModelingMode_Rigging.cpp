@@ -21,6 +21,8 @@ void ModelingMode::setBindPose() {
     m_bindPoseVerts.resize(verts.size());
     for (size_t i = 0; i < verts.size(); ++i) m_bindPoseVerts[i] = verts[i].position;
     m_bindPoseBonePositions = m_bonePositions;
+    m_bindPoseBoneRotations.assign(m_bonePositions.size(), glm::quat(1, 0, 0, 0));
+    m_boneWorldRotations    .assign(m_bonePositions.size(), glm::quat(1, 0, 0, 0));
 
     // Recompute IBMs from the bind-pose bone world positions, walking the
     // hierarchy so child bones correctly capture their parent's rest world
@@ -59,19 +61,97 @@ void ModelingMode::reskinFromBoneDeltas() {
     if (m_bindPoseVerts.size() != vertCount) return;
     if (m_bindPoseBonePositions.size() != m_bonePositions.size()) return;
 
-    // Translation-only skinning: deformed = rest + sum(weight_i * (bone_i - bind_bone_i))
-    // Matches LIME's existing translate-by-weighted-delta deform model and
-    // is what GPU skinning will compute when bones have only translation.
-    for (uint32_t vi = 0; vi < vertCount; ++vi) {
-        auto& v = m_ctx.editableMesh.getVertex(vi);
-        glm::vec3 delta(0.0f);
-        for (int j = 0; j < 4; ++j) {
-            if (v.boneWeights[j] <= 0.0f) continue;
-            int b = v.boneIndices[j];
-            if (b < 0 || b >= static_cast<int>(m_bonePositions.size())) continue;
-            delta += v.boneWeights[j] * (m_bonePositions[b] - m_bindPoseBonePositions[b]);
+    const bool haveRots = (m_boneWorldRotations.size() == m_bonePositions.size());
+
+    // Per-bone skin transform (R, T) in world space:
+    //   M_skin_b = translate(anim_pos) * mat(anim_rot) * translate(-bind_pos)
+    //            = [ anim_rot | anim_pos - anim_rot * bind_pos ]
+    // We need this for both LBS and DQS, so precompute once per bone.
+    std::vector<glm::quat> R_bone(m_bonePositions.size(), glm::quat(1, 0, 0, 0));
+    std::vector<glm::vec3> T_bone(m_bonePositions.size(), glm::vec3(0.0f));
+    for (size_t b = 0; b < m_bonePositions.size(); ++b) {
+        glm::quat r = haveRots ? m_boneWorldRotations[b] : glm::quat(1, 0, 0, 0);
+        R_bone[b] = r;
+        T_bone[b] = m_bonePositions[b] - r * m_bindPoseBonePositions[b];
+    }
+
+    if (m_useDQS) {
+        // Dual-quaternion skinning. Each (R, T) becomes a unit dual quat
+        //   real = R, dual = 0.5 * (T as pure quat) * R
+        // We blend dual quats by weight (with antipodal sign-fix), normalize
+        // by the real-part magnitude, then transform the rest vertex by the
+        // resulting (R', T') reconstructed from the blended DQ.
+        std::vector<glm::quat> realQ(m_bonePositions.size());
+        std::vector<glm::quat> dualQ(m_bonePositions.size());
+        for (size_t b = 0; b < m_bonePositions.size(); ++b) {
+            realQ[b] = R_bone[b];
+            glm::quat tq(0.0f, T_bone[b].x, T_bone[b].y, T_bone[b].z);
+            dualQ[b] = 0.5f * (tq * R_bone[b]);
         }
-        v.position = m_bindPoseVerts[vi] + delta;
+
+        for (uint32_t vi = 0; vi < vertCount; ++vi) {
+            auto& v = m_ctx.editableMesh.getVertex(vi);
+            const glm::vec3 vRest = m_bindPoseVerts[vi];
+
+            glm::quat blendedReal(0, 0, 0, 0);
+            glm::quat blendedDual(0, 0, 0, 0);
+            glm::quat pivotReal(1, 0, 0, 0);
+            bool havePivot = false;
+            float wSum = 0.0f;
+
+            for (int j = 0; j < 4; ++j) {
+                if (v.boneWeights[j] <= 0.0f) continue;
+                int b = v.boneIndices[j];
+                if (b < 0 || b >= static_cast<int>(m_bonePositions.size())) continue;
+
+                glm::quat r = realQ[b];
+                glm::quat d = dualQ[b];
+                if (!havePivot) { pivotReal = r; havePivot = true; }
+                // Antipodal fix — quats q and -q represent the same rotation
+                // but blend differently. Force consistent hemisphere.
+                if (glm::dot(pivotReal, r) < 0.0f) { r = -r; d = -d; }
+
+                float w = v.boneWeights[j];
+                blendedReal += w * r;
+                blendedDual += w * d;
+                wSum += w;
+            }
+            if (wSum <= 0.0f) { v.position = vRest; continue; }
+
+            // Normalize by real magnitude (DQS spec)
+            float n = glm::length(blendedReal);
+            if (n < 1e-8f) { v.position = vRest; continue; }
+            blendedReal /= n;
+            blendedDual /= n;
+
+            // Reconstruct (R, T):
+            //   T_blend = 2 * (real.w * dual.vec - dual.w * real.vec
+            //                  + cross(real.vec, dual.vec))
+            const glm::vec3 rv(blendedReal.x, blendedReal.y, blendedReal.z);
+            const glm::vec3 dv(blendedDual.x, blendedDual.y, blendedDual.z);
+            glm::vec3 t = 2.0f * (blendedReal.w * dv - blendedDual.w * rv + glm::cross(rv, dv));
+            v.position = blendedReal * vRest + t;
+        }
+    } else {
+        // Linear blend skinning:
+        //   v' = sum_i w_i * (R_i * v_rest + T_i)
+        // Identical math to DQS for a single influence; differs only when
+        // multiple bones blend (LBS lerps positions, DQS lerps rotations).
+        for (uint32_t vi = 0; vi < vertCount; ++vi) {
+            auto& v = m_ctx.editableMesh.getVertex(vi);
+            glm::vec3 sum(0.0f);
+            float wSum = 0.0f;
+            const glm::vec3 vRest = m_bindPoseVerts[vi];
+            for (int j = 0; j < 4; ++j) {
+                if (v.boneWeights[j] <= 0.0f) continue;
+                int b = v.boneIndices[j];
+                if (b < 0 || b >= static_cast<int>(m_bonePositions.size())) continue;
+                glm::vec3 contribution = R_bone[b] * vRest + T_bone[b];
+                sum += v.boneWeights[j] * contribution;
+                wSum += v.boneWeights[j];
+            }
+            v.position = (wSum > 0.0f) ? sum * (1.0f / wSum) : vRest;
+        }
     }
 
     // Push to GPU via the in-place fast path so we don't rebuild buffers.

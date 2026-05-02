@@ -58,7 +58,7 @@ private:
     void renderAnimationTimeline();              // Always-visible timeline strip pinned to bottom
     void clampWindowAboveTimeline(const char* name); // Call BEFORE ImGui::Begin(name, ...)
     void requestLayoutReset() { m_layoutResetPending = true; }
-    bool m_layoutResetPending = true;  // True on first frame so the layout self-corrects on launch
+    bool m_layoutResetPending = false;  // Triggered manually by the timeline's "Reset Layout" button; otherwise ImGui restores from imgui.ini
 
     // Animation timeline state (persistent across modes; will hold per-skeleton clips later)
     float m_timelineDuration = 5.0f;
@@ -80,6 +80,7 @@ private:
         std::vector<glm::quat> rotations;
         std::vector<glm::vec3> scales;
         std::vector<std::vector<glm::vec3>> bonePositionsPerKey;  // empty for un-rigged objects
+        std::vector<std::vector<glm::quat>> boneRotationsPerKey;  // matched 1:1 with bonePositionsPerKey
     };
     std::unordered_map<SceneObject*, ObjectAnimTrack> m_objectAnims;
 
@@ -92,11 +93,32 @@ private:
     SceneObject* m_bindPoseOwner = nullptr;        // bind pose belongs to this object
     std::vector<glm::vec3> m_bindPoseVerts;        // rest-pose vertex positions
     std::vector<glm::vec3> m_bindPoseBonePositions; // rest-pose bone positions (world)
+    std::vector<glm::quat> m_bindPoseBoneRotations; // rest-pose world rotations (typically identity)
+    std::vector<glm::quat> m_boneWorldRotations;    // current world rotation per bone (updated by gizmo)
+
+    // Bone-state undo stacks. Pushed in lock-step with EditableMesh's mesh
+    // undo (via its setSaveStateHook hook) so Ctrl+Z restores both the
+    // mesh AND the bone positions/rotations together. Without this, undo
+    // would put verts back where they were but leave the bones moved —
+    // the next reskin would un-do the undo.
+    struct BoneSnapshot {
+        std::vector<glm::vec3> positions;
+        std::vector<glm::quat> rotations;
+    };
+    std::vector<BoneSnapshot> m_boneUndoStack;
+    std::vector<BoneSnapshot> m_boneRedoStack;
+    void installBoneUndoHooks();
 
     void setBindPose();           // Snapshot current verts/bones as rest pose, recompute IBMs
     void clearBindPose();
-    void reskinFromBoneDeltas();  // Recompute deformed verts from bind + current bone positions
+    void reskinFromBoneDeltas();  // Recompute deformed verts from bind + current bone positions (LBS or DQS based on m_useDQS)
     void exportSkinnedAnimatedGLB(); // Save the rigged + animated selected object
+
+    // Linear blend skinning (LBS) is the default; toggle to dual-quaternion
+    // skinning (DQS) for volume-preserving bends — fixes "candy wrapper"
+    // collapse at sharp joints. Faint bone-swelling at very extreme rotations
+    // is the known DQS tradeoff.
+    bool m_useDQS = false;
 
     // Weight heatmap: colors mesh verts by their weight on the selected bone
     // (blue=0 → green=0.5 → red=1). Pushes overridden vertex colors via the
@@ -114,6 +136,7 @@ private:
     float m_weightPaintRadius = 0.3f;     // model-space radius
     float m_weightPaintStrength = 0.5f;   // weight delta applied per stroke-tick
     bool  m_weightPaintingActive = false; // edge-detect to save undo state once per stroke
+    float m_autoWeightMaxReach = 0.5f;    // mesh-units; bones further than this don't influence a vertex
 
     void setKeyOnSelected();             // Records selected object's current transform at m_timelineCurrentTime
     void deleteKeyOnSelectedNearTime();  // Removes the closest key within a small time threshold
@@ -130,6 +153,7 @@ private:
         glm::quat   rotation{1.0f, 0.0f, 0.0f, 0.0f};
         glm::vec3   scale{1.0f};
         std::vector<glm::vec3> bonePositions;  // empty for un-rigged objects
+        std::vector<glm::quat> boneRotations;  // matched 1:1 with bonePositions
     };
     KeyClipboard m_keyClipboard;
     void renderImageRefWindow();  // Clone source images window
