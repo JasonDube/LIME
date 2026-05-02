@@ -34,6 +34,17 @@ just so good ideas don't fall on the floor.
 
 ## Rigging UX
 
+- [ ] **Rigging-panel layout pass** — buttons have been added one at a time over
+      many sessions and the panel is getting noisy. Group into named ImGui
+      child windows / collapsing headers so each section reads like a tool:
+        - *Skeleton* (Add Bone, Insert Bone, bone list, Delete Bone, Save/Load
+          Skeleton)
+        - *Bind* (Set Bind Pose, Auto Weights, Max Reach, Use DQS, Clear Weights)
+        - *Visualize* (Show Skeleton, Show Bone Names, Weight Heatmap, Weight Paint
+          + radius/strength)
+        - *Export* (Export Skinned GLB)
+      Reduce vertical scroll, and stop mixing authoring buttons with viz toggles.
+
 - [ ] **Mirror weights** across an axis. Paint one side of a symmetrical mesh
       and have the other side update.
 - [ ] **Smooth weights** brush — average a vertex's weights with its neighbors.
