@@ -83,6 +83,8 @@ just so good ideas don't fall on the floor.
 
 ## Misc
 
-- [ ] **Save/load animations + bind pose in `.lime`**. Currently in-memory only;
-      reopen the file and the rig is back to bind without keys.
+- [x] ~~**Save/load animations + bind pose in `.lime`**~~ — DONE 2026-07-19. Skeleton +
+      weights were already saved (v3.0); added bind pose + keyframes as a
+      `RIG_RUNTIME_BEGIN/END` blob (ModelingMode serialize/deserialize). Wired into
+      Save as LIME (Ctrl+S) + F5 quicksave; restored on Load LIME. NOT in saveToLibrary.
 - [ ] **Multi-character GLB export** with shared skeletons — for clones.

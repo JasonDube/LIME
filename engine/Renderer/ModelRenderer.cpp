@@ -461,6 +461,19 @@ void ModelRenderer::createWireframePipeline(VkRenderPass renderPass, VkExtent2D 
         throw std::runtime_error("Failed to create line pipeline");
     }
 
+    // Depth-test-disabled variant of the line pipeline — for always-on-top gizmos
+    // so they aren't hidden inside geometry. Same state, depth test/write off.
+    {
+        VkPipelineDepthStencilStateCreateInfo dsNoDepth = depthStencil;
+        dsNoDepth.depthTestEnable = VK_FALSE;
+        dsNoDepth.depthWriteEnable = VK_FALSE;
+        VkGraphicsPipelineCreateInfo noDepthInfo = pipelineInfo;
+        noDepthInfo.pDepthStencilState = &dsNoDepth;
+        if (vkCreateGraphicsPipelines(m_context.getDevice(), VK_NULL_HANDLE, 1, &noDepthInfo, nullptr, &m_linePipelineNoDepth) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create no-depth line pipeline");
+        }
+    }
+
     // Create point pipeline (POINT_LIST topology for renderPoints)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
 
@@ -963,11 +976,12 @@ void ModelRenderer::renderWireframe(VkCommandBuffer commandBuffer, const glm::ma
 }
 
 void ModelRenderer::renderLines(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,
-                                 const std::vector<glm::vec3>& lines, const glm::vec3& color) {
+                                 const std::vector<glm::vec3>& lines, const glm::vec3& color, bool depthTest) {
     if (lines.empty()) return;
 
     // Bind line pipeline and push constants once
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_linePipeline);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      depthTest ? m_linePipeline : m_linePipelineNoDepth);
 
     WireframePushConstants pc{};
     pc.mvp = viewProj;
@@ -1008,10 +1022,11 @@ void ModelRenderer::renderLines(VkCommandBuffer commandBuffer, const glm::mat4& 
 }
 
 void ModelRenderer::renderLines(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,
-                                 const std::vector<glm::vec3>& lines, const glm::vec4& color) {
+                                 const std::vector<glm::vec3>& lines, const glm::vec4& color, bool depthTest) {
     if (lines.empty()) return;
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_linePipeline);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      depthTest ? m_linePipeline : m_linePipelineNoDepth);
 
     WireframePushConstants pc{};
     pc.mvp = viewProj;
@@ -1450,6 +1465,10 @@ void ModelRenderer::recreatePipeline(VkRenderPass renderPass, VkExtent2D extent)
     if (m_linePipeline) {
         vkDestroyPipeline(device, m_linePipeline, nullptr);
         m_linePipeline = VK_NULL_HANDLE;
+    }
+    if (m_linePipelineNoDepth) {
+        vkDestroyPipeline(device, m_linePipelineNoDepth, nullptr);
+        m_linePipelineNoDepth = VK_NULL_HANDLE;
     }
     if (m_pointPipeline) {
         vkDestroyPipeline(device, m_pointPipeline, nullptr);

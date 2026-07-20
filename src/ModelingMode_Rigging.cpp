@@ -4,6 +4,10 @@
 #include <imgui.h>
 #include <nfd.h>
 #include <iostream>
+#include <cmath>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/constants.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 using namespace eden;
 
@@ -51,6 +55,48 @@ void ModelingMode::clearBindPose() {
     m_bindPoseOwner = nullptr;
     m_bindPoseVerts.clear();
     m_bindPoseBonePositions.clear();
+}
+
+// Full flush: clear the selected object's animation + current pose and snap the
+// bones AND the mesh back to the bind pose. Fixes "deleted the keys but the pose
+// is still stuck" — the pose lives in m_bonePositions/rotations and the deformed
+// editable-mesh verts, independently of the keyframes.
+void ModelingMode::resetToBindPose() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) { std::cout << "[Reset] No object selected\n"; return; }
+
+    // 1) Drop the animation track + stop/rewind the timeline.
+    m_objectAnims.erase(obj);
+    m_timelinePlaying = false;
+    m_timelineCurrentTime = 0.0f;
+    m_timelineLastAppliedTime = -1.0f;
+    m_ikDragLeg = -1;
+
+    // 2) Snap bones back to the bind pose (positions to bind, rotations to identity).
+    if (m_hasBindPose && m_bindPoseOwner == obj &&
+        m_bindPoseBonePositions.size() == m_bonePositions.size()) {
+        m_bonePositions = m_bindPoseBonePositions;
+        m_boneWorldRotations.assign(m_bonePositions.size(), glm::quat(1, 0, 0, 0));
+
+        // Keep the skeleton's localTransforms in sync so the overlay is at bind too.
+        auto& skel = m_ctx.editableMesh.getSkeleton();
+        for (size_t b = 0; b < skel.bones.size() && b < m_bonePositions.size(); ++b) {
+            int p = skel.bones[b].parentIndex;
+            glm::vec3 pp = (p >= 0 && p < static_cast<int>(m_bonePositions.size())) ? m_bonePositions[p] : glm::vec3(0.0f);
+            skel.bones[b].localTransform = glm::translate(glm::mat4(1.0f), m_bonePositions[b] - pp);
+        }
+        // 3) Re-skin the mesh back to the rest verts.
+        reskinFromBoneDeltas();
+    }
+
+    // 4) Re-plant IK goals/poles at the bind foot positions so IK holds at bind.
+    for (auto& leg : m_ikLegs) {
+        if (leg.foot >= 0 && leg.foot < static_cast<int>(m_bonePositions.size()))
+            leg.goal = m_bonePositions[leg.foot];
+        leg.hingeValid = false;  // re-capture the hinge next time it's needed
+    }
+
+    std::cout << "[Reset] Cleared animation + pose; snapped to bind pose." << std::endl;
 }
 
 void ModelingMode::reskinFromBoneDeltas() {
@@ -262,6 +308,7 @@ void ModelingMode::applyHeatMapToVerts(std::vector<ModelVertex>& verts) {
                 break;
             }
         }
+
         // Blue → green → red heat ramp.
         glm::vec3 col;
         if (w < 0.5f) {
@@ -422,4 +469,296 @@ void ModelingMode::drawSkeletonOverlay(float vpX, float vpY, float vpW, float vp
     }
 
     drawList->PopClipRect();
+}
+
+// ============================ Two-bone leg IK ============================
+
+// Rotation that swings unit vector a onto unit vector b (shortest arc, no twist).
+static glm::quat swingRotation(glm::vec3 a, glm::vec3 b) {
+    float la = glm::length(a), lb = glm::length(b);
+    if (la < 1e-6f || lb < 1e-6f) return glm::quat(1, 0, 0, 0);
+    a /= la; b /= lb;
+    float d = glm::clamp(glm::dot(a, b), -1.0f, 1.0f);
+    if (d > 0.99999f) return glm::quat(1, 0, 0, 0);
+    if (d < -0.99999f) {  // opposite — pick any perpendicular axis
+        glm::vec3 axis = glm::cross(glm::vec3(1, 0, 0), a);
+        if (glm::length(axis) < 1e-4f) axis = glm::cross(glm::vec3(0, 1, 0), a);
+        return glm::angleAxis(glm::pi<float>(), glm::normalize(axis));
+    }
+    return glm::angleAxis(std::acos(d), glm::normalize(glm::cross(a, b)));
+}
+
+// Analytic two-bone IK. root=hip, goal=foot target, L1=thigh len, L2=shin len,
+// poleHint = a point on the knee-bend side. Out: knee + ankle positions. If the
+// goal is out of reach the leg straightens toward it (ankle clamped to reach).
+static void solveTwoBone(const glm::vec3& root, const glm::vec3& goal,
+                         float L1, float L2, const glm::vec3& poleHint,
+                         glm::vec3& outKnee, glm::vec3& outAnkle) {
+    glm::vec3 toGoal = goal - root;
+    float dist = glm::length(toGoal);
+    glm::vec3 dir = (dist > 1e-6f) ? (toGoal / dist) : glm::vec3(0, -1, 0);
+    float dmin = std::fabs(L1 - L2) + 1e-4f;
+    float dmax = L1 + L2 - 1e-4f;
+    float d = glm::clamp(dist, dmin, dmax);
+    outAnkle = root + dir * d;  // ankle clamped to the reachable point along dir
+    float a = (d * d + L1 * L1 - L2 * L2) / (2.0f * d);
+    float h = std::sqrt(std::max(0.0f, L1 * L1 - a * a));
+    glm::vec3 bend = (poleHint - root);
+    bend = bend - dir * glm::dot(bend, dir);  // perpendicular component
+    if (glm::length(bend) < 1e-5f) {
+        glm::vec3 up(0, 1, 0);
+        bend = up - dir * glm::dot(up, dir);
+        if (glm::length(bend) < 1e-5f) bend = glm::vec3(1, 0, 0);
+    }
+    bend = glm::normalize(bend);
+    outKnee = root + dir * a + bend * h;
+}
+
+void ModelingMode::addIKLegFromSelected() {
+    if (m_selectedBone < 0) { std::cout << "[IK] Select the FOOT/ankle bone first\n"; return; }
+    const auto& skel = m_ctx.editableMesh.getSkeleton();
+    int foot = m_selectedBone;
+    if (foot >= static_cast<int>(skel.bones.size())) return;
+    int shin = skel.bones[foot].parentIndex;
+    if (shin < 0) { std::cout << "[IK] Foot bone has no parent (need shin)\n"; return; }
+    int thigh = skel.bones[shin].parentIndex;
+    if (thigh < 0) { std::cout << "[IK] Shin bone has no parent (need thigh)\n"; return; }
+
+    IKLeg leg;
+    leg.thigh = thigh; leg.shin = shin; leg.foot = foot;
+    if (foot < static_cast<int>(m_bonePositions.size())) leg.goal = m_bonePositions[foot];  // plant at current ankle
+    // Place the pole out in front of the knee, along the current bend direction, so
+    // it steers the knee where it already points (and is easy to grab).
+    if (thigh < static_cast<int>(m_bonePositions.size()) && foot < static_cast<int>(m_bonePositions.size())) {
+        glm::vec3 hipP = m_bonePositions[thigh], kneeP = m_bonePositions[shin], ankP = m_bonePositions[foot];
+        float legLen = glm::length(kneeP - hipP) + glm::length(ankP - kneeP);
+        glm::vec3 bend = kneeP - 0.5f * (hipP + ankP);
+        if (glm::length(bend) < 1e-4f) bend = glm::vec3(0, 0, 1);  // straight leg fallback: forward
+        leg.pole = kneeP + glm::normalize(bend) * std::max(0.3f, legLen * 0.6f);
+    }
+    leg.active = true;
+    m_ikLegs.push_back(leg);
+    m_ikEnabled = true;
+    std::cout << "[IK] Added leg: " << skel.bones[thigh].name << " -> "
+              << skel.bones[shin].name << " -> " << skel.bones[foot].name << "\n";
+}
+
+void ModelingMode::solveIKLegs() {
+    if (!m_ikEnabled || m_ikLegs.empty()) return;
+    if (m_bindPoseBonePositions.size() != m_bonePositions.size()) return;  // need a bind pose
+    if (m_boneWorldRotations.size() != m_bonePositions.size())
+        m_boneWorldRotations.assign(m_bonePositions.size(), glm::quat(1, 0, 0, 0));
+
+    bool any = false;
+    for (IKLeg& leg : m_ikLegs) {
+        if (!leg.active) continue;
+        if (leg.thigh < 0 || leg.shin < 0 || leg.foot < 0) continue;
+        if (leg.foot >= static_cast<int>(m_bonePositions.size())) continue;
+
+        const glm::vec3 hip = m_bonePositions[leg.thigh];   // driven by the pelvis (FK)
+        const glm::vec3 hipR  = m_bindPoseBonePositions[leg.thigh];
+        const glm::vec3 kneeR = m_bindPoseBonePositions[leg.shin];
+        const glm::vec3 ankR  = m_bindPoseBonePositions[leg.foot];
+        const float L1 = glm::length(kneeR - hipR);
+        const float L2 = glm::length(ankR - kneeR);
+        if (L1 < 1e-5f || L2 < 1e-5f) continue;
+
+        // Bend direction source. Locked: derive from a fixed hinge axis so the
+        // knee folds the same anatomical way as the leg swings (kicks) and can
+        // never invert. Unlocked: the draggable pole point steers it.
+        glm::vec3 poleHint = leg.pole;
+        if (leg.lockKnee) {
+            if (!leg.hingeValid) {
+                // Capture the current bend plane as the hinge axis.
+                glm::vec3 la0 = glm::normalize(m_bonePositions[leg.foot] - hip);
+                glm::vec3 kc = m_bonePositions[leg.shin];
+                glm::vec3 bend0 = kc - (hip + la0 * glm::dot(kc - hip, la0));
+                if (glm::length(bend0) > 1e-4f) {
+                    leg.hingeAxis = glm::normalize(glm::cross(la0, glm::normalize(bend0)));
+                    leg.hingeValid = true;
+                }
+            }
+            if (leg.hingeValid) {
+                glm::vec3 la = leg.goal - hip;
+                if (glm::length(la) > 1e-5f) {
+                    la = glm::normalize(la);
+                    glm::vec3 bendDir = glm::cross(leg.hingeAxis, la);  // consistent side of the leg
+                    if (glm::length(bendDir) > 1e-5f)
+                        poleHint = hip + glm::normalize(bendDir) * (L1 + L2);
+                }
+            }
+        }
+
+        glm::vec3 knee, ankle;
+        solveTwoBone(hip, leg.goal, L1, L2, poleHint, knee, ankle);
+
+        m_bonePositions[leg.shin] = knee;
+        m_bonePositions[leg.foot] = ankle;
+        m_boneWorldRotations[leg.thigh] = swingRotation(glm::normalize(kneeR - hipR), glm::normalize(knee - hip));
+        m_boneWorldRotations[leg.shin]  = swingRotation(glm::normalize(ankR - kneeR), glm::normalize(ankle - knee));
+
+        // Foot follows the shin, with Foot Pitch applied in the leg's OWN frame
+        // (right-multiplied). Right-multiplication commutes with slerp, so when
+        // the keyed foot rotation is interpolated it provably stays glued to the
+        // shin's path — no flailing mid-blend. Pitch axis = the hinge axis (the
+        // leg's left/right) when captured, else model X.
+        glm::quat shinRot = m_boneWorldRotations[leg.shin];
+        glm::vec3 localPitchAxis = leg.hingeValid ? leg.hingeAxis : glm::vec3(1.0f, 0.0f, 0.0f);
+        glm::quat footRot = shinRot * glm::angleAxis(glm::radians(leg.footPitch), localPitchAxis);
+        m_boneWorldRotations[leg.foot] = footRot;
+
+        // Carry the foot's DOWNSTREAM joints (heel, toe, ...) with the ankle,
+        // rotating them around it by footRot so the whole foot pitches together.
+        for (int d : getDescendantBones(leg.foot)) {
+            if (d >= 0 && d < static_cast<int>(m_bonePositions.size()) &&
+                d < static_cast<int>(m_bindPoseBonePositions.size())) {
+                m_bonePositions[d] = ankle + footRot * (m_bindPoseBonePositions[d] - ankR);
+                if (d < static_cast<int>(m_boneWorldRotations.size()))
+                    m_boneWorldRotations[d] = footRot;
+            }
+        }
+        any = true;
+    }
+    if (!any) return;
+
+    // Keep skeleton localTransforms in sync so the overlay bone lines follow.
+    auto& skel = m_ctx.editableMesh.getSkeleton();
+    for (size_t b = 0; b < skel.bones.size() && b < m_bonePositions.size(); ++b) {
+        int p = skel.bones[b].parentIndex;
+        glm::vec3 pp = (p >= 0 && p < static_cast<int>(m_bonePositions.size())) ? m_bonePositions[p] : glm::vec3(0.0f);
+        skel.bones[b].localTransform = glm::translate(glm::mat4(1.0f), m_bonePositions[b] - pp);
+    }
+    reskinFromBoneDeltas();
+}
+
+// Playback fix: after keyframe interpolation, rebuild each IK leg so its bone
+// ROTATIONS are derived from its interpolated POSITIONS (not separately slerped).
+// When position and rotation interpolate independently they disagree mid-blend,
+// so the shin's verts get rotated to a spot that doesn't line up with the ankle
+// — the mesh stretches to fill the gap and the joint SWELLS. Deriving rotations
+// from the (length-corrected) positions keeps them consistent = no swell, no
+// flail. Foot follows the shin + Foot Pitch; heel/toe ride rigidly.
+void ModelingMode::rederiveIKFeet() {
+    if (m_ikLegs.empty()) return;
+    if (m_boneWorldRotations.size() != m_bonePositions.size()) return;
+    if (m_bindPoseBonePositions.size() != m_bonePositions.size()) return;
+    const size_t n = m_bonePositions.size();
+    for (const IKLeg& leg : m_ikLegs) {
+        if (leg.thigh < 0 || leg.shin < 0 || leg.foot < 0) continue;
+        if (leg.thigh >= static_cast<int>(n) || leg.shin >= static_cast<int>(n) ||
+            leg.foot >= static_cast<int>(n)) continue;
+
+        const glm::vec3 hip = m_bonePositions[leg.thigh];
+        const glm::vec3 knee = m_bonePositions[leg.shin];
+        const glm::vec3 ankle = m_bonePositions[leg.foot];
+        const glm::vec3 hipR  = m_bindPoseBonePositions[leg.thigh];
+        const glm::vec3 kneeR = m_bindPoseBonePositions[leg.shin];
+        const glm::vec3 ankR  = m_bindPoseBonePositions[leg.foot];
+
+        // Thigh + shin rotations straight from the interpolated joint directions.
+        m_boneWorldRotations[leg.thigh] = swingRotation(glm::normalize(kneeR - hipR), glm::normalize(knee - hip));
+        glm::quat shinRot = swingRotation(glm::normalize(ankR - kneeR), glm::normalize(ankle - knee));
+        m_boneWorldRotations[leg.shin] = shinRot;
+
+        // Foot follows the shin + Foot Pitch (leg-local, smooth).
+        glm::vec3 localAxis = leg.hingeValid ? leg.hingeAxis : glm::vec3(1.0f, 0.0f, 0.0f);
+        glm::quat footRot = shinRot * glm::angleAxis(glm::radians(leg.footPitch), localAxis);
+        m_boneWorldRotations[leg.foot] = footRot;
+
+        // Heel/toe ride rigidly on the ankle.
+        for (int d : getDescendantBones(leg.foot)) {
+            if (d >= 0 && d < static_cast<int>(n) && d < static_cast<int>(m_bindPoseBonePositions.size())) {
+                m_bonePositions[d] = ankle + footRot * (m_bindPoseBonePositions[d] - ankR);
+                if (d < static_cast<int>(m_boneWorldRotations.size()))
+                    m_boneWorldRotations[d] = footRot;
+            }
+        }
+    }
+}
+
+int ModelingMode::pickIKGoalAtScreenPos(const glm::vec2& screenPos, float threshold) {
+    if (m_ikLegs.empty() || !m_ctx.selectedObject) return -1;
+    Camera& cam = m_ctx.getActiveCamera();
+    float vpW = static_cast<float>(m_ctx.window.getWidth());
+    float vpH = static_cast<float>(m_ctx.window.getHeight());
+    glm::mat4 vp = cam.getProjectionMatrix(vpW / vpH) * cam.getViewMatrix();
+    glm::mat4 model = m_ctx.selectedObject->getTransform().getMatrix();
+
+    float best = threshold; int bestLeg = -1;
+    for (size_t i = 0; i < m_ikLegs.size(); ++i) {
+        if (!m_ikLegs[i].active) continue;
+        glm::vec4 clip = vp * model * glm::vec4(m_ikLegs[i].goal, 1.0f);
+        if (clip.w <= 0.0f) continue;
+        glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        glm::vec2 sp((ndc.x + 1.0f) * 0.5f * vpW, (1.0f - ndc.y) * 0.5f * vpH);
+        float dsq = glm::length(sp - screenPos);
+        if (dsq < best) { best = dsq; bestLeg = static_cast<int>(i); }
+    }
+    return bestLeg;
+}
+
+int ModelingMode::pickIKPoleAtScreenPos(const glm::vec2& screenPos, float threshold) {
+    if (m_ikLegs.empty() || !m_ctx.selectedObject) return -1;
+    Camera& cam = m_ctx.getActiveCamera();
+    float vpW = static_cast<float>(m_ctx.window.getWidth());
+    float vpH = static_cast<float>(m_ctx.window.getHeight());
+    glm::mat4 vp = cam.getProjectionMatrix(vpW / vpH) * cam.getViewMatrix();
+    glm::mat4 model = m_ctx.selectedObject->getTransform().getMatrix();
+
+    float best = threshold; int bestLeg = -1;
+    for (size_t i = 0; i < m_ikLegs.size(); ++i) {
+        if (!m_ikLegs[i].active) continue;
+        glm::vec4 clip = vp * model * glm::vec4(m_ikLegs[i].pole, 1.0f);
+        if (clip.w <= 0.0f) continue;
+        glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        glm::vec2 sp((ndc.x + 1.0f) * 0.5f * vpW, (1.0f - ndc.y) * 0.5f * vpH);
+        float dsq = glm::length(sp - screenPos);
+        if (dsq < best) { best = dsq; bestLeg = static_cast<int>(i); }
+    }
+    return bestLeg;
+}
+
+void ModelingMode::drawIKGoalsOverlay(float vpX, float vpY, float vpW, float vpH) {
+    if (!m_ikEnabled || m_ikLegs.empty() || !m_ctx.selectedObject) return;
+    Camera& cam = (m_ctx.splitView && vpX > 0) ? m_ctx.camera2 : m_ctx.camera;
+    glm::mat4 vp = cam.getProjectionMatrix(vpW / vpH) * cam.getViewMatrix();
+    glm::mat4 model = m_ctx.selectedObject->getTransform().getMatrix();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+    auto project = [&](const glm::vec3& p, ImVec2& out) -> bool {
+        glm::vec4 clip = vp * model * glm::vec4(p, 1.0f);
+        if (clip.w <= 0.0f) return false;
+        glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        out = ImVec2(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+        return true;
+    };
+    for (size_t i = 0; i < m_ikLegs.size(); ++i) {
+        const IKLeg& leg = m_ikLegs[i];
+        if (!leg.active) continue;
+        bool draggingThis = (static_cast<int>(i) == m_ikDragLeg);
+
+        // --- knee -> pole guide line + blue pole diamond (steers knee direction) ---
+        ImVec2 kneeSp, poleSp;
+        bool haveKnee = (leg.shin >= 0 && leg.shin < static_cast<int>(m_bonePositions.size()))
+                        && project(m_bonePositions[leg.shin], kneeSp);
+        if (project(leg.pole, poleSp)) {
+            if (haveKnee) dl->AddLine(kneeSp, poleSp, IM_COL32(80, 140, 255, 160), 1.5f);
+            bool dragPole = draggingThis && m_ikDragIsPole;
+            ImU32 pf = dragPole ? IM_COL32(150, 190, 255, 255) : IM_COL32(70, 130, 240, 220);
+            ImVec2 d[4] = { {poleSp.x, poleSp.y - 9}, {poleSp.x + 9, poleSp.y}, {poleSp.x, poleSp.y + 9}, {poleSp.x - 9, poleSp.y} };
+            dl->AddConvexPolyFilled(d, 4, pf);
+            dl->AddPolyline(d, 4, IM_COL32(0, 0, 0, 220), ImDrawFlags_Closed, 2.0f);
+        }
+
+        // --- green foot goal handle ---
+        ImVec2 sp;
+        if (!project(leg.goal, sp)) continue;
+        bool dragGoal = draggingThis && !m_ikDragIsPole;
+        ImU32 fill = dragGoal ? IM_COL32(120, 255, 150, 255) : IM_COL32(40, 220, 90, 220);
+        dl->AddRectFilled(ImVec2(sp.x - 9, sp.y - 9), ImVec2(sp.x + 9, sp.y + 9), fill, 3.0f);
+        dl->AddRect(ImVec2(sp.x - 10, sp.y - 10), ImVec2(sp.x + 10, sp.y + 10), IM_COL32(0, 0, 0, 220), 3.0f, 0, 2.0f);
+        dl->AddLine(ImVec2(sp.x - 14, sp.y), ImVec2(sp.x + 14, sp.y), IM_COL32(20, 120, 50, 200), 1.5f);
+        dl->AddLine(ImVec2(sp.x, sp.y - 14), ImVec2(sp.x, sp.y + 14), IM_COL32(20, 120, 50, 200), 1.5f);
+    }
+    dl->PopClipRect();
 }

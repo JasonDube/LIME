@@ -106,9 +106,9 @@ public:
     // Render lines with depth testing (for grids, guides, etc.)
     // lines: pairs of points (line0_start, line0_end, line1_start, line1_end, ...)
     void renderLines(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,
-                     const std::vector<glm::vec3>& lines, const glm::vec3& color);
+                     const std::vector<glm::vec3>& lines, const glm::vec3& color, bool depthTest = true);
     void renderLines(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,
-                     const std::vector<glm::vec3>& lines, const glm::vec4& color);
+                     const std::vector<glm::vec3>& lines, const glm::vec4& color, bool depthTest = true);
 
     // Render points with depth testing (for vertices)
     void renderPoints(VkCommandBuffer commandBuffer, const glm::mat4& viewProj,
@@ -155,6 +155,7 @@ private:
     VkPipelineLayout m_wireframePipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_wireframePipeline = VK_NULL_HANDLE;
     VkPipeline m_linePipeline = VK_NULL_HANDLE;  // LINE_LIST topology for renderLines
+    VkPipeline m_linePipelineNoDepth = VK_NULL_HANDLE;  // same, depth test OFF (always-on-top gizmos)
     VkPipeline m_pointPipeline = VK_NULL_HANDLE;  // POINT_LIST topology for renderPoints
 
     // Selection pipeline (for rendering selected faces)

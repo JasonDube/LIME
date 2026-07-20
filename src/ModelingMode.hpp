@@ -38,7 +38,7 @@ public:
     void saveEditableMeshAsLime();
     void exportTextureAsPNG();
     void loadOBJFile();
-    void loadLimeFile();
+    void loadLimeFile(const std::string& pathArg = "");  // empty = open dialog; else load that path (Open Recent)
     void quickSave();  // F5 - save to current file path/format
 
     // Scene save/load (.limes format - all objects in scene)
@@ -111,8 +111,13 @@ private:
 
     void setBindPose();           // Snapshot current verts/bones as rest pose, recompute IBMs
     void clearBindPose();
+    void resetToBindPose();       // FLUSH: clear this object's animation + pose, snap bones/mesh back to bind
     void reskinFromBoneDeltas();  // Recompute deformed verts from bind + current bone positions (LBS or DQS based on m_useDQS)
     void exportSkinnedAnimatedGLB(); // Save the rigged + animated selected object
+    void importBoneAnimationJSON(const std::string& path); // Load a pose2anim *.limeanim.json onto the selected rig (positions-only)
+    // Rig-runtime (bind pose + keyframes) persistence embedded in .lime files.
+    std::string serializeRigRuntime(SceneObject* obj);
+    void deserializeRigRuntime(const std::string& blob, SceneObject* obj);
 
     // Linear blend skinning (LBS) is the default; toggle to dual-quaternion
     // skinning (DQS) for volume-preserving bends — fixes "candy wrapper"
@@ -125,6 +130,10 @@ private:
     // in-place updateModelBuffer fast-path; toggling off restores the
     // editable mesh's stored colors.
     bool m_showWeightHeatMap = false;
+    // Influence highlight: paint every vertex the selected bone influences AT ALL
+    // (weight > 0) solid red; uninfluenced verts keep their normal color. Shares
+    // the heatmap push path (m_heatMapDirty / pushMeshWithHeatMap).
+    bool m_showInfluenceHighlight = false;
     int  m_lastHeatMapBone = -1;
     bool m_heatMapDirty = false;  // forces a re-push next update tick
     void applyHeatMapToVerts(std::vector<ModelVertex>& verts);  // overrides .color in-place
@@ -536,7 +545,37 @@ private:
     float m_boneInsetDepth = 0.2f;   // How far to push bone inward along surface normal
     std::vector<glm::vec3> m_bonePositions;  // Editor-side head positions per bone
     char m_newBoneName[64] = "Bone";
+    float m_newBoneOffset = 0.5f;            // Distance a new/added bone is placed from its parent (Add Bone / Insert-on-leaf)
+    bool m_alwaysShowGizmo = false;          // Draw transform gizmos on top of geometry (no depth test) so they aren't hidden
     glm::vec3 m_skeletonOffset{0.0f};        // Cumulative offset applied via "Move Skeleton" — drag changes are applied as deltas to all bones
+
+    // --- Two-bone leg IK (prototype) ---
+    // A leg is thigh(upper) -> shin(lower) -> foot(end). With IK on, the foot
+    // sticks to `goal` (planted) while the thigh's head (hip) is driven by the
+    // pelvis; the solver bends the knee so the ankle stays on the goal. Lets you
+    // shift the hips/weight without the feet moving.
+    struct IKLeg {
+        int thigh = -1, shin = -1, foot = -1;  // bone indices (foot=ankle end effector)
+        glm::vec3 goal{0.0f};                  // model-space foot target
+        glm::vec3 pole{0.0f};                  // model-space knee-direction target (pole vector)
+        bool active = true;
+        bool lockKnee = false;                 // hinge-lock: knee only bends one way (no inversion) — for kicks
+        glm::vec3 hingeAxis{0.0f};             // captured bend-plane axis (model space) when lock is enabled
+        bool hingeValid = false;               // recompute hinge from current pose on next solve
+        float footPitch = 0.0f;                // rotate the foot (+heel/toe) around the ankle, degrees: +toes up / -toes down
+    };
+    std::vector<IKLeg> m_ikLegs;
+    bool m_ikEnabled = false;                  // master toggle for leg IK solving
+    int  m_ikDragLeg = -1;                     // leg whose handle is being dragged (-1 = none)
+    bool m_ikDragIsPole = false;               // dragging the pole handle vs the foot goal
+    glm::vec3 m_ikDragPlaneNormal{0, 0, 1};
+    glm::vec3 m_ikDragPrevPoint{0.0f};
+    void addIKLegFromSelected();               // build a leg from the selected foot bone (walks up 2 parents)
+    void solveIKLegs();                        // solve all active legs + reskin
+    void rederiveIKFeet();                     // during playback: rebuild each foot rigidly from the interpolated shin (no flail)
+    void drawIKGoalsOverlay(float vpX, float vpY, float vpW, float vpH);
+    int  pickIKGoalAtScreenPos(const glm::vec2& screenPos, float threshold = 32.0f);
+    int  pickIKPoleAtScreenPos(const glm::vec2& screenPos, float threshold = 32.0f);
 
     // Pre-rigging state — restored by cancelRiggingMode so exiting rigging
     // doesn't leave the user stuck in component+vertex mode (which triggers
@@ -618,6 +657,13 @@ private:
     void autoPackUVIslands(bool fitToUV = false);
 
 public:
+    // New-bone placement distance (persisted in ~/.lime_prefs.ini via ModelEditor).
+    float getNewBoneOffset() const { return m_newBoneOffset; }
+    void  setNewBoneOffset(float v) { m_newBoneOffset = (v < 0.0f) ? 0.0f : v; }
+    // Always-show-gizmo toggle (persisted via ModelEditor).
+    bool getAlwaysShowGizmo() const { return m_alwaysShowGizmo; }
+    void setAlwaysShowGizmo(bool v) { m_alwaysShowGizmo = v; }
+
     // AI Generate (Hunyuan3D) UI state — public so main.cpp can read params
     char m_generatePrompt[512] = "";
     std::string m_generateImagePath;         // Single mode image

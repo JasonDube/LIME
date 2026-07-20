@@ -7489,7 +7489,8 @@ bool EditableMesh::saveLime(const std::string& filepath, const unsigned char* te
 }
 
 bool EditableMesh::saveLime(const std::string& filepath, const unsigned char* textureData, int texWidth, int texHeight,
-                            const glm::vec3& position, const glm::quat& rotation, const glm::vec3& scale) const {
+                            const glm::vec3& position, const glm::quat& rotation, const glm::vec3& scale,
+                            const std::string& rigRuntime) const {
     std::ofstream file(filepath);
     if (!file.is_open()) {
         std::cerr << "Failed to open " << filepath << " for writing" << std::endl;
@@ -7643,6 +7644,15 @@ bool EditableMesh::saveLime(const std::string& filepath, const unsigned char* te
         else otherCount++;
     }
     file << "# Quads: " << quadCount << ", Tris: " << triCount << ", Other: " << otherCount << "\n";
+
+    // Rig-runtime blob (bind pose + keyframes), serialized by ModelingMode. Written
+    // verbatim between sentinels; loadLime captures it back. Backward compatible —
+    // the main parser skips '#' comments and ignores unknown line types.
+    if (!rigRuntime.empty()) {
+        file << "\nRIG_RUNTIME_BEGIN\n" << rigRuntime;
+        if (rigRuntime.back() != '\n') file << "\n";
+        file << "RIG_RUNTIME_END\n";
+    }
 
     file.close();
     // Debug: print UV range for save verification
@@ -7992,6 +8002,7 @@ bool EditableMesh::loadLime(const std::string& filepath, std::vector<unsigned ch
     m_metadata.clear();
     m_skeleton.bones.clear();
     m_skeleton.boneNameToIndex.clear();
+    m_loadedRigRuntime.clear();
     outTextureData.clear();
     outTexWidth = 0;
     outTexHeight = 0;
@@ -8023,6 +8034,16 @@ bool EditableMesh::loadLime(const std::string& filepath, std::vector<unsigned ch
         }
         else if (type == "transform_scale:") {
             iss >> outScale.x >> outScale.y >> outScale.z;
+        }
+        else if (type == "RIG_RUNTIME_BEGIN") {
+            // Capture the ModelingMode-owned rig blob verbatim (bind pose + keys).
+            std::string rl, blob;
+            while (std::getline(file, rl)) {
+                if (rl == "RIG_RUNTIME_END") break;
+                blob += rl;
+                blob += "\n";
+            }
+            m_loadedRigRuntime = std::move(blob);
         }
         else if (type == "tex_size:") {
             iss >> outTexWidth >> outTexHeight;

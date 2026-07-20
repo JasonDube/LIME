@@ -166,11 +166,16 @@ public:
     bool saveLime(const std::string& filepath) const;
     bool saveLime(const std::string& filepath, const unsigned char* textureData, int texWidth, int texHeight) const;
     bool saveLime(const std::string& filepath, const unsigned char* textureData, int texWidth, int texHeight,
-                  const glm::vec3& position, const glm::quat& rotation, const glm::vec3& scale) const;
+                  const glm::vec3& position, const glm::quat& rotation, const glm::vec3& scale,
+                  const std::string& rigRuntime = "") const;
     bool loadLime(const std::string& filepath);
     bool loadLime(const std::string& filepath, std::vector<unsigned char>& outTextureData, int& outTexWidth, int& outTexHeight);
     bool loadLime(const std::string& filepath, std::vector<unsigned char>& outTextureData, int& outTexWidth, int& outTexHeight,
                   glm::vec3& outPosition, glm::quat& outRotation, glm::vec3& outScale);
+
+    // Opaque per-object rig-runtime blob (bind pose + keyframes) captured from the
+    // last loadLime, for the owner (ModelingMode) to deserialize. Empty if none.
+    const std::string& getLoadedRigRuntime() const { return m_loadedRigRuntime; }
 
     // Save/Load .obj format (preserves quads natively)
     bool saveOBJ(const std::string& filepath) const;
@@ -489,6 +494,10 @@ private:
 
     // Skeleton data for rigging
     Skeleton m_skeleton;
+
+    // Rig-runtime blob (bind pose + keyframes) captured verbatim from loadLime;
+    // ModelingMode deserializes it. Written back out by saveLime's rigRuntime arg.
+    std::string m_loadedRigRuntime;
 
     // Edge lookup: (minVert, maxVert) -> one of the half-edges for that edge
     std::unordered_map<uint64_t, uint32_t> m_edgeMap;

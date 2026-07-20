@@ -45,9 +45,11 @@
 
 #include <iostream>
 #include <fstream>
+#include <cstdlib>
 #include <memory>
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -70,6 +72,97 @@ public:
     ModelEditor() : VulkanApplicationBase(1600, 900, "LIME Editor") {}
 
 protected:
+    // --- User preferences: font scale + display toggles, persisted to
+    // ~/.lime_prefs.ini so the program reopens however it was left. ---
+    std::string prefsPath() const {
+        const char* home = std::getenv("HOME");
+        return std::string(home ? home : ".") + "/.lime_prefs.ini";
+    }
+    void loadPrefs() {  // call AFTER ImGui is initialized (sets FontScaleMain)
+        std::ifstream f(prefsPath());
+        if (!f.is_open()) return;
+        std::string line;
+        while (std::getline(f, line)) {
+            auto eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+            if (k == "fontScale") {
+                float s = std::strtof(v.c_str(), nullptr);
+                if (s >= 0.5f && s <= 3.0f) ImGui::GetStyle().FontScaleMain = s;
+            } else if (k == "showGrid")             m_showGrid = (v == "1");
+            else if (k == "showWireframe")          m_showWireframe = (v == "1");
+            else if (k == "showModelingWireframe")  m_showModelingWireframe = (v == "1");
+            else if (k == "gizmoSize") {
+                float g = std::strtof(v.c_str(), nullptr);
+                if (g >= 0.1f && g <= 3.0f) m_gizmoSize = g;
+            }
+            else if (k == "newBoneOffset") {
+                float o = std::strtof(v.c_str(), nullptr);
+                if (o >= 0.0f && o <= 10.0f) m_prefNewBoneOffset = o;
+            }
+            else if (k == "alwaysShowGizmo") m_prefAlwaysShowGizmo = (v == "1");
+        }
+        // ModelingMode may not exist yet at load time; apply once it does.
+        if (m_modelingMode) {
+            m_modelingMode->setNewBoneOffset(m_prefNewBoneOffset);
+            m_modelingMode->setAlwaysShowGizmo(m_prefAlwaysShowGizmo);
+        }
+        std::cout << "[Prefs] Loaded " << prefsPath() << std::endl;
+    }
+    void savePrefs() {
+        std::ofstream f(prefsPath());
+        if (!f.is_open()) return;
+        f << "fontScale=" << ImGui::GetStyle().FontScaleMain << "\n";
+        f << "showGrid=" << (m_showGrid ? 1 : 0) << "\n";
+        f << "showWireframe=" << (m_showWireframe ? 1 : 0) << "\n";
+        f << "showModelingWireframe=" << (m_showModelingWireframe ? 1 : 0) << "\n";
+        f << "gizmoSize=" << m_gizmoSize << "\n";
+        f << "newBoneOffset=" << (m_modelingMode ? m_modelingMode->getNewBoneOffset() : m_prefNewBoneOffset) << "\n";
+        f << "alwaysShowGizmo=" << ((m_modelingMode ? m_modelingMode->getAlwaysShowGizmo() : m_prefAlwaysShowGizmo) ? 1 : 0) << "\n";
+    }
+
+    // --- Recent files (Open Recent menu), persisted to ~/.lime_recents ---
+    std::string recentsPath() const {
+        const char* home = std::getenv("HOME");
+        return std::string(home ? home : ".") + "/.lime_recents";
+    }
+    void loadRecents() {
+        m_recentFiles.clear();
+        std::ifstream f(recentsPath());
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && std::filesystem::exists(line)) m_recentFiles.push_back(line);
+        }
+    }
+    void saveRecents() {
+        std::ofstream f(recentsPath());
+        if (!f.is_open()) return;
+        for (const auto& p : m_recentFiles) f << p << "\n";
+    }
+    void addRecentFile(const std::string& path) {
+        if (path.empty()) return;
+        m_recentFiles.erase(std::remove(m_recentFiles.begin(), m_recentFiles.end(), path), m_recentFiles.end());
+        m_recentFiles.insert(m_recentFiles.begin(), path);
+        if (m_recentFiles.size() > 12) m_recentFiles.resize(12);
+        saveRecents();
+    }
+    // Open a recent file by extension (.lime via ModelingMode, .glb/.gltf via loadModel).
+    void openRecentFile(const std::string& path) {
+        if (!std::filesystem::exists(path)) {
+            m_recentFiles.erase(std::remove(m_recentFiles.begin(), m_recentFiles.end(), path), m_recentFiles.end());
+            saveRecents();
+            return;
+        }
+        std::string ext = std::filesystem::path(path).extension().string();
+        for (auto& c : ext) c = static_cast<char>(std::tolower((unsigned char)c));
+        if (ext == ".lime" && m_modelingMode) {
+            m_modelingMode->loadLimeFile(path);
+        } else if (ext == ".glb" || ext == ".gltf") {
+            loadModel(path);
+        }
+        addRecentFile(path);
+    }
+
     void onInit() override {
         // Initialize NFD
         NFD_Init();
@@ -80,6 +173,11 @@ protected:
 
         // Initialize ImGui
         m_imguiManager.init(getContext(), getSwapchain(), getWindow().getHandle());
+
+        // Restore saved preferences (font scale + display toggles). Must be after
+        // ImGui init so FontScaleMain applies to the live style.
+        loadPrefs();
+        loadRecents();
 
         // Setup camera
         m_camera.setPosition(glm::vec3(3, 2, 5));
@@ -96,6 +194,8 @@ protected:
         // Create mode instances
         m_modelingMode = std::make_unique<ModelingMode>(*m_editorContext);
         m_animationMode = std::make_unique<AnimationMode>(*m_editorContext);
+        m_modelingMode->setNewBoneOffset(m_prefNewBoneOffset);       // apply persisted prefs
+        m_modelingMode->setAlwaysShowGizmo(m_prefAlwaysShowGizmo);
 
         // Start in modeling mode
         switchMode(EditorModeType::ModelingEditor);
@@ -307,6 +407,9 @@ protected:
     }
 
     void onCleanup() override {
+        // Persist preferences so the next launch matches how things were left.
+        savePrefs();
+
         // Stop AI generation thread (always try to join if joinable)
         m_aiGenerateCancelled = true;
         if (m_aiGenerateThread.joinable()) {
@@ -1834,16 +1937,31 @@ private:
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Open Model...", "Ctrl+O")) {
                     openModelDialog();
+                    if (m_editorContext) addRecentFile(m_editorContext->currentFilePath);
                 }
                 if (ImGui::MenuItem("Load OBJ...")) {
                     if (m_modelingMode) {
                         m_modelingMode->loadOBJFile();
+                        if (m_editorContext) addRecentFile(m_editorContext->currentFilePath);
                     }
                 }
                 if (ImGui::MenuItem("Load LIME...")) {
                     if (m_modelingMode) {
                         m_modelingMode->loadLimeFile();
+                        if (m_editorContext) addRecentFile(m_editorContext->currentFilePath);
                     }
+                }
+                if (ImGui::BeginMenu("Open Recent", !m_recentFiles.empty())) {
+                    std::string toOpen;
+                    for (const auto& p : m_recentFiles) {
+                        std::string label = std::filesystem::path(p).filename().string();
+                        if (ImGui::MenuItem(label.c_str())) toOpen = p;
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.c_str());
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Clear Recent")) { m_recentFiles.clear(); saveRecents(); }
+                    ImGui::EndMenu();
+                    if (!toOpen.empty()) openRecentFile(toOpen);  // open after menu closes
                 }
                 ImGui::Separator();
                 bool hasScene = m_modelingMode && m_editorContext && !m_editorContext->sceneObjects.empty();
@@ -1859,6 +1977,18 @@ private:
                 }
                 ImGui::Separator();
                 bool hasEditableMesh = m_modelingMode && m_editorContext && m_editorContext->editableMesh.isValid();
+                {
+                    bool canQuickSave = m_modelingMode && m_editorContext &&
+                                        (m_editorContext->editableMesh.isValid() || m_editorContext->selectedObject);
+                    std::string saveLabel = "Save";
+                    if (m_editorContext && !m_editorContext->currentFilePath.empty())
+                        saveLabel = "Save (" + std::filesystem::path(m_editorContext->currentFilePath).filename().string() + ")";
+                    if (ImGui::MenuItem(saveLabel.c_str(), "F5", false, canQuickSave)) {
+                        if (m_modelingMode) m_modelingMode->quickSave();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Save straight to the current file (no dialog).\nIf never saved, prompts once for a location.");
+                }
                 if (ImGui::MenuItem("Save as LIME...", "Ctrl+S", false, hasEditableMesh)) {
                     if (m_modelingMode) {
                         m_modelingMode->saveEditableMeshAsLime();
@@ -1997,6 +2127,15 @@ private:
                 ImGui::MenuItem("Camera", nullptr, &m_showCameraWindow);
                 ImGui::MenuItem("Image References", nullptr, &m_showImageRefWindow);
                 ImGui::MenuItem("Library", nullptr, &m_showLibraryWindow);
+                if (m_modelingMode) {
+                    ImGui::Separator();
+                    bool alwaysGizmo = m_modelingMode->getAlwaysShowGizmo();
+                    if (ImGui::MenuItem("Always Show Gizmo", nullptr, &alwaysGizmo)) {
+                        m_modelingMode->setAlwaysShowGizmo(alwaysGizmo);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Draw transform gizmos on top of geometry\nso they aren't hidden inside the model.");
+                }
                 ImGui::EndMenu();
             }
 
@@ -2004,6 +2143,39 @@ private:
                 if (ImGui::MenuItem("Auto-UV Cubes", "U")) {
                     autoUVSelectedObject();
                 }
+                ImGui::EndMenu();
+            }
+
+            if (ImGui::BeginMenu("Settings")) {
+                ImGuiStyle& style = ImGui::GetStyle();
+                // Edit a pending value; only COMMIT to style.FontScaleMain when the
+                // user finishes (Enter / slider release). Applying every frame during
+                // a drag rebuilds the global font atlas + reflows the whole UI each
+                // frame — that feedback loop is what makes the program jitter.
+                static float s_fontScale = style.FontScaleMain;
+                auto clampScale = [](float v) { return v < 0.5f ? 0.5f : (v > 3.0f ? 3.0f : v); };
+                auto commit = [&]() { s_fontScale = clampScale(s_fontScale); style.FontScaleMain = s_fontScale; savePrefs(); };
+
+                ImGui::TextDisabled("Interface");
+
+                // Text field — type an exact number, applied on Enter.
+                ImGui::SetNextItemWidth(120.0f);
+                if (ImGui::InputFloat("Font Size", &s_fontScale, 0.05f, 0.25f, "%.2f",
+                                      ImGuiInputTextFlags_EnterReturnsTrue)) {
+                    commit();
+                }
+
+                // Slider — applied only on release (not mid-drag), so no jitter.
+                ImGui::SetNextItemWidth(200.0f);
+                ImGui::SliderFloat("##fontscale", &s_fontScale, 0.5f, 3.0f, "%.2fx");
+                if (ImGui::IsItemDeactivatedAfterEdit()) commit();
+
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Apply")) commit();
+                ImGui::SameLine();
+                if (ImGui::SmallButton("1.0x")) { s_fontScale = 1.0f; commit(); }
+
+                ImGui::TextDisabled("Startup default: env LIME_UI_SCALE");
                 ImGui::EndMenu();
             }
 
@@ -4890,6 +5062,9 @@ private:
     glm::vec3 m_gizmoDragStartPos = glm::vec3(0.0f);
     glm::vec3 m_gizmoOriginalObjPos = glm::vec3(0.0f);  // Original object position for snap
     float m_gizmoSize = 0.4f;
+    float m_prefNewBoneOffset = 0.5f;  // persisted new-bone distance; applied to ModelingMode after creation
+    std::vector<std::string> m_recentFiles;  // Open Recent list (most-recent first), persisted to ~/.lime_recents
+    bool m_prefAlwaysShowGizmo = false;      // persisted "always show gizmo"; applied to ModelingMode after creation
     glm::vec3 m_gizmoOffset = glm::vec3(0.0f);
     bool m_gizmoLocalSpace = false;
 

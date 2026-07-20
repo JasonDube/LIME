@@ -7,6 +7,7 @@
 #include <imgui_impl_vulkan.h>
 #include <GLFW/glfw3.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace eden {
@@ -90,6 +91,18 @@ void ImGuiManager::init(VulkanContext& context, Swapchain& swapchain, GLFWwindow
     io.IniFilename = s_iniFilename.c_str();
 
     ImGui::StyleColorsDark();
+
+    // Scale the UI for readability (TV at couch distance); override with LIME_UI_SCALE
+    float uiScale = 1.5f;
+    if (const char* scaleEnv = std::getenv("LIME_UI_SCALE")) {
+        float v = std::strtof(scaleEnv, nullptr);
+        if (v >= 0.5f && v <= 4.0f) {
+            uiScale = v;
+        }
+    }
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(uiScale);
+    style.FontScaleMain = uiScale;
 
     // Initialize GLFW backend
     ImGui_ImplGlfw_InitForVulkan(window, true);

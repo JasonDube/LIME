@@ -3,9 +3,13 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <glm/gtc/quaternion.hpp>
+#include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 
 using namespace eden;
 
@@ -133,6 +137,94 @@ void ModelingMode::deleteKeyOnSelectedNearTime() {
     if (best < track.boneRotationsPerKey.size())
         track.boneRotationsPerKey.erase(track.boneRotationsPerKey.begin() + best);
     if (track.times.empty()) m_objectAnims.erase(found);
+}
+
+// Import a pose2anim *.limeanim.json (per-frame bone HEAD positions) onto the
+// selected rigged object. Rung 1 = positions only: boneRotationsPerKey is left
+// empty so playback takes the identity-rotation path and re-skins from bind pose.
+// Bones are matched to the current rig BY NAME (case-insensitive); unmatched rig
+// bones hold their current position so nothing collapses to the origin.
+// Precondition for *seeing* it play: Set Bind Pose on this object first.
+void ModelingMode::importBoneAnimationJSON(const std::string& path) {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) { std::cout << "[ImportAnim] No object selected\n"; return; }
+    if (!m_ctx.editableMesh.isValid() || !m_ctx.editableMesh.hasSkeleton()) {
+        std::cout << "[ImportAnim] Selected object has no skeleton — Load/Add a skeleton first\n";
+        return;
+    }
+
+    std::ifstream file(path);
+    if (!file.is_open()) { std::cout << "[ImportAnim] Could not open " << path << "\n"; return; }
+    nlohmann::json j;
+    try { file >> j; }
+    catch (const std::exception& e) { std::cout << "[ImportAnim] JSON parse error: " << e.what() << "\n"; return; }
+
+    if (!j.contains("frames") || !j.contains("skeleton_bones")) {
+        std::cout << "[ImportAnim] Not a LIMEANIM file (missing 'frames'/'skeleton_bones')\n";
+        return;
+    }
+
+    std::vector<std::string> animNames = j["skeleton_bones"].get<std::vector<std::string>>();
+    const Skeleton& skel = m_ctx.editableMesh.getSkeleton();
+    const size_t rigCount = skel.bones.size();
+
+    auto lower = [](std::string s) { for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c)); return s; };
+
+    // rig bone index -> column in the anim file (by name)
+    std::vector<int> rigToCol(rigCount, -1);
+    int matched = 0;
+    for (size_t b = 0; b < rigCount; ++b) {
+        std::string rn = lower(skel.bones[b].name);
+        for (size_t c = 0; c < animNames.size(); ++c) {
+            if (lower(animNames[c]) == rn) { rigToCol[b] = static_cast<int>(c); ++matched; break; }
+        }
+    }
+    if (matched == 0) {
+        std::cout << "[ImportAnim] No bone names matched between the anim file and the current rig\n";
+        return;
+    }
+
+    // Fallback positions for unmatched bones = current editor bone positions.
+    std::vector<glm::vec3> restPos = m_bonePositions;
+    if (restPos.size() != rigCount) restPos.assign(rigCount, glm::vec3(0.0f));
+
+    ObjectAnimTrack track;
+    const glm::vec3 tp = obj->getTransform().getPosition();
+    const glm::quat tr = obj->getTransform().getRotation();
+    const glm::vec3 ts = obj->getTransform().getScale();
+
+    for (const auto& jf : j["frames"]) {
+        float t = jf.value("time", 0.0f);
+        std::vector<glm::vec3> bones(rigCount, glm::vec3(0.0f));
+        const auto& bp = jf["bone_positions"];
+        for (size_t b = 0; b < rigCount; ++b) {
+            int c = rigToCol[b];
+            if (c >= 0 && c < static_cast<int>(bp.size()) && bp[c].size() >= 3) {
+                bones[b] = glm::vec3(bp[c][0].get<float>(), bp[c][1].get<float>(), bp[c][2].get<float>());
+            } else {
+                bones[b] = restPos[b];
+            }
+        }
+        track.times.push_back(t);
+        track.positions.push_back(tp);
+        track.rotations.push_back(tr);
+        track.scales.push_back(ts);
+        track.bonePositionsPerKey.push_back(std::move(bones));
+        track.boneRotationsPerKey.emplace_back();  // positions-only (Rung 1)
+    }
+
+    if (track.times.empty()) { std::cout << "[ImportAnim] File had no frames\n"; return; }
+
+    m_objectAnims[obj] = std::move(track);
+    m_timelineDuration = std::max(m_timelineDuration, m_objectAnims[obj].times.back());
+    m_timelineCurrentTime = 0.0f;
+    m_timelineLastAppliedTime = -1.0f;  // force re-apply on next tick
+
+    std::cout << "[ImportAnim] " << m_objectAnims[obj].times.size() << " keyframes, "
+              << matched << "/" << rigCount << " bones matched, duration "
+              << m_objectAnims[obj].times.back() << "s, from " << path << "\n";
+    if (!(m_hasBindPose && m_bindPoseOwner == obj))
+        std::cout << "[ImportAnim] NOTE: Set Bind Pose on this object to see the animation play/deform.\n";
 }
 
 void ModelingMode::jumpToPrevKey() {
@@ -304,8 +396,25 @@ void ModelingMode::applyAnimatedTransforms() {
         const bool slerpRots = haveRotsA && haveRotsB;
         if (m_boneWorldRotations.size() != bonesA.size())
             m_boneWorldRotations.assign(bonesA.size(), glm::quat(1, 0, 0, 0));
+        const bool haveBind = (m_bindPoseBonePositions.size() == m_bonePositions.size());
         for (size_t b = 0; b < bonesA.size(); ++b) {
             m_bonePositions[b] = glm::mix(bonesA[b], bonesB[b], u);
+
+            // Preserve bone length: lerping two joint positions between keys
+            // shortens the segment (the "smush"). Snap this bone's head back to
+            // its REST distance from its parent, keeping the interpolated
+            // direction. Parents have lower indices, so they're already fixed.
+            if (haveBind && b < skel.bones.size()) {
+                int lp = skel.bones[b].parentIndex;
+                if (lp >= 0 && lp < static_cast<int>(b)) {
+                    float restLen = glm::length(m_bindPoseBonePositions[b] - m_bindPoseBonePositions[lp]);
+                    glm::vec3 dir = m_bonePositions[b] - m_bonePositions[lp];
+                    float d = glm::length(dir);
+                    if (d > 1e-6f && restLen > 1e-6f)
+                        m_bonePositions[b] = m_bonePositions[lp] + dir * (restLen / d);
+                }
+            }
+
             if (slerpRots) {
                 glm::quat qa = track.boneRotationsPerKey[i0][b];
                 glm::quat qb = track.boneRotationsPerKey[i1][b];
@@ -324,6 +433,11 @@ void ModelingMode::applyAnimatedTransforms() {
                     glm::translate(glm::mat4(1.0f), m_bonePositions[b] - parentPos);
             }
         }
+
+        // IK feet: rebuild rigidly from the interpolated shin so they follow the
+        // leg instead of flailing (foot/heel/toe keyframes interpolate separately
+        // and disagree). Must run after the bone interp, before the reskin.
+        rederiveIKFeet();
 
         // Reskin from the bind pose; pushes new verts via updateModelBuffer.
         // No vertex snapshots; per-key memory is O(bones).

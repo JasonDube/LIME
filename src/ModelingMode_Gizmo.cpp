@@ -826,6 +826,9 @@ void ModelingMode::renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj) {
 
     glm::vec3 gizmoPos = getGizmoPosition();
     float size = m_ctx.gizmoSize;
+    // When "always show gizmo" is on, draw the gizmo lines with depth test OFF so
+    // they render on top of geometry instead of being hidden inside it.
+    const bool gizmoDepth = !m_alwaysShowGizmo;
 
     // Define axis colors
     glm::vec3 xColor = (m_ctx.gizmoHoveredAxis == GizmoAxis::X || m_ctx.gizmoActiveAxis == GizmoAxis::X)
@@ -916,22 +919,22 @@ void ModelingMode::renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj) {
         auto c1 = makeCircle(gizmoPos, sphereRadius, glm::vec3(1, 0, 0));
         auto c2 = makeCircle(gizmoPos, sphereRadius, glm::vec3(0, 1, 0));
         auto c3 = makeCircle(gizmoPos, sphereRadius, glm::vec3(0, 0, 1));
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, c1, sphereColor);
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, c2, sphereColor);
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, c3, sphereColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, c1, sphereColor, gizmoDepth);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, c2, sphereColor, gizmoDepth);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, c3, sphereColor, gizmoDepth);
         return;
     }
 
     if (isRotateMode) {
         // ROTATE MODE: Draw circles around each axis
         auto xCircle = makeCircleLines(gizmoPos, size * 0.9f, glm::vec3(1, 0, 0));
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, xCircle, xColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, xCircle, xColor, gizmoDepth);
 
         auto yCircle = makeCircleLines(gizmoPos, size * 0.9f, glm::vec3(0, 1, 0));
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, yCircle, yColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, yCircle, yColor, gizmoDepth);
 
         auto zCircle = makeCircleLines(gizmoPos, size * 0.9f, glm::vec3(0, 0, 1));
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, zCircle, zColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, zCircle, zColor, gizmoDepth);
     } else {
         // MOVE or SCALE MODE: Draw axis lines with arrows or cubes
 
@@ -958,7 +961,7 @@ void ModelingMode::renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj) {
             xLines.push_back(xEnd); xLines.push_back(arrowBase + xPerp2 * (size * 0.1f));
             xLines.push_back(xEnd); xLines.push_back(arrowBase - xPerp2 * (size * 0.1f));
         }
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, xLines, xColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, xLines, xColor, gizmoDepth);
 
         // Draw Y axis (green)
         glm::vec3 yEnd = gizmoPos + gizmoYAxis * size;
@@ -974,7 +977,7 @@ void ModelingMode::renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj) {
             yLines.push_back(yEnd); yLines.push_back(arrowBase + yPerp2 * (size * 0.1f));
             yLines.push_back(yEnd); yLines.push_back(arrowBase - yPerp2 * (size * 0.1f));
         }
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, yLines, yColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, yLines, yColor, gizmoDepth);
 
         // Draw Z axis (blue)
         glm::vec3 zEnd = gizmoPos + gizmoZAxis * size;
@@ -990,14 +993,14 @@ void ModelingMode::renderGizmo(VkCommandBuffer cmd, const glm::mat4& viewProj) {
             zLines.push_back(zEnd); zLines.push_back(arrowBase + zPerp2 * (size * 0.1f));
             zLines.push_back(zEnd); zLines.push_back(arrowBase - zPerp2 * (size * 0.1f));
         }
-        m_ctx.modelRenderer.renderLines(cmd, viewProj, zLines, zColor);
+        m_ctx.modelRenderer.renderLines(cmd, viewProj, zLines, zColor, gizmoDepth);
 
         // Draw center cube for uniform scale (only in scale mode)
         if (isScaleMode) {
             glm::vec3 uniformColor = (m_ctx.gizmoHoveredAxis == GizmoAxis::Uniform || m_ctx.gizmoActiveAxis == GizmoAxis::Uniform)
                                      ? glm::vec3(1.0f, 1.0f, 0.0f) : glm::vec3(0.9f, 0.9f, 0.9f);  // White / Yellow
             auto centerCubeLines = makeCubeLines(gizmoPos, cubeSize * 1.2f);
-            m_ctx.modelRenderer.renderLines(cmd, viewProj, centerCubeLines, uniformColor);
+            m_ctx.modelRenderer.renderLines(cmd, viewProj, centerCubeLines, uniformColor, gizmoDepth);
         }
     }
 }

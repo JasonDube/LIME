@@ -10,6 +10,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <queue>
 #include <set>
 #include <map>
@@ -61,6 +62,19 @@ static std::vector<unsigned char> limes_base64_decode(const std::string& encoded
     return ret;
 }
 
+
+// Put the next button on the current line only if it fits within the panel
+// width; otherwise let it fall to a new line. Call in place of ImGui::SameLine()
+// *before* a button, passing that button's label so its width can be measured.
+// This makes a row of buttons wrap instead of running off the right edge.
+static void sameLineIfButtonFits(const char* nextLabel) {
+    ImGuiStyle& st = ImGui::GetStyle();
+    float nextW = ImGui::CalcTextSize(nextLabel).x + st.FramePadding.x * 2.0f;
+    float lastRight = ImGui::GetItemRectMax().x;
+    float regionRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+    if (lastRight + st.ItemSpacing.x + nextW <= regionRight)
+        ImGui::SameLine();
+}
 
 // Debug flag for wireframe rendering (reset when mesh is rebuilt)
 static bool g_wireframeDebugPrinted = false;
@@ -164,22 +178,30 @@ void ModelingMode::update(float deltaTime) {
         m_timelineLastAppliedTime = m_timelineCurrentTime;
     }
 
-    // Weight heatmap: re-push the mesh when the toggle flips, the selected
-    // bone changes, or somebody invalidated it (e.g. weight slider edit).
+    // Process deferred mesh updates FIRST (must happen before rendering, not
+    // during). updateMeshFromEditable() rebuilds the GPU buffer with base vertex
+    // colors, so it must run before the heatmap re-push below — otherwise a
+    // rebuild would wipe the heatmap even though it's still enabled.
+    bool meshWasRebuilt = false;
+    if (m_ctx.meshDirty) {
+        invalidateWireframeCache();
+        updateMeshFromEditable();
+        meshWasRebuilt = true;
+    }
+
+    // Weight heatmap: keep it applied until the user turns it off. Re-push when
+    // the toggle flips, the selected bone changes, someone invalidated it (e.g.
+    // weight slider edit), OR the mesh buffer was just rebuilt with base colors.
+    // The rebuild case is what previously made the heatmap "turn off" on any edit.
     if (m_riggingMode && m_ctx.selectedObject) {
         bool needPush = m_heatMapDirty ||
-                        (m_showWeightHeatMap && m_selectedBone != m_lastHeatMapBone);
+                        (m_showWeightHeatMap && m_selectedBone != m_lastHeatMapBone) ||
+                        (m_showWeightHeatMap && meshWasRebuilt);
         if (needPush) {
             pushMeshWithHeatMap();
             m_lastHeatMapBone = m_selectedBone;
             m_heatMapDirty = false;
         }
-    }
-
-    // Process deferred mesh updates (must happen before rendering, not during)
-    if (m_ctx.meshDirty) {
-        invalidateWireframeCache();
-        updateMeshFromEditable();
     }
 
     // Process deferred clone image deletions (must happen before ImGui rendering)
@@ -979,6 +1001,42 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
     if (m_riggingMode && m_showSkeleton) {
         drawSkeletonOverlay(vpX, vpY, vpW, vpH);
     }
+
+    // Rigging: red dots on every vertex influenced (weight > 0) by the selected
+    // bone. Additive overlay on top of the skin weight map. Front-facing only.
+    if (m_riggingMode && m_showInfluenceHighlight && m_selectedBone >= 0 &&
+        m_ctx.editableMesh.isValid() && m_ctx.selectedObject) {
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        dl->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+        glm::mat4 view = activeCamera.getViewMatrix();
+        glm::mat4 proj = activeCamera.getProjectionMatrix(vpW / vpH);
+        glm::mat4 vp2 = proj * view;
+        glm::mat4 mdl = m_ctx.selectedObject->getTransform().getMatrix();
+        glm::vec3 camP = activeCamera.getPosition();
+        const int bone = m_selectedBone;
+        const ImU32 red = IM_COL32(255, 30, 30, 255);
+        for (uint32_t vi = 0; vi < m_ctx.editableMesh.getVertexCount(); ++vi) {
+            const auto& v = m_ctx.editableMesh.getVertex(vi);
+            float w = 0.0f;
+            for (int j = 0; j < 4; ++j) {
+                if (v.boneIndices[j] == bone) { w = v.boneWeights[j]; break; }
+            }
+            if (w <= 0.0f) continue;  // not influenced by this bone
+            glm::vec3 wp = glm::vec3(mdl * glm::vec4(v.position, 1.0f));
+            glm::vec3 vn = v.normal;
+            if (glm::length(vn) > 0.001f && glm::dot(vn, camP - wp) < 0.0f) continue;  // backface cull
+            glm::vec4 clip = vp2 * glm::vec4(wp, 1.0f);
+            if (clip.w <= 0.0f) continue;
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            ImVec2 sp(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+            if (sp.x < vpX || sp.x > vpX + vpW || sp.y < vpY || sp.y > vpY + vpH) continue;
+            dl->AddCircleFilled(sp, 3.5f, red);
+        }
+        dl->PopClipRect();
+    }
+
+    // Leg-IK foot goals (green square handles)
+    if (m_riggingMode) drawIKGoalsOverlay(vpX, vpY, vpW, vpH);
 }
 
 void ModelingMode::renderModelingEditorUI() {
@@ -2036,6 +2094,13 @@ void ModelingMode::renderModelingEditorUI() {
                                       "(blue 0 -> green 0.5 -> red 1).");
                 }
 
+                ImGui::Checkbox("Influenced Verts (red dots)", &m_showInfluenceHighlight);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Draw a red dot on every VERTEX the selected bone\n"
+                                      "influences at all (weight > 0). Overlaid on top of\n"
+                                      "the weight map — front-facing verts only.");
+                }
+
                 ImGui::SameLine();
                 ImGui::Checkbox("Weight Paint", &m_weightPaintMode);
                 if (ImGui::IsItemHovered()) {
@@ -2054,9 +2119,75 @@ void ModelingMode::renderModelingEditorUI() {
                 }
                 ImGui::TextDisabled("Tip: drag a bone joint dot for camera-plane move; gizmo arrows stay world-axis.");
 
+                // --- Two-bone leg IK ---
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Leg IK");
+                ImGui::Checkbox("Enable Leg IK", &m_ikEnabled);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Planted feet stay put while you move the pelvis/hips —\n"
+                                      "the knees bend to keep the feet on their goals.\n"
+                                      "Requires Set Bind Pose.");
+                }
+                if (ImGui::Button("Add IK Leg (from selected foot bone)")) {
+                    addIKLegFromSelected();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Select the FOOT/ankle bone first. Walks up two parents\n"
+                                      "(shin, thigh) to build the leg. The foot goal is planted\n"
+                                      "at the current ankle; drag the green square to move it.");
+                }
+                for (size_t li = 0; li < m_ikLegs.size(); ++li) {
+                    ImGui::PushID(static_cast<int>(li));
+                    IKLeg& leg = m_ikLegs[li];
+                    const char* fname = (leg.foot >= 0 && leg.foot < numBones)
+                                        ? skel.bones[leg.foot].name.c_str() : "?";
+                    ImGui::Checkbox("##legact", &leg.active);
+                    ImGui::SameLine();
+                    ImGui::Text("Leg %zu: %s", li, fname);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Re-plant")) {
+                        if (leg.foot >= 0 && leg.foot < static_cast<int>(m_bonePositions.size()))
+                            leg.goal = m_bonePositions[leg.foot];
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move the foot goal to the foot's current position");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Remove")) {
+                        m_ikLegs.erase(m_ikLegs.begin() + li);
+                        ImGui::PopID();
+                        break;
+                    }
+                    // Hinge lock: knee only bends one way (no inversion) — enables kicks.
+                    ImGui::Indent(20.0f);
+                    if (ImGui::Checkbox("Lock Knee (hinge)", &leg.lockKnee)) {
+                        leg.hingeValid = false;  // recapture the bend plane from the current pose
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Lock the knee to a hinge so it can't bend backward.\n"
+                                          "Capture it from a good bent pose, then kick freely.\n"
+                                          "Toggle off+on to re-capture the bend direction.");
+                    ImGui::SetNextItemWidth(140.0f);
+                    ImGui::SliderFloat("Foot Pitch", &leg.footPitch, -90.0f, 90.0f, "%.0f deg");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Rotate the foot at the ankle: + points the toes up\n"
+                                          "(kick), - points them down (stomp/point).");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("0##fp")) leg.footPitch = 0.0f;
+                    ImGui::Unindent(20.0f);
+                    ImGui::PopID();
+                }
+
+                // New-bone placement distance from the selected (parent) bone.
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::InputFloat("New Bone Dist", &m_newBoneOffset, 0.01f, 0.1f, "%.3f");
+                if (m_newBoneOffset < 0.0f) m_newBoneOffset = 0.0f;
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How far a new bone is placed from its parent\n"
+                                      "(Add Bone, and Insert Bone on a leaf).");
+                }
+
                 // Add bone
                 ImGui::InputText("##bonename", m_newBoneName, sizeof(m_newBoneName));
-                ImGui::SameLine();
+                sameLineIfButtonFits("Add Bone");
                 if (ImGui::Button("Add Bone")) {
                     m_ctx.editableMesh.saveState();
                     Bone newBone;
@@ -2068,7 +2199,7 @@ void ModelingMode::renderModelingEditorUI() {
                     // Add default position at origin (or near parent)
                     glm::vec3 pos(0.0f);
                     if (m_selectedBone >= 0 && m_selectedBone < static_cast<int>(m_bonePositions.size())) {
-                        pos = m_bonePositions[m_selectedBone] + glm::vec3(0.0f, 0.5f, 0.0f);
+                        pos = m_bonePositions[m_selectedBone] + glm::vec3(0.0f, m_newBoneOffset, 0.0f);
                     }
                     m_bonePositions.push_back(pos);
                     if (!m_boneWorldRotations.empty() || m_hasBindPose) {
@@ -2080,7 +2211,7 @@ void ModelingMode::renderModelingEditorUI() {
                     m_ctx.meshDirty = true;
                     invalidateWireframeCache();
                 }
-                ImGui::SameLine();
+                sameLineIfButtonFits("Insert Bone");
                 if (ImGui::Button("Insert Bone")) {
                     // Inserts a new bone between the selected bone and its
                     // existing children. Result for chain A -> B with A
@@ -2103,7 +2234,7 @@ void ModelingMode::renderModelingEditorUI() {
                             childAvg /= static_cast<float>(children.size());
                             newPos = (m_bonePositions[m_selectedBone] + childAvg) * 0.5f;
                         } else {
-                            newPos = m_bonePositions[m_selectedBone] + glm::vec3(0.0f, 0.5f, 0.0f);
+                            newPos = m_bonePositions[m_selectedBone] + glm::vec3(0.0f, m_newBoneOffset, 0.0f);
                         }
 
                         Bone newBone;
@@ -2132,7 +2263,7 @@ void ModelingMode::renderModelingEditorUI() {
                                       "If the selected bone is a leaf, behaves like Add Bone.");
                 }
 
-                ImGui::SameLine();
+                sameLineIfButtonFits("Load Skeleton");
                 if (ImGui::Button("Load Skeleton")) {
                     nfdchar_t* outPath = nullptr;
                     nfdfilteritem_t filters[1] = {{"Skeleton", "limesk"}};
@@ -2415,6 +2546,19 @@ void ModelingMode::renderModelingEditorUI() {
                         ImGui::SetTooltip("Capture current verts + bones as the rest pose. After this,\nbone moves re-skin the mesh instead of baking into vertices.\nRequired before keying animation for skinned GLB export.");
                     }
 
+                    // Full flush back to bind — clears animation + any stuck pose.
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.3f, 0.15f, 1.0f));
+                    if (ImGui::Button("Reset to Bind")) {
+                        resetToBindPose();
+                    }
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("FLUSH: clears this object's animation (all keys) AND snaps the\n"
+                                          "bones + mesh back to the bind pose. Use when deleting keys\n"
+                                          "leaves the pose stuck. Does not remove the skeleton/weights.");
+                    }
+
                     ImGui::SameLine();
                     if (ImGui::Button("Clear Weights")) {
                         m_ctx.editableMesh.saveState();
@@ -2456,12 +2600,26 @@ void ModelingMode::renderModelingEditorUI() {
                         }
                     }
 
-                    ImGui::SameLine();
+                    sameLineIfButtonFits("Export Skinned GLB");
                     if (ImGui::Button("Export Skinned GLB")) {
                         exportSkinnedAnimatedGLB();
                     }
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Save mesh + skeleton + weights + keyframed animation\nas a GLB the engine can play with GPU skinning.\nRequires Set Bind Pose + at least one keyframe.");
+                    }
+
+                    // pose2anim: load a video-derived bone animation onto this rig.
+                    sameLineIfButtonFits("Import Anim (JSON)");
+                    if (ImGui::Button("Import Anim (JSON)")) {
+                        nfdchar_t* outPath = nullptr;
+                        nfdfilteritem_t filters[2] = {{"LIME animation", "limeanim.json"}, {"JSON", "json"}};
+                        if (NFD_OpenDialog(&outPath, filters, 2, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
+                            importBoneAnimationJSON(outPath);
+                            NFD_FreePath(outPath);
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Load a pose2anim *.limeanim.json (per-frame bone positions\nderived from a video) onto this rig. Bones matched by name.\nSet Bind Pose first to see it deform. Rung 1: positions only.");
                     }
                 }
 
@@ -2641,7 +2799,8 @@ void ModelingMode::renderModelingEditorUI() {
                     // Switch to component mode with vertex selection + wireframe visible
                     m_ctx.objectMode = false;
                     m_ctx.modelingSelectionMode = ModelingSelectionMode::Vertex;
-                    m_ctx.showModelingWireframe = true;
+                    // Respect the user's wireframe choice — do NOT force it on here.
+                    // (Restored on exit via m_preRiggingShowWireframe regardless.)
                     // Sync bone positions from existing skeleton.
                     // localTransform is relative to parent — taking [3] alone collapses
                     // a hierarchical skeleton into a vertical stack. Use inverse(IBM) for
@@ -6228,8 +6387,57 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
     // Gizmo arrow drags stay world-axis-locked — picking the interaction
     // target chooses the constraint, no checkbox.
     // Disabled while weight painting so LMB drags don't move bones around.
-    if (m_riggingMode && !m_placingBone && !m_ctx.gizmoDragging && !mouseOverImGui &&
-        !m_weightPaintMode && m_ctx.gizmoHoveredAxis == GizmoAxis::None) {
+    // Only let a hovered gizmo axis block bone picking when a gizmo is ACTUALLY
+    // active. In Select mode (gizmoMode==None) the gizmo isn't drawn and
+    // gizmoHoveredAxis is never refreshed — it can hold a stale non-None axis
+    // from the last Move/Rotate/Scale use, which would silently block all bone
+    // selection in 3D. (This was the "can't select bones in Q mode" bug.)
+    // --- Leg-IK handle dragging (foot goal = green, knee pole = blue). Takes
+    //     priority over bone picking. Pole is picked first so it's grabbable
+    //     even when it overlaps the goal. ---
+    if (m_riggingMode && m_ikEnabled && !m_placingBone && !m_ctx.gizmoDragging &&
+        !mouseOverImGui && !m_weightPaintMode) {
+        if (m_ikDragLeg < 0 && Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
+            glm::vec2 mp = Input::getMousePosition();
+            int poleLeg = pickIKPoleAtScreenPos(mp);
+            int goalLeg = pickIKGoalAtScreenPos(mp);
+            int leg = (poleLeg >= 0) ? poleLeg : goalLeg;
+            bool isPole = (poleLeg >= 0);
+            if (leg >= 0 && m_ctx.selectedObject) {
+                m_ikDragLeg = leg;
+                m_ikDragIsPole = isPole;
+                m_ctx.editableMesh.saveState();
+                glm::vec3 rayO, rayD; m_ctx.getMouseRay(rayO, rayD);
+                m_ikDragPlaneNormal = m_ctx.getActiveCamera().getFront();
+                glm::vec3 handleLocal = isPole ? m_ikLegs[leg].pole : m_ikLegs[leg].goal;
+                glm::vec3 handleW = glm::vec3(m_ctx.selectedObject->getTransform().getMatrix() * glm::vec4(handleLocal, 1.0f));
+                float denom = glm::dot(rayD, m_ikDragPlaneNormal);
+                m_ikDragPrevPoint = (std::abs(denom) > 1e-4f)
+                    ? rayO + rayD * (glm::dot(handleW - rayO, m_ikDragPlaneNormal) / denom) : handleW;
+            }
+        }
+        if (m_ikDragLeg >= 0 && Input::isMouseButtonDown(Input::MOUSE_LEFT) && m_ctx.selectedObject) {
+            glm::vec3 rayO, rayD; m_ctx.getMouseRay(rayO, rayD);
+            float denom = glm::dot(rayD, m_ikDragPlaneNormal);
+            if (std::abs(denom) > 1e-4f) {
+                glm::vec3 cur = rayO + rayD * (glm::dot(m_ikDragPrevPoint - rayO, m_ikDragPlaneNormal) / denom);
+                glm::vec3 worldDelta = cur - m_ikDragPrevPoint;
+                if (glm::length(worldDelta) > 1e-6f) {
+                    glm::mat4 invModel = glm::inverse(m_ctx.selectedObject->getTransform().getMatrix());
+                    glm::vec3 localDelta = glm::vec3(invModel * glm::vec4(worldDelta, 0.0f));
+                    if (m_ikDragIsPole) m_ikLegs[m_ikDragLeg].pole += localDelta;
+                    else                m_ikLegs[m_ikDragLeg].goal += localDelta;
+                    m_ikDragPrevPoint = cur;
+                }
+            }
+        }
+        if (m_ikDragLeg >= 0 && !Input::isMouseButtonDown(Input::MOUSE_LEFT)) m_ikDragLeg = -1;
+    }
+
+    bool gizmoAxisBlocking = (m_ctx.gizmoMode != GizmoMode::None &&
+                              m_ctx.gizmoHoveredAxis != GizmoAxis::None);
+    if (m_riggingMode && m_ikDragLeg < 0 && !m_placingBone && !m_ctx.gizmoDragging && !mouseOverImGui &&
+        !m_weightPaintMode && !gizmoAxisBlocking) {
         glm::vec2 mousePos = Input::getMousePosition();
 
         if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
@@ -6318,6 +6526,20 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
             m_riggingBoneDragIdx = -1;
             m_riggingDragWeightedVerts.clear();
         }
+    }
+
+    // Leg IK: re-solve so planted feet stay put and knees bend. But ONLY while
+    // authoring — i.e. actively dragging a handle/bone/gizmo, or when the object
+    // isn't animated. During timeline playback/scrub the KEYFRAMES own the pose;
+    // solving here would fight the animation (snap the leg to the static goal on
+    // scrubber release, thrash the foot mid-blend).
+    if (m_riggingMode && m_ikEnabled) {
+        bool manipulating = (m_ikDragLeg >= 0) || (m_riggingBoneDragIdx >= 0) || m_ctx.gizmoDragging;
+        bool hasKeys = m_ctx.selectedObject &&
+                       m_objectAnims.count(m_ctx.selectedObject) &&
+                       !m_objectAnims[m_ctx.selectedObject].times.empty();
+        if (manipulating || (!hasKeys && !m_timelinePlaying))
+            solveIKLegs();
     }
 
     // Patch Blanket: Shift+drag rectangle to define patch region
@@ -7501,7 +7723,11 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         bool ctrlHeld = Input::isKeyDown(Input::KEY_LEFT_CONTROL) || Input::isKeyDown(Input::KEY_RIGHT_CONTROL);
 
         // Normal selection mode - click for point select, drag for rectangle select
-        if (m_ctx.selectionTool == SelectionTool::Normal && !m_ctx.isPainting && !m_patchBlanketMode && !m_weightPaintMode) {
+        // Don't start a selection rectangle while dragging a rig handle (IK
+        // goal/pole) or a bone — that LMB press is a manipulation, not a marquee.
+        bool draggingRigHandle = (m_ikDragLeg >= 0) || (m_riggingBoneDragIdx >= 0);
+        if (m_ctx.selectionTool == SelectionTool::Normal && !m_ctx.isPainting && !m_patchBlanketMode &&
+            !m_weightPaintMode && !draggingRigHandle) {
             if (Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
                 // Start tracking for potential rectangle selection
                 m_ctx.isRectSelecting = true;
@@ -9615,12 +9841,210 @@ void ModelingMode::saveEditableMeshAsLime() {
             scale = m_ctx.selectedObject->getTransform().getScale();
         }
 
-        if (m_ctx.editableMesh.saveLime(filepath, texData, texWidth, texHeight, position, rotation, scale)) {
-            std::cout << "Saved LIME to: " << filepath << std::endl;
+        std::string rigBlob = serializeRigRuntime(m_ctx.selectedObject);
+        if (m_ctx.editableMesh.saveLime(filepath, texData, texWidth, texHeight, position, rotation, scale, rigBlob)) {
+            std::cout << "Saved LIME to: " << filepath
+                      << (rigBlob.empty() ? "" : " (with rig + animation)") << std::endl;
+            m_ctx.currentFilePath = filepath;   // remember for quicksave (F5 / Save)
+            m_ctx.currentFileFormat = 2;         // LIME
         } else {
             std::cerr << "Failed to save LIME: " << filepath << std::endl;
         }
     }
+}
+
+// Serialize bind pose + keyframes for `obj` into a text blob embedded in .lime.
+// (Skeleton + weights are already saved by EditableMesh::saveLime v3.0.)
+std::string ModelingMode::serializeRigRuntime(SceneObject* obj) {
+    if (!obj) return "";
+    bool hasBP = (m_hasBindPose && m_bindPoseOwner == obj);
+    auto animIt = m_objectAnims.find(obj);
+    bool hasAnim = (animIt != m_objectAnims.end() && !animIt->second.times.empty());
+    bool hasBonePos = (obj == m_ctx.selectedObject) && !m_bonePositions.empty();
+    bool hasIK = (obj == m_ctx.selectedObject) && !m_ikLegs.empty();
+    if (!hasBP && !hasAnim && !hasBonePos && !hasIK) return "";
+
+    std::ostringstream o;
+    o << "version 1\n";
+
+    // Editor bone head positions
+    o << "bonepos " << (hasBonePos ? m_bonePositions.size() : 0) << "\n";
+    if (hasBonePos)
+        for (const auto& p : m_bonePositions) o << p.x << " " << p.y << " " << p.z << "\n";
+
+    // Bind pose
+    o << "bindpose " << (hasBP ? 1 : 0) << "\n";
+    if (hasBP) {
+        o << "bpverts " << m_bindPoseVerts.size() << "\n";
+        for (const auto& p : m_bindPoseVerts) o << p.x << " " << p.y << " " << p.z << "\n";
+        o << "bpbonepos " << m_bindPoseBonePositions.size() << "\n";
+        for (const auto& p : m_bindPoseBonePositions) o << p.x << " " << p.y << " " << p.z << "\n";
+        o << "bpbonerot " << m_bindPoseBoneRotations.size() << "\n";
+        for (const auto& q : m_bindPoseBoneRotations) o << q.w << " " << q.x << " " << q.y << " " << q.z << "\n";
+    }
+
+    // Animation keyframes
+    if (hasAnim) {
+        const ObjectAnimTrack& t = animIt->second;
+        size_t K = t.times.size();
+        o << "anim " << K << "\n";
+        for (size_t k = 0; k < K; ++k) {
+            o << "key " << t.times[k] << "\n";
+            const glm::vec3& p = t.positions[k];
+            const glm::quat& r = t.rotations[k];
+            const glm::vec3& s = t.scales[k];
+            o << "tp " << p.x << " " << p.y << " " << p.z << "\n";
+            o << "tr " << r.w << " " << r.x << " " << r.y << " " << r.z << "\n";
+            o << "ts " << s.x << " " << s.y << " " << s.z << "\n";
+            size_t nbp = (k < t.bonePositionsPerKey.size()) ? t.bonePositionsPerKey[k].size() : 0;
+            o << "kbonepos " << nbp << "\n";
+            for (size_t b = 0; b < nbp; ++b) {
+                const auto& v = t.bonePositionsPerKey[k][b];
+                o << v.x << " " << v.y << " " << v.z << "\n";
+            }
+            size_t nbr = (k < t.boneRotationsPerKey.size()) ? t.boneRotationsPerKey[k].size() : 0;
+            o << "kbonerot " << nbr << "\n";
+            for (size_t b = 0; b < nbr; ++b) {
+                const auto& q = t.boneRotationsPerKey[k][b];
+                o << q.w << " " << q.x << " " << q.y << " " << q.z << "\n";
+            }
+        }
+    } else {
+        o << "anim 0\n";
+    }
+
+    // Leg IK: enable flag + one line per leg (bones | foot goal | knee pole).
+    o << "ikenabled " << (m_ikEnabled ? 1 : 0) << "\n";
+    o << "iklegs " << (hasIK ? m_ikLegs.size() : 0) << "\n";
+    if (hasIK) {
+        for (const IKLeg& leg : m_ikLegs) {
+            o << "ikleg " << leg.thigh << " " << leg.shin << " " << leg.foot << " " << (leg.active ? 1 : 0)
+              << " | " << leg.goal.x << " " << leg.goal.y << " " << leg.goal.z
+              << " | " << leg.pole.x << " " << leg.pole.y << " " << leg.pole.z << "\n";
+        }
+        // Knee-lock flags + foot pitch on separate optional lines (backward compatible).
+        o << "iklocks " << m_ikLegs.size() << "\n";
+        for (const IKLeg& leg : m_ikLegs) o << (leg.lockKnee ? 1 : 0) << "\n";
+        o << "ikfootpitch " << m_ikLegs.size() << "\n";
+        for (const IKLeg& leg : m_ikLegs) o << leg.footPitch << "\n";
+    }
+    return o.str();
+}
+
+// Restore bind pose + keyframes from a .lime rig blob onto `obj`.
+void ModelingMode::deserializeRigRuntime(const std::string& blob, SceneObject* obj) {
+    // Always reset IK on load — legs reference this object's bone indices.
+    m_ikLegs.clear();
+    m_ikEnabled = false;
+    m_ikDragLeg = -1;
+    if (blob.empty() || !obj) return;
+    std::istringstream in(blob);
+    std::string tok;
+    int ver = 0;
+    in >> tok >> ver;  // "version 1"
+    if (tok != "version") return;
+
+    // Editor bone head positions
+    size_t n = 0;
+    in >> tok >> n;  // "bonepos N"
+    if (tok == "bonepos" && n > 0) {
+        m_bonePositions.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            in >> m_bonePositions[i].x >> m_bonePositions[i].y >> m_bonePositions[i].z;
+    }
+
+    // Bind pose
+    int hasBP = 0;
+    in >> tok >> hasBP;  // "bindpose 0|1"
+    if (tok == "bindpose" && hasBP) {
+        in >> tok >> n;  // bpverts
+        m_bindPoseVerts.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            in >> m_bindPoseVerts[i].x >> m_bindPoseVerts[i].y >> m_bindPoseVerts[i].z;
+        in >> tok >> n;  // bpbonepos
+        m_bindPoseBonePositions.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            in >> m_bindPoseBonePositions[i].x >> m_bindPoseBonePositions[i].y >> m_bindPoseBonePositions[i].z;
+        in >> tok >> n;  // bpbonerot
+        m_bindPoseBoneRotations.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            in >> m_bindPoseBoneRotations[i].w >> m_bindPoseBoneRotations[i].x
+               >> m_bindPoseBoneRotations[i].y >> m_bindPoseBoneRotations[i].z;
+        m_hasBindPose = true;
+        m_bindPoseOwner = obj;
+        m_boneWorldRotations.assign(m_bindPoseBonePositions.size(), glm::quat(1, 0, 0, 0));
+    }
+
+    // Animation keyframes
+    size_t K = 0;
+    in >> tok >> K;  // "anim K"
+    if (tok == "anim" && K > 0) {
+        ObjectAnimTrack t;
+        for (size_t k = 0; k < K; ++k) {
+            float time = 0.0f;
+            in >> tok >> time;  // "key <time>"
+            t.times.push_back(time);
+            glm::vec3 p, s; glm::quat r;
+            in >> tok >> p.x >> p.y >> p.z;                 // tp
+            in >> tok >> r.w >> r.x >> r.y >> r.z;          // tr
+            in >> tok >> s.x >> s.y >> s.z;                 // ts
+            t.positions.push_back(p);
+            t.rotations.push_back(r);
+            t.scales.push_back(s);
+            size_t nbp = 0; in >> tok >> nbp;               // kbonepos
+            std::vector<glm::vec3> bposes(nbp);
+            for (size_t b = 0; b < nbp; ++b) in >> bposes[b].x >> bposes[b].y >> bposes[b].z;
+            t.bonePositionsPerKey.push_back(std::move(bposes));
+            size_t nbr = 0; in >> tok >> nbr;               // kbonerot
+            std::vector<glm::quat> brots(nbr);
+            for (size_t b = 0; b < nbr; ++b) in >> brots[b].w >> brots[b].x >> brots[b].y >> brots[b].z;
+            t.boneRotationsPerKey.push_back(std::move(brots));
+        }
+        m_objectAnims[obj] = std::move(t);
+        if (!m_objectAnims[obj].times.empty())
+            m_timelineDuration = std::max(m_timelineDuration, m_objectAnims[obj].times.back());
+    }
+
+    // Leg IK (optional — absent in older .lime files, handled by the stream check).
+    tok.clear();
+    if ((in >> tok) && tok == "ikenabled") {
+        int ikEn = 0; in >> ikEn;
+        m_ikEnabled = (ikEn != 0);
+        size_t nlegs = 0;
+        in >> tok >> nlegs;  // "iklegs N"
+        if (tok == "iklegs") {
+            for (size_t i = 0; i < nlegs; ++i) {
+                IKLeg leg; int act = 1; std::string bar;
+                in >> tok  // "ikleg"
+                   >> leg.thigh >> leg.shin >> leg.foot >> act >> bar
+                   >> leg.goal.x >> leg.goal.y >> leg.goal.z >> bar
+                   >> leg.pole.x >> leg.pole.y >> leg.pole.z;
+                leg.active = (act != 0);
+                m_ikLegs.push_back(leg);
+            }
+            // Optional knee-lock flags (absent in older IK blobs).
+            tok.clear();
+            if ((in >> tok) && tok == "iklocks") {
+                size_t nlk = 0; in >> nlk;
+                for (size_t i = 0; i < nlk; ++i) {
+                    int lk = 0; in >> lk;
+                    if (i < m_ikLegs.size()) { m_ikLegs[i].lockKnee = (lk != 0); m_ikLegs[i].hingeValid = false; }
+                }
+            }
+            // Optional foot-pitch angles.
+            tok.clear();
+            if ((in >> tok) && tok == "ikfootpitch") {
+                size_t nfp = 0; in >> nfp;
+                for (size_t i = 0; i < nfp; ++i) {
+                    float fp = 0.0f; in >> fp;
+                    if (i < m_ikLegs.size()) m_ikLegs[i].footPitch = fp;
+                }
+            }
+        }
+    }
+
+    std::cout << "[Rig] Restored bind pose + " << K << " keyframes + "
+              << m_ikLegs.size() << " IK legs from .lime" << std::endl;
 }
 
 void ModelingMode::exportTextureAsPNG() {
@@ -9658,15 +10082,17 @@ void ModelingMode::exportTextureAsPNG() {
     }
 }
 
-void ModelingMode::loadLimeFile() {
-    nfdchar_t* outPath = nullptr;
-    nfdfilteritem_t filters[1] = {{"LIME Model", "lime"}};
-    nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath));
-
-    if (result == NFD_OKAY) {
-        std::string filepath = outPath;
+void ModelingMode::loadLimeFile(const std::string& pathArg) {
+    std::string filepath = pathArg;
+    if (filepath.empty()) {
+        nfdchar_t* outPath = nullptr;
+        nfdfilteritem_t filters[1] = {{"LIME Model", "lime"}};
+        nfdresult_t result = NFD_OpenDialog(&outPath, filters, 1, nfdDefaultDir(m_ctx.projectPath));
+        if (result != NFD_OKAY) return;
+        filepath = outPath;
         NFD_FreePath(outPath);
-
+    }
+    {
         std::vector<unsigned char> textureData;
         int texWidth = 0, texHeight = 0;
         glm::vec3 position(0.0f);
@@ -9750,6 +10176,10 @@ void ModelingMode::loadLimeFile() {
             m_ctx.selectedObject = obj.get();
             m_ctx.sceneObjects.push_back(std::move(obj));
 
+            // Restore bind pose + keyframes (skeleton + weights already loaded by
+            // loadLime). No-op if the file has no rig blob (older / unrigged .lime).
+            deserializeRigRuntime(m_ctx.editableMesh.getLoadedRigRuntime(), m_ctx.selectedObject);
+
             // Update faceToTriangles mapping
             m_ctx.faceToTriangles.clear();
             uint32_t triIndex = 0;
@@ -9783,7 +10213,10 @@ void ModelingMode::loadLimeFile() {
 
 void ModelingMode::quickSave() {
     if (m_ctx.currentFilePath.empty() || m_ctx.currentFileFormat == 0) {
-        std::cout << "No file loaded - use Save As instead" << std::endl;
+        // Never saved yet — prompt once via Save As; that sets the path so all
+        // subsequent quicksaves write straight to the file with no dialog.
+        std::cout << "[Save] No current file — opening Save As" << std::endl;
+        saveEditableMeshAsLime();
         return;
     }
 
@@ -9818,7 +10251,8 @@ void ModelingMode::quickSave() {
                 scale = m_ctx.selectedObject->getTransform().getScale();
             }
 
-            success = m_ctx.editableMesh.saveLime(filepath, texData, texWidth, texHeight, position, rotation, scale);
+            success = m_ctx.editableMesh.saveLime(filepath, texData, texWidth, texHeight, position, rotation, scale,
+                                                  serializeRigRuntime(m_ctx.selectedObject));
             break;
         }
         case 3: {  // GLB
