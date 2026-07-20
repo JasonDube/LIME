@@ -434,10 +434,41 @@ void ModelingMode::applyAnimatedTransforms() {
             }
         }
 
+        // Per-key foot pitch: interpolate each leg's LOCAL foot rotation (foot
+        // relative to shin) from the keyframes so the ankle angle can animate.
+        m_ikHaveLocalFoot = false;
+        if (slerpRots && !m_ikLegs.empty() &&
+            i0 < track.boneRotationsPerKey.size() && i1 < track.boneRotationsPerKey.size()) {
+            const auto& rotsA = track.boneRotationsPerKey[i0];
+            const auto& rotsB = track.boneRotationsPerKey[i1];
+            m_ikLocalFootRot.assign(m_ikLegs.size(), glm::quat(1, 0, 0, 0));
+            for (size_t li = 0; li < m_ikLegs.size(); ++li) {
+                const IKLeg& leg = m_ikLegs[li];
+                if (leg.shin < 0 || leg.foot < 0) continue;
+                if (leg.foot < static_cast<int>(rotsA.size()) && leg.shin < static_cast<int>(rotsA.size()) &&
+                    leg.foot < static_cast<int>(rotsB.size()) && leg.shin < static_cast<int>(rotsB.size())) {
+                    glm::quat pA = glm::normalize(glm::inverse(rotsA[leg.shin]) * rotsA[leg.foot]);
+                    glm::quat pB = glm::normalize(glm::inverse(rotsB[leg.shin]) * rotsB[leg.foot]);
+                    if (glm::dot(pA, pB) < 0.0f) pB = -pB;
+                    m_ikLocalFootRot[li] = glm::normalize(glm::slerp(pA, pB, u));
+                    m_ikHaveLocalFoot = true;
+                }
+            }
+        }
+
         // IK feet: rebuild rigidly from the interpolated shin so they follow the
         // leg instead of flailing (foot/heel/toe keyframes interpolate separately
         // and disagree). Must run after the bone interp, before the reskin.
         rederiveIKFeet();
+
+        // Keep IK goals synced to the interpolated foot positions. Otherwise, when
+        // you author at an in-between frame and move one control, the OTHER legs
+        // snap to their stale (last-authored) goals — the "other leg flies off"
+        // bug. Syncing here pins each leg to where the animation currently shows it.
+        for (auto& leg : m_ikLegs) {
+            if (leg.foot >= 0 && leg.foot < static_cast<int>(m_bonePositions.size()))
+                leg.goal = m_bonePositions[leg.foot];
+        }
 
         // Reskin from the bind pose; pushes new verts via updateModelBuffer.
         // No vertex snapshots; per-key memory is O(bones).
@@ -465,11 +496,12 @@ void ModelingMode::renderAnimationTimeline() {
         return;
     }
 
-    // Advance time when playing.
+    // Advance time when playing (speed-scaled; negative speed plays in reverse).
     if (m_timelinePlaying) {
-        m_timelineCurrentTime += ImGui::GetIO().DeltaTime;
-        if (m_timelineCurrentTime >= m_timelineDuration) {
+        m_timelineCurrentTime += ImGui::GetIO().DeltaTime * m_timelineSpeed;
+        if (m_timelineDuration > 0.0f) {
             m_timelineCurrentTime = std::fmod(m_timelineCurrentTime, m_timelineDuration);
+            if (m_timelineCurrentTime < 0.0f) m_timelineCurrentTime += m_timelineDuration;  // wrap reverse
         }
     }
 
@@ -486,6 +518,19 @@ void ModelingMode::renderAnimationTimeline() {
     ImGui::SameLine();
     ImGui::SetNextItemWidth(80);
     ImGui::DragFloat("Length", &m_timelineDuration, 0.1f, 0.1f, 600.0f, "%.1fs");
+    // Playback speed: type/drag a multiplier, or use presets (negative = reverse).
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70);
+    ImGui::DragFloat("Speed", &m_timelineSpeed, 0.05f, -5.0f, 5.0f, "%.2fx");
+    ImGui::SameLine();
+    if (ImGui::Button("1x", ImVec2(28, 0))) m_timelineSpeed = 1.0f;
+    ImGui::SameLine();
+    if (ImGui::Button("2x", ImVec2(28, 0))) m_timelineSpeed = 2.0f;
+    ImGui::SameLine();
+    if (ImGui::Button("5x", ImVec2(28, 0))) m_timelineSpeed = 5.0f;
+    ImGui::SameLine();
+    if (ImGui::Button("Rev", ImVec2(34, 0))) m_timelineSpeed = -m_timelineSpeed;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reverse: flip the current speed's sign");
     ImGui::SameLine();
     {
         SceneObject* obj = m_ctx.selectedObject;

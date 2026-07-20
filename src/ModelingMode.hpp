@@ -62,6 +62,7 @@ private:
 
     // Animation timeline state (persistent across modes; will hold per-skeleton clips later)
     float m_timelineDuration = 5.0f;
+    float m_timelineSpeed = 1.0f;            // playback speed multiplier (negative = reverse)
     float m_timelineCurrentTime = 0.0f;
     bool  m_timelinePlaying = false;
     float m_timelineZoom = 1.0f;
@@ -566,6 +567,11 @@ private:
     };
     std::vector<IKLeg> m_ikLegs;
     bool m_ikEnabled = false;                  // master toggle for leg IK solving
+    // Per-leg local foot rotation (relative to shin) interpolated from the
+    // keyframes during playback — gives PER-KEY foot pitch. Empty/false = fall
+    // back to the leg's single footPitch slider value.
+    std::vector<glm::quat> m_ikLocalFootRot;
+    bool m_ikHaveLocalFoot = false;
     int  m_ikDragLeg = -1;                     // leg whose handle is being dragged (-1 = none)
     bool m_ikDragIsPole = false;               // dragging the pole handle vs the foot goal
     glm::vec3 m_ikDragPlaneNormal{0, 0, 1};

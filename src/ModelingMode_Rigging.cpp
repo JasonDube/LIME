@@ -643,7 +643,8 @@ void ModelingMode::rederiveIKFeet() {
     if (m_boneWorldRotations.size() != m_bonePositions.size()) return;
     if (m_bindPoseBonePositions.size() != m_bonePositions.size()) return;
     const size_t n = m_bonePositions.size();
-    for (const IKLeg& leg : m_ikLegs) {
+    for (size_t li = 0; li < m_ikLegs.size(); ++li) {
+        const IKLeg& leg = m_ikLegs[li];
         if (leg.thigh < 0 || leg.shin < 0 || leg.foot < 0) continue;
         if (leg.thigh >= static_cast<int>(n) || leg.shin >= static_cast<int>(n) ||
             leg.foot >= static_cast<int>(n)) continue;
@@ -660,9 +661,17 @@ void ModelingMode::rederiveIKFeet() {
         glm::quat shinRot = swingRotation(glm::normalize(ankR - kneeR), glm::normalize(ankle - knee));
         m_boneWorldRotations[leg.shin] = shinRot;
 
-        // Foot follows the shin + Foot Pitch (leg-local, smooth).
-        glm::vec3 localAxis = leg.hingeValid ? leg.hingeAxis : glm::vec3(1.0f, 0.0f, 0.0f);
-        glm::quat footRot = shinRot * glm::angleAxis(glm::radians(leg.footPitch), localAxis);
+        // Foot follows the shin. Its local rotation is the PER-KEY foot pose
+        // interpolated from the keyframes (m_ikLocalFootRot); if unavailable,
+        // fall back to the single Foot Pitch slider value.
+        glm::quat footLocal;
+        if (m_ikHaveLocalFoot && li < m_ikLocalFootRot.size()) {
+            footLocal = m_ikLocalFootRot[li];
+        } else {
+            glm::vec3 localAxis = leg.hingeValid ? leg.hingeAxis : glm::vec3(1.0f, 0.0f, 0.0f);
+            footLocal = glm::angleAxis(glm::radians(leg.footPitch), localAxis);
+        }
+        glm::quat footRot = shinRot * footLocal;
         m_boneWorldRotations[leg.foot] = footRot;
 
         // Heel/toe ride rigidly on the ankle.
