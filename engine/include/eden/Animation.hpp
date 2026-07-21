@@ -24,6 +24,13 @@ struct Skeleton {
     std::vector<Bone> bones;
     std::unordered_map<std::string, int> boneNameToIndex;
 
+    // Global transform of everything ABOVE the root joint (the "Armature" node
+    // and any ancestors). glTF exporters (Meshy/Mixamo, FBX-derived) commonly
+    // put a 0.01 cm->m scale here. The inverse-bind matrices bake it in, so the
+    // animation hierarchy MUST re-apply it above the root bone or the skin
+    // explodes ~100x. Identity when there is no armature transform.
+    glm::mat4 rootTransform = glm::mat4(1.0f);
+
     int findBone(const std::string& name) const {
         auto it = boneNameToIndex.find(name);
         return it != boneNameToIndex.end() ? it->second : -1;

@@ -69,9 +69,20 @@ glm::mat4 AnimationPlayer::computeBoneTransform(int boneIndex, float time) {
         }
     }
 
-    glm::vec3 translation(0.0f);
-    glm::quat rotation(1.0f, 0.0f, 0.0f, 0.0f);
-    glm::vec3 scale(1.0f);
+    // Default each component to the bone's REST (bind) local TRS. A glTF channel
+    // often animates only rotation; translation/scale must then stay at the rest
+    // pose, NOT collapse to 0/1, or the skeleton distorts.
+    const glm::mat4& rest = m_skeleton->bones[boneIndex].localTransform;
+    glm::vec3 translation = glm::vec3(rest[3]);
+    glm::vec3 restScale(glm::length(glm::vec3(rest[0])),
+                        glm::length(glm::vec3(rest[1])),
+                        glm::length(glm::vec3(rest[2])));
+    glm::mat3 restBasis(
+        glm::vec3(rest[0]) / (restScale.x > 1e-8f ? restScale.x : 1.0f),
+        glm::vec3(rest[1]) / (restScale.y > 1e-8f ? restScale.y : 1.0f),
+        glm::vec3(rest[2]) / (restScale.z > 1e-8f ? restScale.z : 1.0f));
+    glm::quat rotation = glm::quat_cast(restBasis);
+    glm::vec3 scale = restScale;
 
     if (channel) {
         // Interpolate position
@@ -88,12 +99,6 @@ glm::mat4 AnimationPlayer::computeBoneTransform(int boneIndex, float time) {
         if (!channel->scales.empty()) {
             scale = lerpVec3(channel->scaleTimes, channel->scales, time);
         }
-    } else {
-        // Use bind pose from skeleton
-        // Extract TRS from local transform (simplified - assumes clean matrix)
-        const glm::mat4& local = m_skeleton->bones[boneIndex].localTransform;
-        translation = glm::vec3(local[3]);
-        // For rotation/scale, we'd need to decompose - for now just use identity
     }
 
     // Compose TRS matrix
@@ -120,8 +125,9 @@ void AnimationPlayer::computeBoneMatrices() {
     for (size_t i = 0; i < boneCount; i++) {
         const Bone& bone = m_skeleton->bones[i];
         if (bone.parentIndex < 0) {
-            // Root bone
-            worldTransforms[i] = m_localTransforms[i];
+            // Root bone: prepend the armature/ancestor transform so the animated
+            // hierarchy lives in the same space as the inverse-bind matrices.
+            worldTransforms[i] = m_skeleton->rootTransform * m_localTransforms[i];
         } else {
             // Child bone - multiply by parent's world transform
             worldTransforms[i] = worldTransforms[bone.parentIndex] * m_localTransforms[i];

@@ -174,6 +174,56 @@ SkinnedLoadResult SkinnedGLBLoader::load(const std::string& filepath) {
             result.skeleton->boneNameToIndex[bone.name] = static_cast<int>(i);
         }
 
+        // Compute the skeleton root transform: the accumulated global transform
+        // of every node ABOVE the root joint (typically the "Armature" node,
+        // often scale 0.01 for cm->m). The inverse-bind matrices bake it in, so
+        // the animation hierarchy must re-apply it or the skin explodes ~100x.
+        {
+            std::vector<int> nodeParent(model.nodes.size(), -1);
+            for (size_t n = 0; n < model.nodes.size(); ++n)
+                for (int c : model.nodes[n].children)
+                    if (c >= 0 && c < static_cast<int>(nodeParent.size())) nodeParent[c] = static_cast<int>(n);
+
+            auto nodeLocal = [&](int ni) -> glm::mat4 {
+                const auto& nd = model.nodes[ni];
+                if (nd.matrix.size() == 16) {
+                    glm::mat4 m(1.0f);
+                    for (int c = 0; c < 16; ++c) glm::value_ptr(m)[c] = static_cast<float>(nd.matrix[c]);
+                    return m;
+                }
+                glm::mat4 T(1.0f), R(1.0f), S(1.0f);
+                if (nd.translation.size() == 3)
+                    T = glm::translate(glm::mat4(1.0f), glm::vec3(nd.translation[0], nd.translation[1], nd.translation[2]));
+                if (nd.rotation.size() == 4)
+                    R = glm::mat4_cast(glm::quat(static_cast<float>(nd.rotation[3]), static_cast<float>(nd.rotation[0]),
+                                                static_cast<float>(nd.rotation[1]), static_cast<float>(nd.rotation[2])));
+                if (nd.scale.size() == 3)
+                    S = glm::scale(glm::mat4(1.0f), glm::vec3(nd.scale[0], nd.scale[1], nd.scale[2]));
+                return T * R * S;
+            };
+
+            // Root joint = first bone with no bone-parent; map back to its node.
+            int rootJointNode = -1;
+            for (size_t b = 0; b < result.skeleton->bones.size(); ++b) {
+                if (result.skeleton->bones[b].parentIndex < 0) {
+                    rootJointNode = skin.joints[b];
+                    break;
+                }
+            }
+
+            glm::mat4 rootXf(1.0f);
+            if (rootJointNode >= 0) {
+                std::vector<int> chain;  // ancestors, bottom-up
+                for (int a = nodeParent[rootJointNode]; a >= 0; a = nodeParent[a])
+                    chain.push_back(a);
+                for (auto it = chain.rbegin(); it != chain.rend(); ++it)  // apply top-down
+                    rootXf = rootXf * nodeLocal(*it);
+            }
+            result.skeleton->rootTransform = rootXf;
+            std::cout << "Skeleton root (armature) scale ~ "
+                      << glm::length(glm::vec3(rootXf[0])) << std::endl;
+        }
+
         std::cout << "Loaded skeleton with " << result.skeleton->bones.size() << " bones" << std::endl;
     }
 

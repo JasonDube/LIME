@@ -5,6 +5,23 @@ just so good ideas don't fall on the floor.
 
 ## Skinning / animation quality
 
+- [ ] **Automatic weight painting (real auto-rigger)** — HIGH PRIORITY, wanted soon.
+      Half the value of Meshy/Mixamo is that the weighting is done for you. On
+      IMPORT we already reuse the GLB's own weights (see importSkinnedGLBNative),
+      but for LIME-authored meshes `generateAutoWeights` is crude inverse-distance.
+      Build a proper solver so a mesh + standard skeleton produces clean weights:
+        - The pattern behind Meshy/Mixamo quality: (a) a FIXED standard humanoid
+          skeleton placed consistently inside the mesh, + (b) a diffusion/biharmonic
+          weight solve (smooth, non-negative, partition-of-unity, local).
+        - Open references to mine: Pinocchio (Baran & Popović 2007, auto rig+weight,
+          code public); Blender "Bone Heat" (Baran heat-diffusion — what "Automatic
+          Weights" uses); Bounded Biharmonic Weights (Jacobson et al. 2011 — closest
+          to the clean Meshy look).
+        - Likely path: heat-diffusion over the mesh graph (geodesic falloff from each
+          bone segment), or a Laplacian/biharmonic solve, replacing inverse-distance.
+        - Pairs naturally with a standard-skeleton fit step (drop a canonical biped
+          rig onto an arbitrary humanoid mesh) → a one-click auto-rig.
+
 - [ ] **Corrective blend shapes ("shape keys")**. The big one. On top of LBS or
       DQS, author per-character shape deltas that fire when a bone hits a given
       angle (e.g. `elbow_bent_90`). Inside of the elbow folds, bicep bulges,

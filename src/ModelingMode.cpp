@@ -546,6 +546,17 @@ void ModelingMode::renderSceneOverlay(VkCommandBuffer cmd, const glm::mat4& view
     for (auto& obj : m_ctx.sceneObjects) {
         if (!obj->isVisible()) continue;
         glm::mat4 modelMatrix = obj->getTransform().getMatrix();
+
+        // Skinned/animated objects draw through the skinned renderer, which
+        // applies the current animation pose. The static mesh (getBufferHandle)
+        // is retained only for picking/bounds, so skip its draw here.
+        if (obj->isSkinned() && obj->getSkinnedModelHandle() != UINT32_MAX) {
+            m_ctx.skinnedModelRenderer.render(cmd, viewProj, obj->getSkinnedModelHandle(),
+                                              modelMatrix, obj->getHueShift(),
+                                              obj->getSaturation(), obj->getBrightness());
+            continue;
+        }
+
         // X-ray mode disables backface culling for this object
         bool twoSided = obj->isXRay();
         m_ctx.modelRenderer.render(cmd, viewProj, obj->getBufferHandle(), modelMatrix, 0.0f, 1.0f, 1.0f, twoSided, obj->isFlatShaded());
@@ -1002,6 +1013,11 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
         drawSkeletonOverlay(vpX, vpY, vpW, vpH);
     }
 
+    // Draw the imported GLB skinned model's animated skeleton (moves with playback)
+    if (m_riggingMode) {
+        drawSkinnedSkeletonOverlay(vpX, vpY, vpW, vpH);
+    }
+
     // Rigging: red dots on every vertex influenced (weight > 0) by the selected
     // bone. Additive overlay on top of the skin weight map. Front-facing only.
     if (m_riggingMode && m_showInfluenceHighlight && m_selectedBone >= 0 &&
@@ -1035,8 +1051,9 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
         dl->PopClipRect();
     }
 
-    // Leg-IK foot goals (green square handles)
-    if (m_riggingMode) drawIKGoalsOverlay(vpX, vpY, vpW, vpH);
+    // Leg-IK foot goals (green square handles) — gated by its own toggle so it
+    // can be shown/hidden independently of the skeleton.
+    if (m_riggingMode && m_showIKControls) drawIKGoalsOverlay(vpX, vpY, vpW, vpH);
 }
 
 void ModelingMode::renderModelingEditorUI() {
@@ -2086,6 +2103,79 @@ void ModelingMode::renderModelingEditorUI() {
 
                 ImGui::Checkbox("Show Skeleton", &m_showSkeleton);
                 ImGui::Checkbox("Show Bone Names", &m_showBoneNames);
+                ImGui::Checkbox("Show IK Controls", &m_showIKControls);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Show/hide IK goal + pole handles independently of the skeleton.");
+
+                // A-Pose spread fix — only for imported skinned GLBs (Meshy/Mixamo)
+                // that carry a baked-in limb spread from the source rig pose.
+                if (m_ctx.selectedObject && m_importedClipSource.count(m_ctx.selectedObject)) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "A-Pose Fix");
+                    ImGui::SetNextItemWidth(180);
+                    float aposePct = m_aposeNeutralize * 100.0f;
+                    if (ImGui::SliderFloat("Neutralize Spread", &aposePct, 0.0f, 100.0f, "%.0f%%",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        m_aposeNeutralize = aposePct / 100.0f;
+                        applyAPoseNeutralize(m_ctx.selectedObject, m_aposeNeutralize);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Removes the constant outward spread baked into the arms/legs\n"
+                                          "by the source A-pose rig. 0%% = original mocap, 100%% = the\n"
+                                          "limbs reach neutral at their most-closed frame. Re-derives\n"
+                                          "from the pristine clip, so it's non-destructive.");
+                }
+
+                // --- Imported GLB animation (skinned model) ---
+                if (m_ctx.selectedObject && m_ctx.selectedObject->isSkinned()) {
+                    uint32_t sh = m_ctx.selectedObject->getSkinnedModelHandle();
+                    auto* data = (sh != UINT32_MAX)
+                        ? m_ctx.skinnedModelRenderer.getModelData(sh) : nullptr;
+                    if (data) {
+                        ImGui::Separator();
+                        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "GLB Animation");
+                        ImGui::Checkbox("Show Animated Skeleton", &m_showSkinnedSkeleton);
+
+                        const auto& names = m_ctx.selectedObject->getAnimationNames();
+                        // Clip selector
+                        if (names.size() > 1) {
+                            std::string cur = m_ctx.selectedObject->getCurrentAnimation();
+                            if (ImGui::BeginCombo("Clip", cur.c_str())) {
+                                for (const auto& n : names) {
+                                    bool sel = (n == cur);
+                                    if (ImGui::Selectable(n.c_str(), sel)) {
+                                        m_ctx.skinnedModelRenderer.playAnimation(sh, n, true);
+                                        m_ctx.selectedObject->setCurrentAnimation(n);
+                                    }
+                                    if (sel) ImGui::SetItemDefaultFocus();
+                                }
+                                ImGui::EndCombo();
+                            }
+                        } else if (names.size() == 1) {
+                            ImGui::Text("Clip: %s", names[0].c_str());
+                        }
+
+                        // Play / pause + frame scrubber
+                        const AnimationClip* clip = data->animPlayer.getCurrentClip();
+                        float duration = clip ? clip->duration : 0.0f;
+                        bool playing = data->animPlayer.getPlaybackSpeed() > 0.0f;
+                        if (ImGui::Checkbox("Play", &playing)) {
+                            data->animPlayer.setPlaybackSpeed(playing ? 1.0f : 0.0f);
+                        }
+                        if (duration > 0.0f) {
+                            float t = data->animPlayer.getCurrentTime();
+                            ImGui::SetNextItemWidth(220);
+                            if (ImGui::SliderFloat("Frame", &t, 0.0f, duration, "%.3fs")) {
+                                // Scrub: pause and jump to the chosen time.
+                                data->animPlayer.setPlaybackSpeed(0.0f);
+                                data->animPlayer.setCurrentTime(t);
+                            }
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("/ %.2fs", duration);
+                        }
+                    }
+                }
+
                 if (ImGui::Checkbox("Weight Heatmap", &m_showWeightHeatMap)) {
                     m_heatMapDirty = true;
                 }

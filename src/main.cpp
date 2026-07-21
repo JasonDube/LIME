@@ -1260,6 +1260,11 @@ protected:
                         if (handle != UINT32_MAX && handle != 0) {
                             m_modelRenderer->destroyModel(handle);
                         }
+                        // Free the skinned GPU model too, if this was an animated object.
+                        if ((*it)->isSkinned() && (*it)->getSkinnedModelHandle() != UINT32_MAX
+                            && m_skinnedModelRenderer) {
+                            m_skinnedModelRenderer->destroyModel((*it)->getSkinnedModelHandle());
+                        }
                         m_sceneObjects.erase(it);
                         break;
                     }
@@ -1286,6 +1291,16 @@ protected:
         // Update active mode
         if (m_activeMode) {
             m_activeMode->update(deltaTime);
+        }
+
+        // Advance animations for any imported skinned models so they play in
+        // the main viewport regardless of the active editor mode.
+        if (m_skinnedModelRenderer) {
+            for (auto& obj : m_sceneObjects) {
+                if (obj->isSkinned() && obj->getSkinnedModelHandle() != UINT32_MAX) {
+                    m_skinnedModelRenderer->updateAnimation(obj->getSkinnedModelHandle(), deltaTime);
+                }
+            }
         }
     }
 
@@ -3290,15 +3305,24 @@ private:
             m_modelingMode->buildEditableMeshFromObject();
         }
 
-        // Also load skeleton/skin data if present — GLBLoader::load above only reads mesh.
+        // Skinned/animated GLB: land it in LIME's NATIVE rig + timeline so the
+        // mocap is fully editable — bones appear in the rigging list, the mesh
+        // carries the GLB's own bone weights, and the animation becomes editable
+        // keyframes (movable/deletable). Requires the editable mesh (built above
+        // when in modeling mode). No parallel skinned renderer, so no duplicate.
         if (SkinnedGLBLoader::hasSkeleton(path)) {
             SkinnedLoadResult skinned = SkinnedGLBLoader::load(path);
-            if (skinned.success && skinned.skeleton && !skinned.skeleton->bones.empty()) {
-                m_editableMesh.setSkeleton(*skinned.skeleton);
-                std::cout << "Imported skeleton: " << skinned.skeleton->bones.size()
-                          << " bones, " << skinned.animations.size() << " animations" << std::endl;
+            if (skinned.success && skinned.skeleton && !skinned.skeleton->bones.empty()
+                && !skinned.meshes.empty() && m_selectedObject) {
+                if (m_currentModeType == EditorModeType::ModelingEditor && m_modelingMode) {
+                    m_modelingMode->importSkinnedGLBNative(skinned);
+                } else {
+                    std::cout << "Skinned GLB: switch to the Modeling editor to rig/animate it" << std::endl;
+                }
             } else if (!skinned.success) {
                 std::cout << "Skeleton present but failed to load: " << skinned.error << std::endl;
+            } else {
+                std::cout << "Skeleton present but no skinned mesh to bind" << std::endl;
             }
         }
 

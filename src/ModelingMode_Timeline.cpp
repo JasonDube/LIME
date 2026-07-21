@@ -1,15 +1,23 @@
 #include "ModelingMode.hpp"
+#include "EditableMesh.hpp"
+#include "Editor/SkinnedGLBLoader.hpp"
 
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/norm.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <set>
+#include <unordered_map>
 
 using namespace eden;
 
@@ -225,6 +233,369 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
               << m_objectAnims[obj].times.back() << "s, from " << path << "\n";
     if (!(m_hasBindPose && m_bindPoseOwner == obj))
         std::cout << "[ImportAnim] NOTE: Set Bind Pose on this object to see the animation play/deform.\n";
+}
+
+// Normalized world rotation of a matrix's upper 3x3 (removes any scale, e.g.
+// the 0.01 armature scale) so quat_cast returns a pure rotation.
+static glm::quat rotationOf(const glm::mat4& m) {
+    glm::vec3 c0(m[0]), c1(m[1]), c2(m[2]);
+    float l0 = glm::length(c0), l1 = glm::length(c1), l2 = glm::length(c2);
+    glm::mat3 basis(c0 / (l0 > 1e-8f ? l0 : 1.0f),
+                    c1 / (l1 > 1e-8f ? l1 : 1.0f),
+                    c2 / (l2 > 1e-8f ? l2 : 1.0f));
+    return glm::normalize(glm::quat_cast(basis));
+}
+
+// Intrinsic X-Y-Z (roll/pitch/yaw) decomposition, matching the analysis that
+// measured the A-pose spread as a local-Z (yaw) offset. Radians.
+static glm::vec3 quatToEulerXYZ(const glm::quat& q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    float roll  = std::atan2(2.0f * (w * x + y * z), 1.0f - 2.0f * (x * x + y * y));
+    float sp    = glm::clamp(2.0f * (w * y - z * x), -1.0f, 1.0f);
+    float pitch = std::asin(sp);
+    float yaw   = std::atan2(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z));
+    return glm::vec3(roll, pitch, yaw);
+}
+static glm::quat eulerXYZToQuat(const glm::vec3& e) {
+    glm::quat qx = glm::angleAxis(e.x, glm::vec3(1, 0, 0));
+    glm::quat qy = glm::angleAxis(e.y, glm::vec3(0, 1, 0));
+    glm::quat qz = glm::angleAxis(e.z, glm::vec3(0, 0, 1));
+    return glm::normalize(qz * qy * qx);  // inverse of the extraction above
+}
+
+// Forward-kinematics one frame → world transform per bone. `localCorrDeg`
+// (optional, per-bone) subtracts a constant LOCAL euler rotation before the
+// compose (used for the legs, whose abduction is constant in the hip-local frame).
+static void fkFrame(const Skeleton& skel, const AnimationClip& clip, float t,
+                    const std::vector<glm::vec3>* localCorrDeg,
+                    std::vector<glm::mat4>& world) {
+    const size_t n = skel.bones.size();
+    world.assign(n, glm::mat4(1.0f));
+    auto findCh = [&](int bi) -> const AnimationChannel* {
+        for (const auto& ch : clip.channels) if (ch.boneIndex == bi) return &ch;
+        return nullptr;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const glm::mat4& rest = skel.bones[i].localTransform;
+        glm::vec3 T(rest[3]);
+        glm::vec3 S(glm::length(glm::vec3(rest[0])),
+                    glm::length(glm::vec3(rest[1])),
+                    glm::length(glm::vec3(rest[2])));
+        glm::mat3 rb(glm::vec3(rest[0]) / (S.x > 1e-8f ? S.x : 1.0f),
+                     glm::vec3(rest[1]) / (S.y > 1e-8f ? S.y : 1.0f),
+                     glm::vec3(rest[2]) / (S.z > 1e-8f ? S.z : 1.0f));
+        glm::quat R = glm::quat_cast(rb);
+        if (const AnimationChannel* ch = findCh(static_cast<int>(i))) {
+            if (!ch->positions.empty()) T = lerpVec3(ch->positionTimes, ch->positions, t);
+            if (!ch->rotations.empty()) R = lerpQuat(ch->rotationTimes, ch->rotations, t);
+            if (!ch->scales.empty())    S = lerpVec3(ch->scaleTimes, ch->scales, t);
+        }
+        if (localCorrDeg && i < localCorrDeg->size()) {
+            const glm::vec3& c = (*localCorrDeg)[i];
+            if (glm::dot(c, c) > 1e-8f) {
+                glm::vec3 e = quatToEulerXYZ(R);
+                e -= glm::radians(c);
+                R = eulerXYZToQuat(e);
+            }
+        }
+        glm::mat4 local = glm::translate(glm::mat4(1.0f), T)
+                        * glm::mat4_cast(R) * glm::scale(glm::mat4(1.0f), S);
+        int p = skel.bones[i].parentIndex;
+        world[i] = (p >= 0 && p < static_cast<int>(i)) ? world[p] * local
+                                                       : skel.rootTransform * local;
+    }
+}
+
+// True if bone k is b or a descendant of b (walks parent chain).
+static bool isInSubtree(const Skeleton& skel, int k, int b) {
+    while (k >= 0) { if (k == b) return true; k = skel.bones[k].parentIndex; }
+    return false;
+}
+
+void ModelingMode::buildNativeTrackFromClip(SceneObject* obj, const Skeleton& skel,
+                                            const AnimationClip& clip,
+                                            const std::vector<glm::vec3>* legLocalCorrDeg,
+                                            const std::vector<float>* armWorldZDeg) {
+    const size_t boneCount = skel.bones.size();
+
+    // Shared timeline = the union of every channel's sample times.
+    std::set<float> timeSet;
+    for (const auto& ch : clip.channels) {
+        for (float t : ch.positionTimes) timeSet.insert(t);
+        for (float t : ch.rotationTimes) timeSet.insert(t);
+        for (float t : ch.scaleTimes)    timeSet.insert(t);
+    }
+    if (timeSet.empty()) return;
+    std::vector<float> times(timeSet.begin(), timeSet.end());
+
+    // Rest world rotation per bone (from inverse bind), so the stored rotation
+    // is a DELTA from rest — what reskinFromBoneDeltas expects.
+    std::vector<glm::quat> restRot(boneCount);
+    for (size_t i = 0; i < boneCount; ++i)
+        restRot[i] = rotationOf(glm::inverse(skel.bones[i].inverseBindMatrix));
+
+    ObjectAnimTrack track;
+    const glm::vec3 tp = obj->getTransform().getPosition();
+    const glm::quat tr = obj->getTransform().getRotation();
+    const glm::vec3 ts = obj->getTransform().getScale();
+
+    std::vector<glm::mat4> world;
+    for (float t : times) {
+        fkFrame(skel, clip, t, legLocalCorrDeg, world);  // legs corrected in-FK
+
+        // Arms: rotate each arm subtree about the shoulder in the world coronal
+        // plane (about world +Z) to cancel the constant lateral spread. Local
+        // euler can't isolate it (the arm bone's local frame is rotated ~90°),
+        // but a rigid rotation of the whole arm about the shoulder does exactly
+        // what we want and preserves the fore/aft swing.
+        if (armWorldZDeg) {
+            for (size_t b = 0; b < boneCount && b < armWorldZDeg->size(); ++b) {
+                float deg = (*armWorldZDeg)[b];
+                if (std::abs(deg) < 1e-4f) continue;
+                glm::vec3 head = glm::vec3(world[b][3]);
+                glm::mat4 P = glm::translate(glm::mat4(1.0f), head)
+                            * glm::rotate(glm::mat4(1.0f), glm::radians(-deg), glm::vec3(0, 0, 1))
+                            * glm::translate(glm::mat4(1.0f), -head);
+                for (size_t k = 0; k < boneCount; ++k)
+                    if (isInSubtree(skel, static_cast<int>(k), static_cast<int>(b)))
+                        world[k] = P * world[k];
+            }
+        }
+
+        std::vector<glm::vec3> heads(boneCount);
+        std::vector<glm::quat> rots(boneCount);
+        for (size_t i = 0; i < boneCount; ++i) {
+            heads[i] = glm::vec3(world[i][3]);
+            rots[i]  = glm::normalize(rotationOf(world[i]) * glm::inverse(restRot[i]));
+        }
+        track.times.push_back(t);
+        track.positions.push_back(tp);
+        track.rotations.push_back(tr);
+        track.scales.push_back(ts);
+        track.bonePositionsPerKey.push_back(std::move(heads));
+        track.boneRotationsPerKey.push_back(std::move(rots));
+    }
+
+    m_objectAnims[obj] = std::move(track);
+    m_timelineDuration = std::max(m_timelineDuration, m_objectAnims[obj].times.back());
+}
+
+std::vector<glm::vec3> ModelingMode::detectAPoseSpread(const Skeleton& skel,
+                                                       const AnimationClip& clip) {
+    const size_t n = skel.bones.size();
+    std::vector<glm::vec3> floors(n, glm::vec3(0.0f));
+
+    std::set<float> ts;
+    for (const auto& ch : clip.channels) for (float t : ch.rotationTimes) ts.insert(t);
+    if (ts.empty()) return floors;
+    std::vector<float> times(ts.begin(), ts.end());
+
+    // LEGS ONLY. The hip's abduction is constant in the UpLeg-local frame (the
+    // hip sways it through world-neutral each stride), so a local Y+Z floor
+    // captures it. Arms are handled separately in world space.
+    auto isUpLeg = [](const std::string& name) {
+        std::string s; s.reserve(name.size());
+        for (char c : name) s += static_cast<char>(std::tolower((unsigned char)c));
+        return s.find("upleg") != std::string::npos;
+    };
+    auto findCh = [&](int bi) -> const AnimationChannel* {
+        for (const auto& ch : clip.channels) if (ch.boneIndex == bi) return &ch;
+        return nullptr;
+    };
+
+    for (size_t i = 0; i < n; ++i) {
+        if (!isUpLeg(skel.bones[i].name)) continue;
+        const AnimationChannel* ch = findCh(static_cast<int>(i));
+        glm::quat restR = rotationOf(skel.bones[i].localTransform);
+        glm::vec2 bestYZ(0.0f); bool set = false;
+        for (float t : times) {
+            glm::quat R = restR;
+            if (ch && !ch->rotations.empty()) R = lerpQuat(ch->rotationTimes, ch->rotations, t);
+            glm::vec3 e = glm::degrees(quatToEulerXYZ(R));
+            if (!set) { bestYZ = glm::vec2(e.y, e.z); set = true; }
+            else {
+                if (std::abs(e.y) < std::abs(bestYZ.x)) bestYZ.x = e.y;
+                if (std::abs(e.z) < std::abs(bestYZ.y)) bestYZ.y = e.z;
+            }
+        }
+        floors[i] = glm::vec3(0.0f, bestYZ.x, bestYZ.y);  // X (swing) kept at 0
+    }
+    return floors;
+}
+
+std::vector<float> ModelingMode::detectArmSpreadWorldZ(const Skeleton& skel,
+                                                       const AnimationClip& clip) {
+    const size_t n = skel.bones.size();
+    std::vector<float> floors(n, 0.0f);
+
+    std::set<float> ts;
+    for (const auto& ch : clip.channels) for (float t : ch.rotationTimes) ts.insert(t);
+    if (ts.empty()) return floors;
+    std::vector<float> times(ts.begin(), ts.end());
+
+    auto isArm = [](const std::string& name) {
+        std::string s; s.reserve(name.size());
+        for (char c : name) s += static_cast<char>(std::tolower((unsigned char)c));
+        return s.find("arm") != std::string::npos && s.find("forearm") == std::string::npos;
+    };
+    // First child of each bone → gives the limb direction (Arm→ForeArm).
+    std::vector<int> childOf(n, -1);
+    for (size_t k = 0; k < n; ++k) {
+        int p = skel.bones[k].parentIndex;
+        if (p >= 0 && p < static_cast<int>(n) && childOf[p] < 0) childOf[p] = static_cast<int>(k);
+    }
+
+    std::vector<glm::mat4> world;
+    std::vector<bool> set(n, false);
+    for (float t : times) {
+        fkFrame(skel, clip, t, nullptr, world);
+        for (size_t b = 0; b < n; ++b) {
+            if (!isArm(skel.bones[b].name)) continue;
+            int c = childOf[b];
+            if (c < 0) continue;
+            glm::vec3 dir = glm::vec3(world[c][3]) - glm::vec3(world[b][3]);
+            float L = glm::length(dir);
+            if (L < 1e-6f) continue;
+            dir /= L;
+            // Lateral (coronal) angle from straight-down; the floor (min-abs
+            // across frames) = the always-present sideways spread.
+            float lat = glm::degrees(std::atan2(dir.x, -dir.y));
+            if (!set[b] || std::abs(lat) < std::abs(floors[b])) { floors[b] = lat; set[b] = true; }
+        }
+    }
+    return floors;
+}
+
+void ModelingMode::applyAPoseNeutralize(SceneObject* obj, float strength) {
+    auto it = m_importedClipSource.find(obj);
+    if (it == m_importedClipSource.end()) {
+        std::cout << "[APose] No stored source clip for this object\n";
+        return;
+    }
+    const Skeleton& skel = it->second.first;
+    const AnimationClip& clip = it->second.second;
+
+    std::vector<glm::vec3> legFloors = detectAPoseSpread(skel, clip);      // legs, local
+    std::vector<float>     armFloors = detectArmSpreadWorldZ(skel, clip);  // arms, world Z
+    float s = glm::clamp(strength, 0.0f, 1.0f);
+    for (glm::vec3& f : legFloors) f *= s;
+    for (float& f : armFloors)     f *= s;
+
+    buildNativeTrackFromClip(obj, skel, clip, &legFloors, &armFloors);
+    m_timelineLastAppliedTime = -1.0f;  // force re-apply on next tick
+
+    std::cout << "[APose] Neutralize " << static_cast<int>(strength * 100) << "% applied (legs+arms)\n";
+}
+
+void ModelingMode::importSkinnedGLBNative(const SkinnedLoadResult& skinned) {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) { std::cout << "[SkinnedImport] No object selected\n"; return; }
+    if (!skinned.skeleton || skinned.skeleton->bones.empty()) {
+        std::cout << "[SkinnedImport] No skeleton in file\n"; return;
+    }
+    if (skinned.meshes.empty()) { std::cout << "[SkinnedImport] No skinned mesh\n"; return; }
+    if (!m_ctx.editableMesh.isValid()) {
+        std::cout << "[SkinnedImport] Editable mesh not built — cannot rig\n"; return;
+    }
+
+    const Skeleton& glbSkel = *skinned.skeleton;
+    const size_t boneCount = glbSkel.bones.size();
+    const auto& smesh = skinned.meshes[0];
+
+    // 1) Skeleton onto the editable mesh (names / parents / IBMs / armature scale).
+    m_ctx.editableMesh.setSkeleton(glbSkel);
+
+    // 2) Transfer Meshy's own per-vertex weights by POSITION. buildEditableMesh
+    //    welds/merges verts so index order is lost, but positions are preserved.
+    //    This reuses the ORIGINAL (good) weights — no guessing.
+    const float cell = 1e-3f;
+    auto hashKey = [&](long x, long y, long z) -> long {
+        return (x * 73856093L) ^ (y * 19349663L) ^ (z * 83492791L);
+    };
+    std::unordered_map<long, std::vector<uint32_t>> grid;
+    grid.reserve(smesh.vertices.size() * 2);
+    for (uint32_t i = 0; i < smesh.vertices.size(); ++i) {
+        const glm::vec3& p = smesh.vertices[i].position;
+        grid[hashKey(std::lround(p.x / cell), std::lround(p.y / cell), std::lround(p.z / cell))].push_back(i);
+    }
+
+    const uint32_t vcount = m_ctx.editableMesh.getVertexCount();
+    uint32_t exact = 0;
+    for (uint32_t vi = 0; vi < vcount; ++vi) {
+        auto& hv = m_ctx.editableMesh.getVertex(vi);
+        const glm::vec3 p = hv.position;
+        long bx = std::lround(p.x / cell), by = std::lround(p.y / cell), bz = std::lround(p.z / cell);
+        float bestD = FLT_MAX; int best = -1;
+        for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dz = -1; dz <= 1; ++dz) {
+            auto it = grid.find(hashKey(bx + dx, by + dy, bz + dz));
+            if (it == grid.end()) continue;
+            for (uint32_t si : it->second) {
+                float d = glm::distance2(smesh.vertices[si].position, p);
+                if (d < bestD) { bestD = d; best = static_cast<int>(si); }
+            }
+        }
+        if (best >= 0) {
+            hv.boneIndices = smesh.vertices[best].joints;
+            hv.boneWeights = smesh.vertices[best].weights;
+            if (bestD < (cell * 4.0f) * (cell * 4.0f)) ++exact;
+            // Renormalize defensively.
+            float s = hv.boneWeights.x + hv.boneWeights.y + hv.boneWeights.z + hv.boneWeights.w;
+            if (s > 1e-6f) hv.boneWeights /= s;
+            else { hv.boneIndices = glm::ivec4(0); hv.boneWeights = glm::vec4(1, 0, 0, 0); }
+        }
+    }
+    float matchRate = vcount ? static_cast<float>(exact) / vcount : 0.0f;
+    std::cout << "[SkinnedImport] weight transfer: " << exact << "/" << vcount
+              << " exact (" << static_cast<int>(matchRate * 100) << "%)\n";
+
+    // 3) Enter rigging mode + derive rest bone head positions from the IBMs
+    //    (mirrors the "Enter Rigging Mode" button).
+    m_riggingMode = true;
+    m_showSkeleton = true;
+    m_selectedBone = -1;
+    m_bonePositions.assign(boneCount, glm::vec3(0.0f));
+    for (size_t i = 0; i < boneCount; ++i) {
+        const glm::mat4& ibm = glbSkel.bones[i].inverseBindMatrix;
+        if (ibm != glm::mat4(1.0f)) {
+            m_bonePositions[i] = glm::vec3(glm::inverse(ibm)[3]);
+        } else {
+            int p = glbSkel.bones[i].parentIndex;
+            glm::vec3 pp = (p >= 0 && p < static_cast<int>(i))
+                ? m_bonePositions[p] : glm::vec3(glbSkel.rootTransform[3]);
+            m_bonePositions[i] = pp + glm::vec3(glbSkel.bones[i].localTransform[3]);
+        }
+    }
+
+    // If weight transfer largely failed (mismatched spaces), fall back to auto
+    // weights so the mesh still deforms.
+    if (matchRate < 0.25f) {
+        std::cout << "[SkinnedImport] low match rate — falling back to auto weights\n";
+        m_ctx.editableMesh.generateAutoWeights(m_bonePositions, FLT_MAX);
+    }
+
+    // 4) Bind pose (mandatory for native skinning to deform).
+    setBindPose();
+
+    // 5) Convert the animation clip into native editable keyframes. Keep a
+    //    pristine copy of the source so the A-pose neutralizer can re-derive the
+    //    track at any strength later without re-importing.
+    m_aposeNeutralize = 0.0f;
+    if (!skinned.animations.empty()) {
+        m_importedClipSource[obj] = { glbSkel, skinned.animations[0] };
+        buildNativeTrackFromClip(obj, glbSkel, skinned.animations[0]);
+    }
+
+    // 6) Show frame 0 and auto-play so the walk is visible immediately.
+    m_timelineCurrentTime = 0.0f;
+    m_timelineLastAppliedTime = -1.0f;
+    m_timelinePlaying = !m_objectAnims[obj].times.empty();
+    reskinFromBoneDeltas();
+
+    std::cout << "[SkinnedImport] Native rig ready: " << boneCount << " bones, "
+              << (skinned.animations.empty() ? 0 : static_cast<int>(m_objectAnims[obj].times.size()))
+              << " keyframes. Bones are in the list; keys are on the timeline.\n";
 }
 
 void ModelingMode::jumpToPrevKey() {

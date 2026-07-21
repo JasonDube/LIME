@@ -3,6 +3,8 @@
 #include "IEditorMode.hpp"
 #include "EditorContext.hpp"
 
+namespace eden { struct SkinnedLoadResult; }
+
 /**
  * @brief Modeling Editor mode for mesh editing
  *
@@ -84,6 +86,12 @@ private:
         std::vector<std::vector<glm::quat>> boneRotationsPerKey;  // matched 1:1 with bonePositionsPerKey
     };
     std::unordered_map<SceneObject*, ObjectAnimTrack> m_objectAnims;
+
+    // Pristine source skeleton+clip for imported skinned GLBs, kept so the
+    // A-pose neutralizer can re-derive the native track at any strength without
+    // re-importing. Keyed by object.
+    std::unordered_map<SceneObject*, std::pair<eden::Skeleton, eden::AnimationClip>> m_importedClipSource;
+    float m_aposeNeutralize = 0.0f;  // 0..1, current neutralize strength for the selected object
 
     // Bind pose for the currently selected rigged object. Populated by the
     // "Set Bind Pose" button in the rigging panel. After this is set, bone
@@ -542,6 +550,8 @@ private:
     int m_selectedBone = -1;
     bool m_showSkeleton = true;
     bool m_showBoneNames = true;
+    bool m_showIKControls = true;        // Draw IK goal/pole handles + targets (independent of Show Skeleton)
+    bool m_showSkinnedSkeleton = true;  // Overlay the imported GLB skinned model's animated skeleton in rigging mode
     bool m_placingBone = false;      // Click mesh surface to place bone head
     float m_boneInsetDepth = 0.2f;   // How far to push bone inward along surface normal
     std::vector<glm::vec3> m_bonePositions;  // Editor-side head positions per bone
@@ -607,6 +617,31 @@ private:
     std::vector<std::pair<uint32_t, float>> m_riggingDragWeightedVerts;
 
     void drawSkeletonOverlay(float vpX, float vpY, float vpW, float vpH);
+    // Draws the imported GLB skinned model's skeleton, posed at the current
+    // animation frame (bones move as the animation plays / is scrubbed).
+    void drawSkinnedSkeletonOverlay(float vpX, float vpY, float vpW, float vpH);
+    // FK a glTF skeleton across its clip and store per-key WORLD bone head
+    // positions + world rotation deltas as a native ObjectAnimTrack on `obj`.
+    // A-pose neutralize uses TWO corrections (the spread lives in different
+    // frames per limb): `legLocalCorrDeg` subtracts a constant LOCAL euler
+    // rotation before FK (legs — abduction is constant in the hip-local frame);
+    // `armWorldZDeg` rotates each arm subtree about the shoulder in the world
+    // coronal plane after FK (arms — local euler can't isolate it). Both nullptr
+    // = faithful import.
+    void buildNativeTrackFromClip(SceneObject* obj, const eden::Skeleton& skel,
+                                  const eden::AnimationClip& clip,
+                                  const std::vector<glm::vec3>* legLocalCorrDeg = nullptr,
+                                  const std::vector<float>* armWorldZDeg = nullptr);
+    // Re-derive the selected object's track from its stored source clip with
+    // `strength` (0..1) of the auto-detected A-pose spread removed on the limb
+    // roots (Arm/UpLeg). strength 0 = original mocap.
+    void applyAPoseNeutralize(SceneObject* obj, float strength);
+    // Legs: constant LOCAL Y+Z euler floor per UpLeg bone (deg; X=0).
+    std::vector<glm::vec3> detectAPoseSpread(const eden::Skeleton& skel,
+                                             const eden::AnimationClip& clip);
+    // Arms: constant WORLD coronal lateral floor per Arm bone (deg about world Z).
+    std::vector<float> detectArmSpreadWorldZ(const eden::Skeleton& skel,
+                                             const eden::AnimationClip& clip);
     void cancelRiggingMode();
     int pickBoneAtScreenPos(const glm::vec2& screenPos, float threshold = 20.0f);
     std::vector<int> getDescendantBones(int boneIdx);  // Get all children recursively
@@ -663,6 +698,13 @@ private:
     void autoPackUVIslands(bool fitToUV = false);
 
 public:
+    // Land an imported skinned GLB natively: transfer its bone weights onto the
+    // editable mesh, set the skeleton (bones show in the list), set a bind pose,
+    // and convert its animation clip into editable timeline keyframes. After this
+    // the mocap is fully native — movable bones, deletable/movable keys.
+    // Called by main.cpp's importer, so it must be public.
+    void importSkinnedGLBNative(const eden::SkinnedLoadResult& skinned);
+
     // New-bone placement distance (persisted in ~/.lime_prefs.ini via ModelEditor).
     float getNewBoneOffset() const { return m_newBoneOffset; }
     void  setNewBoneOffset(float v) { m_newBoneOffset = (v < 0.0f) ? 0.0f : v; }

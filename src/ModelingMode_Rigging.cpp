@@ -459,8 +459,10 @@ void ModelingMode::drawSkeletonOverlay(float vpX, float vpY, float vpW, float vp
             drawList->AddCircleFilled(headScreen, radius + 1.0f, outlineColor);
             drawList->AddCircleFilled(headScreen, radius, markerColor);
 
-            // Draw bone name
-            if (m_showBoneNames && (isSelected || numBones <= 20)) {
+            // Draw bone name. "Show Bone Names" is an explicit user toggle, so
+            // honor it for every bone — the old numBones<=20 declutter cap hid
+            // names on typical humanoid rigs (24 bones).
+            if (m_showBoneNames) {
                 drawList->AddText(ImVec2(headScreen.x + radius + 3, headScreen.y - 7),
                                   isSelected ? IM_COL32(255, 255, 100, 255) : IM_COL32(200, 200, 200, 180),
                                   skel.bones[i].name.c_str());
@@ -469,6 +471,79 @@ void ModelingMode::drawSkeletonOverlay(float vpX, float vpY, float vpW, float vp
     }
 
     drawList->PopClipRect();
+}
+
+// Draw the imported GLB skinned model's skeleton, posed at the current animation
+// frame. Unlike drawSkeletonOverlay (which draws the LIME editor skeleton from
+// m_bonePositions), this reads the live pose from the skinned model's animation
+// player, so the bones move with playback / scrubbing.
+void ModelingMode::drawSkinnedSkeletonOverlay(float vpX, float vpY, float vpW, float vpH) {
+    if (!m_showSkinnedSkeleton || !m_ctx.selectedObject) return;
+    if (!m_ctx.selectedObject->isSkinned()) return;
+    uint32_t handle = m_ctx.selectedObject->getSkinnedModelHandle();
+    if (handle == UINT32_MAX) return;
+
+    auto* data = m_ctx.skinnedModelRenderer.getModelData(handle);
+    if (!data || !data->skeleton) return;
+    const Skeleton& skel = *data->skeleton;
+    if (skel.bones.empty()) return;
+
+    // Skinning matrices (globalBoneTransform * inverseBindMatrix), model space.
+    const std::vector<glm::mat4>& skinMats = data->animPlayer.getBoneMatrices();
+
+    // Recover each joint's world position in mesh/model space:
+    //   global = skin * inverse(inverseBind);  jointPos = global[3]
+    // If no animation pose has been computed yet, fall back to the bind pose.
+    std::vector<glm::vec3> jointPos(skel.bones.size());
+    for (size_t i = 0; i < skel.bones.size(); ++i) {
+        glm::mat4 global;
+        if (i < skinMats.size()) {
+            global = skinMats[i] * glm::inverse(skel.bones[i].inverseBindMatrix);
+        } else {
+            global = glm::inverse(skel.bones[i].inverseBindMatrix);
+        }
+        jointPos[i] = glm::vec3(global[3]);
+    }
+
+    Camera& activeCamera = (m_ctx.splitView && vpX > 0) ? m_ctx.camera2 : m_ctx.camera;
+    glm::mat4 view = activeCamera.getViewMatrix();
+    glm::mat4 proj = activeCamera.getProjectionMatrix(vpW / vpH);
+    glm::mat4 vp = proj * view;
+    glm::mat4 modelMatrix = m_ctx.selectedObject->getTransform().getMatrix();
+
+    auto worldToScreen = [&](const glm::vec3& p) -> ImVec2 {
+        glm::vec4 clip = vp * modelMatrix * glm::vec4(p, 1.0f);
+        if (clip.w <= 0.0f) return ImVec2(-1000, -1000);
+        glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        return ImVec2(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+    };
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+
+    int numBones = static_cast<int>(skel.bones.size());
+    for (int i = 0; i < numBones; ++i) {
+        ImVec2 headScreen = worldToScreen(jointPos[i]);
+
+        int parentIdx = skel.bones[i].parentIndex;
+        if (parentIdx >= 0 && parentIdx < numBones) {
+            ImVec2 parentScreen = worldToScreen(jointPos[parentIdx]);
+            if (headScreen.x > -500 && parentScreen.x > -500) {
+                dl->AddLine(headScreen, parentScreen, IM_COL32(120, 230, 160, 220), 2.0f);
+            }
+        }
+
+        if (headScreen.x > -500) {
+            dl->AddCircleFilled(headScreen, 4.0f, IM_COL32(0, 0, 0, 200));
+            dl->AddCircleFilled(headScreen, 3.0f, IM_COL32(80, 255, 140, 235));
+            if (m_showBoneNames && numBones <= 40) {
+                dl->AddText(ImVec2(headScreen.x + 5, headScreen.y - 7),
+                            IM_COL32(150, 255, 190, 200), skel.bones[i].name.c_str());
+            }
+        }
+    }
+
+    dl->PopClipRect();
 }
 
 // ============================ Two-bone leg IK ============================
