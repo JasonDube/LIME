@@ -201,6 +201,13 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
     const glm::quat tr = obj->getTransform().getRotation();
     const glm::vec3 ts = obj->getTransform().getScale();
 
+    // Rung 2: LIMEANIM v2 files also carry per-bone WORLD rotation deltas
+    // (quat wxyz) — the twist/roll that positions can't encode. When present we
+    // fill boneRotationsPerKey so playback slerps them; unmatched rig bones get
+    // identity.
+    bool hasRot = !j["frames"].empty() && j["frames"][0].contains("bone_rotations");
+    int matchedRot = 0;
+
     for (const auto& jf : j["frames"]) {
         float t = jf.value("time", 0.0f);
         std::vector<glm::vec3> bones(rigCount, glm::vec3(0.0f));
@@ -218,8 +225,26 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
         track.rotations.push_back(tr);
         track.scales.push_back(ts);
         track.bonePositionsPerKey.push_back(std::move(bones));
-        track.boneRotationsPerKey.emplace_back();  // positions-only (Rung 1)
+
+        if (hasRot && jf.contains("bone_rotations")) {
+            const auto& br = jf["bone_rotations"];
+            std::vector<glm::quat> rots(rigCount, glm::quat(1, 0, 0, 0));
+            for (size_t b = 0; b < rigCount; ++b) {
+                int c = rigToCol[b];
+                if (c >= 0 && c < static_cast<int>(br.size()) && br[c].size() >= 4) {
+                    // stored wxyz -> glm::quat(w, x, y, z)
+                    rots[b] = glm::normalize(glm::quat(br[c][0].get<float>(), br[c][1].get<float>(),
+                                                       br[c][2].get<float>(), br[c][3].get<float>()));
+                    ++matchedRot;
+                }
+            }
+            track.boneRotationsPerKey.push_back(std::move(rots));
+        } else {
+            track.boneRotationsPerKey.emplace_back();  // positions-only (Rung 1)
+        }
     }
+    if (hasRot) std::cout << "[ImportAnim] rotations: " << (matchedRot / std::max<size_t>(1, track.times.size()))
+                          << " bones/frame\n";
 
     if (track.times.empty()) { std::cout << "[ImportAnim] File had no frames\n"; return; }
 
