@@ -1593,6 +1593,9 @@ private:
                 }
             }
         });
+
+        // Background pipelines (Auto-Rig, etc.) use this to open their result.
+        m_editorContext->requestLoadModel = [this](const std::string& p) { loadModel(p); };
     }
 
     void switchMode(EditorModeType type) {
@@ -3276,6 +3279,7 @@ private:
             obj->setBufferHandle(handle);
             obj->setIndexCount(static_cast<uint32_t>(mesh.indices.size()));
             obj->setVertexCount(static_cast<uint32_t>(mesh.vertices.size()));
+            obj->setModelPath(path);  // source GLB (used by Anim from Video to find the rig)
             obj->setMeshData(mesh.vertices, mesh.indices);
 
             // Update GPU with recolored vertices

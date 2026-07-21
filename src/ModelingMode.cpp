@@ -204,6 +204,47 @@ void ModelingMode::update(float deltaTime) {
         }
     }
 
+    // Auto-Rig pipeline finished? Reload the rigged model on the main thread.
+    if (m_autoRigDone.exchange(false)) {
+        m_autoRigRunning = false;
+        if (m_autoRigOk) {
+            std::cout << "[AutoRig] Done — loading " << m_autoRigOut << std::endl;
+            // Hide the unrigged source object first: the rigged model loads at
+            // the same spot, and two stacked copies means viewport clicks keep
+            // selecting the rig-less twin ("it didn't bind!").
+            if (!m_autoRigSourceName.empty()) {
+                for (auto& so : m_ctx.sceneObjects) {
+                    if (so && so->getName() == m_autoRigSourceName && !so->isSkinned()) {
+                        so->setVisible(false);
+                        std::cout << "[AutoRig] Hid unrigged source object '"
+                                  << m_autoRigSourceName << "'" << std::endl;
+                        break;
+                    }
+                }
+            }
+            m_autoRigStatus = "Done: " + std::filesystem::path(m_autoRigOut).filename().string()
+                            + " loaded (source hidden)";
+            if (m_ctx.requestLoadModel) m_ctx.requestLoadModel(m_autoRigOut);
+        } else {
+            std::cout << "[AutoRig] FAILED — see /tmp/mesh2rig_lime.log" << std::endl;
+            m_autoRigStatus = "FAILED — see /tmp/mesh2rig_lime.log";
+        }
+    }
+
+    // Anim-from-Video pipeline finished? Import the result on the main thread.
+    if (m_vid2animDone.exchange(false)) {
+        m_vid2animRunning = false;
+        if (m_vid2animOk) {
+            std::cout << "[Vid2Anim] Pipeline done — importing " << m_vid2animOutJson << std::endl;
+            importBoneAnimationJSON(m_vid2animOutJson);
+            m_vid2animStatus = "Done: imported "
+                             + std::filesystem::path(m_vid2animOutJson).filename().string();
+        } else {
+            std::cout << "[Vid2Anim] FAILED — see /tmp/clip2anim_lime.log" << std::endl;
+            m_vid2animStatus = "FAILED (bad clip range?) — see /tmp/clip2anim_lime.log";
+        }
+    }
+
     // Process deferred clone image deletions (must happen before ImGui rendering)
     if (m_pendingCloneImageDelete >= 0 && m_pendingCloneImageDelete < static_cast<int>(m_ctx.cloneSourceImages.size())) {
         int idx = m_pendingCloneImageDelete;
@@ -2097,6 +2138,31 @@ void ModelingMode::renderModelingEditorUI() {
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Rigging");
             ImGui::Separator();
 
+            // Auto-Rig: local UniRig skeleton + skinning prediction on the
+            // selected mesh (one-time per character; ~3 min on GPU). The rigged
+            // GLB auto-loads when done. Separate from Anim from Video, which
+            // only animates an ALREADY-rigged model.
+            if (m_autoRigRunning) {
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
+                                   "Auto-rigging... (~3 min, GPU busy)");
+            } else {
+                if (ImGui::Button("Auto-Rig (UniRig)")) {
+                    launchAutoRig();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Predict a full skeleton + skinning weights for this mesh\n"
+                                      "with UniRig (local AI, MIT). Writes <mesh>_rigged.glb next\n"
+                                      "to the source and loads it. Use on an UNRIGGED mesh;\n"
+                                      "re-running re-rigs from the source mesh.");
+                }
+            }
+            if (!m_autoRigStatus.empty() && !m_autoRigRunning) {
+                bool failed = m_autoRigStatus.rfind("FAILED", 0) == 0;
+                ImGui::TextColored(failed ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
+                                          : ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                                   "%s", m_autoRigStatus.c_str());
+            }
+
             if (m_riggingMode) {
                 auto& skel = m_ctx.editableMesh.getSkeleton();
                 int numBones = static_cast<int>(skel.bones.size());
@@ -2707,6 +2773,77 @@ void ModelingMode::renderModelingEditorUI() {
                             importBoneAnimationJSON(outPath);
                             NFD_FreePath(outPath);
                         }
+                    }
+
+                    // Anim from Video: full pipeline — pick ANY video (Grok Imagine,
+                    // phone footage, ...), run local 3D mocap (GVHMR) + rotation
+                    // retarget in the background, auto-import onto this rig.
+                    if (m_vid2animRunning) {
+                        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
+                                           "Generating anim from video... (~1 min, GPU busy)");
+                    } else {
+                        sameLineIfButtonFits("Anim from Video...");
+                        if (ImGui::Button("Anim from Video...")) {
+                            nfdchar_t* vPath = nullptr;
+                            nfdfilteritem_t vf[1] = {{"Video", "mp4,mov,webm,mkv,avi"}};
+                            if (NFD_OpenDialog(&vPath, vf, 1, nullptr) == NFD_OKAY) {
+                                m_vid2animVideoPath = vPath;
+                                NFD_FreePath(vPath);
+                                m_vid2animStartFrame = 0;
+                                m_vid2animEndFrame = 0;
+                                probeVideoInfo();  // fill total frames + fps
+                                m_vid2animShowPopup = true;
+                            }
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Generate an animation FROM a video clip:\n"
+                                              "local 3D mocap (GVHMR) + retarget onto this rig.\n"
+                                              "Prompt a clip in Grok Imagine, point this at it.");
+                        }
+                    }
+                    // Persistent status so a fast failure / a finished run doesn't vanish.
+                    if (!m_vid2animStatus.empty() && !m_vid2animRunning) {
+                        bool failed = m_vid2animStatus.rfind("FAILED", 0) == 0;
+                        ImGui::TextColored(failed ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
+                                                  : ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                                           "%s", m_vid2animStatus.c_str());
+                    }
+                    if (m_vid2animShowPopup) {
+                        ImGui::OpenPopup("Anim from Video");
+                        m_vid2animShowPopup = false;
+                    }
+                    if (ImGui::BeginPopupModal("Anim from Video", nullptr,
+                                               ImGuiWindowFlags_AlwaysAutoResize)) {
+                        ImGui::Text("Video: %s",
+                                    std::filesystem::path(m_vid2animVideoPath).filename().string().c_str());
+                        if (m_vid2animTotalFrames > 0)
+                            ImGui::Text("%d frames @ %.0f fps  (frame 0 .. %d)",
+                                        m_vid2animTotalFrames, m_vid2animFps,
+                                        m_vid2animTotalFrames - 1);
+                        ImGui::Separator();
+                        ImGui::Checkbox("Use clip range (frames)", &m_vid2animUseRange);
+                        int maxF = (m_vid2animTotalFrames > 0) ? m_vid2animTotalFrames - 1 : 100000;
+                        if (m_vid2animUseRange) {
+                            ImGui::SetNextItemWidth(110);
+                            ImGui::InputInt("Start frame", &m_vid2animStartFrame);
+                            ImGui::SetNextItemWidth(110);
+                            ImGui::InputInt("End frame", &m_vid2animEndFrame);
+                            m_vid2animStartFrame = std::clamp(m_vid2animStartFrame, 0, maxF);
+                            m_vid2animEndFrame   = std::clamp(m_vid2animEndFrame, 0, maxF);
+                        } else {
+                            ImGui::TextDisabled("The whole video will be used.");
+                        }
+                        bool rangeOk = !m_vid2animUseRange ||
+                                       (m_vid2animEndFrame > m_vid2animStartFrame);
+                        if (!rangeOk)
+                            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "End frame must be after Start");
+                        if (ImGui::Button("Generate") && rangeOk) {
+                            launchVideoToAnim();
+                            ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
                     }
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Load a pose2anim *.limeanim.json (per-frame bone positions\nderived from a video) onto this rig. Bones matched by name.\nSet Bind Pose first to see it deform. Rung 1: positions only.");

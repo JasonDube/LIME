@@ -348,6 +348,10 @@ struct EditorContext {
     std::string& currentFilePath;  // Full path to the currently loaded file
     int& currentFileFormat;        // 0=none, 1=OBJ, 2=LIME, 3=GLB
 
+    // Ask the editor to load a model file (set by main.cpp -> loadModel).
+    // Used by background pipelines (e.g. Auto-Rig) to open their result.
+    std::function<void(const std::string&)> requestLoadModel;
+
     // Project directory (default path for file dialogs)
     std::string& projectPath;
 

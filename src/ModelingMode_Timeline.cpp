@@ -13,7 +13,9 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -258,6 +260,132 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
               << m_objectAnims[obj].times.back() << "s, from " << path << "\n";
     if (!(m_hasBindPose && m_bindPoseOwner == obj))
         std::cout << "[ImportAnim] NOTE: Set Bind Pose on this object to see the animation play/deform.\n";
+}
+
+// Probe the chosen video for total frame count + fps (via ffprobe) so the
+// clip-range UI can work in FRAMES and validate the range up front.
+void ModelingMode::probeVideoInfo() {
+    m_vid2animTotalFrames = 0;
+    m_vid2animFps = 0.0;
+    if (m_vid2animVideoPath.empty()) return;
+    std::string cmd =
+        "ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate "
+        "-of csv=p=0 '" + m_vid2animVideoPath + "' 2>/dev/null; "
+        "ffprobe -v error -show_entries format=duration -of csv=p=0 '"
+        + m_vid2animVideoPath + "' 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return;
+    char buf[128];
+    double fps = 0.0, dur = 0.0;
+    if (fgets(buf, sizeof(buf), pipe)) {   // r_frame_rate, e.g. "24/1"
+        int a = 0, b = 1;
+        if (std::sscanf(buf, "%d/%d", &a, &b) >= 1 && b != 0) fps = static_cast<double>(a) / b;
+    }
+    if (fgets(buf, sizeof(buf), pipe)) dur = std::atof(buf);  // duration seconds
+    pclose(pipe);
+    m_vid2animFps = fps > 0 ? fps : 24.0;
+    m_vid2animTotalFrames = static_cast<int>(dur * m_vid2animFps + 0.5);
+    if (m_vid2animEndFrame <= 0 && m_vid2animTotalFrames > 0)
+        m_vid2animEndFrame = m_vid2animTotalFrames - 1;
+}
+
+// Spawn the pose2anim clip2anim pipeline (GVHMR local 3D mocap + rotation
+// retarget) on the chosen video, in a detached worker so the UI stays live.
+// The rig GLB is taken from the selected object (or the currently open file);
+// completion is polled in update(), which auto-imports the resulting JSON.
+void ModelingMode::launchVideoToAnim() {
+    if (m_vid2animRunning) return;
+
+    std::string glb;
+    if (m_ctx.selectedObject && !m_ctx.selectedObject->getModelPath().empty())
+        glb = m_ctx.selectedObject->getModelPath();
+    else
+        glb = m_ctx.currentFilePath;
+    if (glb.empty() || m_vid2animVideoPath.empty()) {
+        std::cout << "[Vid2Anim] Need an imported rig GLB and a video first\n";
+        return;
+    }
+
+    const char* homeEnv = std::getenv("HOME");
+    std::string script = std::string(homeEnv ? homeEnv : "") + "/Desktop/pose2anim/clip2anim.sh";
+    if (!std::filesystem::exists(script)) {
+        std::cout << "[Vid2Anim] Pipeline script not found: " << script << "\n";
+        return;
+    }
+
+    std::filesystem::path vp(m_vid2animVideoPath);
+    std::string outName = vp.stem().string();
+    std::string rangeArgs;
+    if (m_vid2animUseRange) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " %d %d", m_vid2animStartFrame, m_vid2animEndFrame);
+        rangeArgs = buf;
+        char tag[48];
+        std::snprintf(tag, sizeof(tag), "_f%d-%d", m_vid2animStartFrame, m_vid2animEndFrame);
+        outName += tag;
+    }
+    std::string out = (vp.parent_path() / (outName + ".limeanim.json")).string();
+
+    std::string cmd = "'" + script + "' '" + m_vid2animVideoPath + "' '" + glb + "' '" + out + "'"
+                    + rangeArgs + " > /tmp/clip2anim_lime.log 2>&1";
+
+    m_vid2animOutJson = out;
+    m_vid2animRunning = true;
+    m_vid2animDone = false;
+    m_vid2animOk = false;
+    m_vid2animStatus = "Generating from " + vp.filename().string()
+                     + (m_vid2animUseRange ? " (frames " + std::to_string(m_vid2animStartFrame)
+                                             + ".." + std::to_string(m_vid2animEndFrame) + ")"
+                                           : " (whole clip)") + "...";
+    std::cout << "[Vid2Anim] Running: " << cmd << "\n";
+
+    std::thread([this, cmd, out]() {
+        int rc = std::system(cmd.c_str());
+        m_vid2animOk = (rc == 0) && std::filesystem::exists(out);
+        m_vid2animDone = true;
+    }).detach();
+}
+
+// Auto-Rig: run the mesh2rig pipeline (UniRig skeleton + skinning, local GPU)
+// on the selected object's source mesh in a detached worker. Completion is
+// polled in update(), which reloads the rigged GLB via m_ctx.requestLoadModel.
+void ModelingMode::launchAutoRig() {
+    if (m_autoRigRunning || m_vid2animRunning) return;
+
+    std::string mesh;
+    if (m_ctx.selectedObject && !m_ctx.selectedObject->getModelPath().empty())
+        mesh = m_ctx.selectedObject->getModelPath();
+    else
+        mesh = m_ctx.currentFilePath;
+    if (mesh.empty()) {
+        m_autoRigStatus = "FAILED: no source mesh file known (open the model first)";
+        return;
+    }
+
+    const char* homeEnv = std::getenv("HOME");
+    std::string script = std::string(homeEnv ? homeEnv : "") + "/Desktop/pose2anim/mesh2rig.sh";
+    if (!std::filesystem::exists(script)) {
+        m_autoRigStatus = "FAILED: pipeline script not found: " + script;
+        return;
+    }
+
+    std::filesystem::path mp(mesh);
+    std::string out = (mp.parent_path() / (mp.stem().string() + "_rigged.glb")).string();
+    std::string cmd = "'" + script + "' '" + mesh + "' '" + out + "' > /tmp/mesh2rig_lime.log 2>&1";
+
+    m_autoRigOut = out;
+    m_autoRigSourceName = m_ctx.selectedObject ? m_ctx.selectedObject->getName() : "";
+    m_autoRigRunning = true;
+    m_autoRigDone = false;
+    m_autoRigOk = false;
+    m_autoRigStatus = "Auto-rigging " + mp.filename().string() + "...";
+    std::cout << "[AutoRig] Running: " << cmd << "\n";
+
+    std::thread([this, cmd, out]() {
+        int rc = std::system(cmd.c_str());
+        m_autoRigOk = (rc == 0) && std::filesystem::exists(out);
+        m_autoRigDone = true;
+    }).detach();
 }
 
 // Normalized world rotation of a matrix's upper 3x3 (removes any scale, e.g.

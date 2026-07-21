@@ -70,6 +70,16 @@ just so good ideas don't fall on the floor.
 
 ## Animation authoring
 
+- [ ] **Animation clip LIBRARY (one model, many clips)** — wanted for the clip2anim
+      pipeline. Today `m_objectAnims` holds ONE track per object and Import Anim
+      REPLACES it. Build: named clip list per object (Import Anim appends: "walk",
+      "spin", ...), selector for which plays on the timeline, persisted in the
+      `.lime` RIG_RUNTIME blob; Export Skinned GLB writes ALL clips into the glTF
+      `animations` array. Eden runtime already supports multi-clip
+      (`SkinnedModelRenderer::playAnimation(handle, name)`) — game switches by name.
+      Bonus: "extract clip from GLB" to merge Meshy's one-clip-per-file exports
+      onto one model.
+
 - [x] ~~Rotation tracks in keyframes~~ — done; Set Key now snapshots
       `m_boneWorldRotations` alongside positions, playback slerps both.
 - [ ] **Rotation channels in skinned-GLB export**. Now that LIME tracks
@@ -77,6 +87,15 @@ just so good ideas don't fall on the floor.
       glTF `rotation` channels instead of just `translation`. Eden's
       `AnimationPlayer` already loads `target_path = "rotation"`, so the
       runtime side just works once the export does.
+- [ ] **"Anim Adjust" panel — animation-wide correction sliders.** Post-import
+      dials on the loaded track: Leg Stance (frontal splay ±), Spine Lean
+      (sagittal ±), Head Pitch (±). Each rotates that bone group's rotation keys
+      by a constant and re-FKs positions below — non-destructive art-direction
+      layer on top of the pipeline's auto-leveling (which handles the constant-
+      bias 95% case automatically; sliders cover intentional leans the auto-level
+      flattens — crouch/bow/wide-stance — plus taste tweaks). Pairs with the
+      pipeline flags --keep-posture / --keep-stance.
+
 - [ ] **Onion skin / ghosting** — show the previous and next keyframe poses
       faintly behind the current pose for timing reference.
 - [ ] **Editable curves** — drag the segment between keys in the timeline to

@@ -2,6 +2,8 @@
 
 #include "IEditorMode.hpp"
 #include "EditorContext.hpp"
+#include <atomic>
+#include <thread>
 
 namespace eden { struct SkinnedLoadResult; }
 
@@ -124,6 +126,34 @@ private:
     void reskinFromBoneDeltas();  // Recompute deformed verts from bind + current bone positions (LBS or DQS based on m_useDQS)
     void exportSkinnedAnimatedGLB(); // Save the rigged + animated selected object
     void importBoneAnimationJSON(const std::string& path); // Load a pose2anim *.limeanim.json onto the selected rig (positions-only)
+
+    // "Anim from Video": run the pose2anim clip2anim pipeline (GVHMR 3D mocap +
+    // rotation retarget) on a chosen video in a background process, then
+    // auto-import the resulting .limeanim.json onto the selected rig.
+    void launchVideoToAnim();            // spawn the detached worker
+    void probeVideoInfo();               // fill total frames + fps from the chosen video
+    std::atomic<bool> m_vid2animRunning{false};
+    std::atomic<bool> m_vid2animDone{false};
+    std::atomic<bool> m_vid2animOk{false};
+    std::string m_vid2animVideoPath;     // chosen source video
+    std::string m_vid2animOutJson;       // expected pipeline output
+    std::string m_vid2animStatus;        // PERSISTENT last-run status shown in the panel
+    bool  m_vid2animShowPopup = false;   // open the options modal next frame
+    bool  m_vid2animUseRange = false;    // whole video vs [start,end] FRAMES
+    int   m_vid2animStartFrame = 0;
+    int   m_vid2animEndFrame = 0;
+    int   m_vid2animTotalFrames = 0;     // probed from the chosen video
+    double m_vid2animFps = 0.0;
+
+    // "Auto-Rig (UniRig)": run local skeleton+skinning prediction on the selected
+    // (unrigged) mesh in a background process, then reload the rigged result.
+    void launchAutoRig();
+    std::atomic<bool> m_autoRigRunning{false};
+    std::atomic<bool> m_autoRigDone{false};
+    std::atomic<bool> m_autoRigOk{false};
+    std::string m_autoRigOut;            // rigged GLB the pipeline will produce
+    std::string m_autoRigStatus;         // persistent last-run status
+    std::string m_autoRigSourceName;     // scene object that was rigged (hidden on success)
     // Rig-runtime (bind pose + keyframes) persistence embedded in .lime files.
     std::string serializeRigRuntime(SceneObject* obj);
     void deserializeRigRuntime(const std::string& blob, SceneObject* obj);
