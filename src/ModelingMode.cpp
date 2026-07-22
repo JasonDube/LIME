@@ -2782,6 +2782,41 @@ void ModelingMode::renderModelingEditorUI() {
                         ImGui::SetTooltip("Save mesh + skeleton + weights + keyframed animation\nas a GLB the engine can play with GPU skinning.\nRequires Set Bind Pose + at least one keyframe.");
                     }
 
+                    // --- Named clip library: assemble idle+walk+... on ONE model,
+                    //     then export a single multi-clip GLB for the game.
+                    if (m_ctx.selectedObject && m_objectAnims.count(m_ctx.selectedObject)) {
+                        ImGui::Separator();
+                        ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f), "Animation Clips (for the game)");
+                        ImGui::SetNextItemWidth(110);
+                        ImGui::InputText("##clipname", m_clipNameBuf, sizeof(m_clipNameBuf));
+                        ImGui::SameLine();
+                        if (ImGui::Button("Save Current Clip")) {
+                            auto& lib = m_namedClips[m_ctx.selectedObject];
+                            std::string nm = m_clipNameBuf[0] ? m_clipNameBuf : ("clip" + std::to_string(lib.size() + 1));
+                            bool replaced = false;
+                            for (auto& pr : lib) if (pr.first == nm) { pr.second = m_objectAnims[m_ctx.selectedObject]; replaced = true; break; }
+                            if (!replaced) lib.push_back({nm, m_objectAnims[m_ctx.selectedObject]});
+                            std::cout << "[Clips] saved '" << nm << "' (" << lib.size() << " total)\n";
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Save the CURRENT (corrected) animation under this name.\n"
+                                              "Import idle -> correct -> Save 'idle'; import walk -> Save 'walk';\n"
+                                              "then Export Multi-Clip GLB. Re-saving a name overwrites it.");
+
+                        auto& lib = m_namedClips[m_ctx.selectedObject];
+                        for (size_t ci = 0; ci < lib.size(); ++ci) {
+                            ImGui::BulletText("%s", lib[ci].first.c_str());
+                            ImGui::SameLine(); ImGui::PushID(static_cast<int>(ci));
+                            if (ImGui::SmallButton("remove")) { lib.erase(lib.begin() + ci); ImGui::PopID(); break; }
+                            ImGui::PopID();
+                        }
+                        if (!lib.empty()) {
+                            if (ImGui::Button("Export Multi-Clip GLB")) exportMultiClipGLB();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Export the model with ALL saved clips as one GLB\n(e.g. idle+walk) for the game. Requires Set Bind Pose.");
+                        }
+                    }
+
                     // pose2anim: load a video-derived bone animation onto this rig.
                     sameLineIfButtonFits("Import Anim (JSON)");
                     if (ImGui::Button("Import Anim (JSON)")) {

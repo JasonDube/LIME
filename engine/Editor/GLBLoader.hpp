@@ -99,6 +99,29 @@ public:
                      const std::string& meshName = "mesh",
                      const std::string& animName = "Take 001");
 
+    // One named animation clip (LIME translation-only rig): per-key bone world
+    // head positions on a shared timeline.
+    struct SkinnedAnimClip {
+        std::string name;
+        std::vector<float> times;
+        std::vector<std::vector<glm::vec3>> boneWorldPosPerKey;  // [key][bone]
+    };
+    // Export a skinned mesh with MULTIPLE named animation clips into one GLB
+    // (e.g. "idle" + "walk" on the same model). Each clip becomes its own glTF
+    // animation sharing the mesh/skin.
+    static bool saveSkinnedAnimatedMulti(const std::string& filepath,
+                     const std::vector<ModelVertex>& vertices,
+                     const std::vector<uint32_t>& indices,
+                     const std::vector<glm::ivec4>& perVertexBoneIndices,
+                     const std::vector<glm::vec4>& perVertexBoneWeights,
+                     const Skeleton& skeleton,
+                     const std::vector<glm::vec3>& bindBoneWorldPos,
+                     const std::vector<SkinnedAnimClip>& clips,
+                     const unsigned char* textureData,
+                     int textureWidth,
+                     int textureHeight,
+                     const std::string& meshName = "mesh");
+
 private:
     static glm::vec3 calculateNormal(
         const glm::vec3& v0,

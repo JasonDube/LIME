@@ -105,6 +105,12 @@ private:
     // "correction_bones" (retargeter tells us which anonymous bone is which).
     std::unordered_map<SceneObject*, std::unordered_map<std::string, int>> m_correctionBones;
 
+    // Named-clip library: build idle+walk+... on one model (each a saved,
+    // corrected track), then export them all as ONE multi-clip GLB for the game.
+    std::unordered_map<SceneObject*, std::vector<std::pair<std::string, ObjectAnimTrack>>> m_namedClips;
+    char m_clipNameBuf[64] = "idle";
+    void exportMultiClipGLB();
+
     // Bind pose for the currently selected rigged object. Populated by the
     // "Set Bind Pose" button in the rigging panel. After this is set, bone
     // gizmo drags stop baking deformation into vertex positions — the mesh

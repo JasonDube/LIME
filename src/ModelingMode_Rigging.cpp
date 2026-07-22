@@ -212,6 +212,56 @@ void ModelingMode::reskinFromBoneDeltas() {
     }
 }
 
+void ModelingMode::exportMultiClipGLB() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) { std::cout << "[Export] No object selected\n"; return; }
+    if (!m_hasBindPose || m_bindPoseOwner != obj) { std::cout << "[Export] Set Bind Pose first\n"; return; }
+    if (!m_ctx.editableMesh.isValid()) return;
+    auto libIt = m_namedClips.find(obj);
+    if (libIt == m_namedClips.end() || libIt->second.empty()) { std::cout << "[Export] No saved clips\n"; return; }
+
+    // Bind-pose mesh (same as exportSkinnedAnimatedGLB).
+    std::vector<ModelVertex> verts; std::vector<uint32_t> indices;
+    m_ctx.editableMesh.triangulate(verts, indices, m_ctx.hiddenFaces);
+    if (verts.size() != m_bindPoseVerts.size()) { std::cout << "[Export] Vertex count changed since Set Bind Pose; re-bind\n"; return; }
+    for (size_t i = 0; i < verts.size(); ++i) verts[i].position = m_bindPoseVerts[i];
+
+    const auto& heVerts = m_ctx.editableMesh.getVerticesData();
+    std::vector<glm::ivec4> boneIdx(heVerts.size());
+    std::vector<glm::vec4>  boneWts(heVerts.size());
+    for (size_t i = 0; i < heVerts.size(); ++i) { boneIdx[i] = heVerts[i].boneIndices; boneWts[i] = heVerts[i].boneWeights; }
+
+    // Gather every saved clip (only its rigged keys) into the multi-clip format.
+    std::vector<GLBLoader::SkinnedAnimClip> clips;
+    for (const auto& [name, tr] : libIt->second) {
+        GLBLoader::SkinnedAnimClip clip; clip.name = name;
+        for (size_t k = 0; k < tr.times.size(); ++k) {
+            if (k < tr.bonePositionsPerKey.size() && !tr.bonePositionsPerKey[k].empty()) {
+                clip.times.push_back(tr.times[k]);
+                clip.boneWorldPosPerKey.push_back(tr.bonePositionsPerKey[k]);
+            }
+        }
+        if (!clip.times.empty()) clips.push_back(std::move(clip));
+    }
+    if (clips.empty()) { std::cout << "[Export] Saved clips have no rigged keys\n"; return; }
+
+    const unsigned char* texData = nullptr; int texW = 0, texH = 0;
+    if (obj->hasTextureData()) { texData = obj->getTextureData().data(); texW = obj->getTextureWidth(); texH = obj->getTextureHeight(); }
+
+    nfdchar_t* outPath = nullptr;
+    nfdfilteritem_t filters[1] = {{"GLB Skinned Model", "glb"}};
+    std::string defaultName = obj->getName() + "_clips.glb";
+    if (NFD_SaveDialog(&outPath, filters, 1, riggingNfdDefaultDir(m_ctx.projectPath), defaultName.c_str()) != NFD_OKAY) return;
+    std::string filepath = outPath; NFD_FreePath(outPath);
+    if (filepath.size() < 4 || filepath.substr(filepath.size() - 4) != ".glb") filepath += ".glb";
+
+    bool ok = GLBLoader::saveSkinnedAnimatedMulti(
+        filepath, verts, indices, boneIdx, boneWts,
+        m_ctx.editableMesh.getSkeleton(), m_bindPoseBonePositions,
+        clips, texData, texW, texH, obj->getName());
+    std::cout << (ok ? "[Export] OK (" : "[Export] FAILED (") << clips.size() << " clips): " << filepath << std::endl;
+}
+
 void ModelingMode::exportSkinnedAnimatedGLB() {
     SceneObject* obj = m_ctx.selectedObject;
     if (!obj) {
