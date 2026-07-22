@@ -256,6 +256,18 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
     m_timelineLastAppliedTime = -1.0f;  // force re-apply on next tick
     m_stancePristine.erase(obj); m_stanceWidth = 0.0f;  // fresh anim -> stance slider resets
 
+    // Body-part -> rig-bone map from the retargeter, so correction sliders find
+    // the right bones on any rig (esp. anonymous UniRig bone_N names).
+    m_correctionBones.erase(obj);
+    if (j.contains("correction_bones")) {
+        for (auto& [role, bname] : j["correction_bones"].items()) {
+            std::string want = lower(bname.get<std::string>());
+            for (size_t b = 0; b < rigCount; ++b)
+                if (lower(skel.bones[b].name) == want) { m_correctionBones[obj][role] = static_cast<int>(b); break; }
+        }
+        std::cout << "[ImportAnim] correction_bones: " << m_correctionBones[obj].size() << " roles mapped\n";
+    }
+
     std::cout << "[ImportAnim] " << m_objectAnims[obj].times.size() << " keyframes, "
               << matched << "/" << rigCount << " bones matched, duration "
               << m_objectAnims[obj].times.back() << "s, from " << path << "\n";
@@ -659,14 +671,43 @@ void ModelingMode::applyStanceWidth(SceneObject* obj, float degrees) {
     ObjectAnimTrack out = m_stancePristine[obj];   // copy, then correct legs
     m_stanceWidth = degrees;
 
-    if (std::abs(degrees) > 1e-4f) {
-        auto isUpLeg = [](const std::string& nm) {
-            std::string s; for (char c : nm) s += static_cast<char>(std::tolower((unsigned char)c));
-            return s.find("upleg") != std::string::npos;
-        };
-        std::vector<int> thighs;
-        for (size_t b = 0; b < n; ++b) if (isUpLeg(skel.bones[b].name)) thighs.push_back(static_cast<int>(b));
+    auto lc = [](const std::string& nm){ std::string s; for(char c:nm) s+=static_cast<char>(std::tolower((unsigned char)c)); return s; };
 
+    // Thigh bones: PREFER the retargeter's role map (works for anonymous rigs);
+    // fall back to name matching for imported (named) anims.
+    std::vector<int> thighs;
+    auto ci = m_correctionBones.find(obj);
+    if (ci != m_correctionBones.end()) {
+        for (const char* role : {"thigh_l", "thigh_r"}) {
+            auto r = ci->second.find(role);
+            if (r != ci->second.end() && r->second >= 0 && r->second < static_cast<int>(n))
+                thighs.push_back(r->second);
+        }
+    }
+    if (thighs.empty()) {
+        for (size_t b = 0; b < n; ++b) {
+            std::string s = lc(skel.bones[b].name);
+            if (s.find("upleg")!=std::string::npos || s.find("thigh")!=std::string::npos ||
+                s.find("upperleg")!=std::string::npos || s.find("upper_leg")!=std::string::npos)
+                thighs.push_back(static_cast<int>(b));
+        }
+    }
+
+    // Diagnostic (prints on every slider move): what matched? If nothing, list
+    // the leg-ish bone names so we can teach the matcher this rig's naming.
+    std::cout << "[Stance] " << degrees << " deg, matched " << thighs.size() << " thigh(s):";
+    for (int t : thighs) std::cout << " '" << skel.bones[t].name << "'";
+    if (thighs.empty()) {
+        std::cout << " -- NONE. Leg/hip bones in this rig:";
+        for (size_t b = 0; b < n; ++b) {
+            std::string s = lc(skel.bones[b].name);
+            if (s.find("leg")!=std::string::npos || s.find("thigh")!=std::string::npos || s.find("hip")!=std::string::npos)
+                std::cout << " '" << skel.bones[b].name << "'";
+        }
+    }
+    std::cout << std::endl;
+
+    if (std::abs(degrees) > 1e-4f && !thighs.empty()) {
         const size_t F = out.times.size();
         for (size_t f = 0; f < F; ++f) {
             if (f >= out.bonePositionsPerKey.size() || f >= out.boneRotationsPerKey.size()) continue;

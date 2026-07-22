@@ -101,6 +101,9 @@ private:
     // pristine holds the pre-stance track so the slider is non-destructive.
     float m_stanceWidth = 0.0f;
     std::unordered_map<SceneObject*, ObjectAnimTrack> m_stancePristine;
+    // role ("thigh_l"/"spine1"/...) -> rig bone index, from the anim's
+    // "correction_bones" (retargeter tells us which anonymous bone is which).
+    std::unordered_map<SceneObject*, std::unordered_map<std::string, int>> m_correctionBones;
 
     // Bind pose for the currently selected rigged object. Populated by the
     // "Set Bind Pose" button in the rigging panel. After this is set, bone
