@@ -2173,6 +2173,24 @@ void ModelingMode::renderModelingEditorUI() {
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Show/hide IK goal + pole handles independently of the skeleton.");
 
+                // Stance Width — live leg correction that works on ANY animation
+                // with a native track (imported OR generated from video), so it's
+                // persistent unlike A-Pose Fix (which needs the source clip).
+                if (m_ctx.selectedObject && m_objectAnims.count(m_ctx.selectedObject)) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Stance Width");
+                    ImGui::SetNextItemWidth(180);
+                    float stance = m_stanceWidth;
+                    if (ImGui::SliderFloat("Bring Legs In", &stance, 0.0f, 30.0f, "%.0f deg",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyStanceWidth(m_ctx.selectedObject, stance);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Swings both legs inward at the hip to bring the feet\n"
+                                          "closer together (past the A-pose rest). Works on\n"
+                                          "generated animations too. Non-destructive.");
+                }
+
                 // A-Pose spread fix — only for imported skinned GLBs (Meshy/Mixamo)
                 // that carry a baked-in limb spread from the source rig pose.
                 if (m_ctx.selectedObject && m_importedClipSource.count(m_ctx.selectedObject)) {

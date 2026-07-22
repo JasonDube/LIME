@@ -95,6 +95,13 @@ private:
     std::unordered_map<SceneObject*, std::pair<eden::Skeleton, eden::AnimationClip>> m_importedClipSource;
     float m_aposeNeutralize = 0.0f;  // 0..1, current neutralize strength for the selected object
 
+    // Live "Stance Width" leg correction — works on the native track (world
+    // heads + deltas), so it applies to BOTH imported and GENERATED animations
+    // (unlike A-Pose Fix, which needs the source clip). Degrees of inward pull;
+    // pristine holds the pre-stance track so the slider is non-destructive.
+    float m_stanceWidth = 0.0f;
+    std::unordered_map<SceneObject*, ObjectAnimTrack> m_stancePristine;
+
     // Bind pose for the currently selected rigged object. Populated by the
     // "Set Bind Pose" button in the rigging panel. After this is set, bone
     // gizmo drags stop baking deformation into vertex positions — the mesh
@@ -666,6 +673,10 @@ private:
     // `strength` (0..1) of the auto-detected A-pose spread removed on the limb
     // roots (Arm/UpLeg). strength 0 = original mocap.
     void applyAPoseNeutralize(SceneObject* obj, float strength);
+    // Re-derive the object's displayed track from its pristine snapshot with the
+    // thigh subtrees rotated inward by `degrees` (world frontal plane). Non-
+    // destructive; works on generated anims. Pass 0 to clear the correction.
+    void applyStanceWidth(SceneObject* obj, float degrees);
     // Legs: constant LOCAL Y+Z euler floor per UpLeg bone (deg; X=0).
     std::vector<glm::vec3> detectAPoseSpread(const eden::Skeleton& skel,
                                              const eden::AnimationClip& clip);

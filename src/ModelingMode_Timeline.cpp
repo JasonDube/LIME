@@ -254,6 +254,7 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
     m_timelineDuration = std::max(m_timelineDuration, m_objectAnims[obj].times.back());
     m_timelineCurrentTime = 0.0f;
     m_timelineLastAppliedTime = -1.0f;  // force re-apply on next tick
+    m_stancePristine.erase(obj); m_stanceWidth = 0.0f;  // fresh anim -> stance slider resets
 
     std::cout << "[ImportAnim] " << m_objectAnims[obj].times.size() << " keyframes, "
               << matched << "/" << rigCount << " bones matched, duration "
@@ -638,6 +639,60 @@ void ModelingMode::applyAPoseNeutralize(SceneObject* obj, float strength) {
     m_timelineLastAppliedTime = -1.0f;  // force re-apply on next tick
 
     std::cout << "[APose] Neutralize " << static_cast<int>(strength * 100) << "% applied (legs+arms)\n";
+
+    // A-Pose rebuilt the base track — refresh the stance pristine and re-layer
+    // any stance-width so the two corrections compose.
+    m_stancePristine.erase(obj);
+    if (std::abs(m_stanceWidth) > 1e-4f) applyStanceWidth(obj, m_stanceWidth);
+}
+
+void ModelingMode::applyStanceWidth(SceneObject* obj, float degrees) {
+    auto ai = m_objectAnims.find(obj);
+    if (ai == m_objectAnims.end()) return;
+    if (!m_ctx.editableMesh.hasSkeleton()) return;
+    const Skeleton& skel = m_ctx.editableMesh.getSkeleton();
+    const size_t n = skel.bones.size();
+
+    // Capture the pre-stance track the first time (slider is at 0 then, so the
+    // current track IS pristine). Cleared on anim load / A-Pose change.
+    if (!m_stancePristine.count(obj)) m_stancePristine[obj] = ai->second;
+    ObjectAnimTrack out = m_stancePristine[obj];   // copy, then correct legs
+    m_stanceWidth = degrees;
+
+    if (std::abs(degrees) > 1e-4f) {
+        auto isUpLeg = [](const std::string& nm) {
+            std::string s; for (char c : nm) s += static_cast<char>(std::tolower((unsigned char)c));
+            return s.find("upleg") != std::string::npos;
+        };
+        std::vector<int> thighs;
+        for (size_t b = 0; b < n; ++b) if (isUpLeg(skel.bones[b].name)) thighs.push_back(static_cast<int>(b));
+
+        const size_t F = out.times.size();
+        for (size_t f = 0; f < F; ++f) {
+            if (f >= out.bonePositionsPerKey.size() || f >= out.boneRotationsPerKey.size()) continue;
+            auto& heads = out.bonePositionsPerKey[f];   // world head positions
+            auto& rots  = out.boneRotationsPerKey[f];   // world rotation deltas
+            if (heads.size() < n || rots.size() < n) continue;
+            for (int th : thighs) {
+                int hip = skel.bones[th].parentIndex;
+                glm::vec3 pivot = (hip >= 0 && hip < static_cast<int>(heads.size())) ? heads[hip] : heads[th];
+                // Inward = toward the body centerline. Sign from which side the
+                // thigh sits relative to the hip (X), so it's correct for L and R.
+                float side = (heads[th].x >= pivot.x) ? 1.0f : -1.0f;
+                glm::quat Rz = glm::angleAxis(glm::radians(degrees) * (-side), glm::vec3(0, 0, 1));
+                glm::mat3 R = glm::mat3_cast(Rz);
+                for (size_t k = 0; k < n; ++k) {
+                    if (!isInSubtree(skel, static_cast<int>(k), th)) continue;
+                    heads[k] = pivot + R * (heads[k] - pivot);   // swing the whole leg about the hip
+                    rots[k]  = glm::normalize(Rz * rots[k]);      // and rotate its world orientation
+                }
+            }
+        }
+    }
+
+    m_objectAnims[obj] = std::move(out);
+    m_timelineLastAppliedTime = -1.0f;   // force re-pose next tick
+    reskinFromBoneDeltas();
 }
 
 void ModelingMode::importSkinnedGLBNative(const SkinnedLoadResult& skinned) {
@@ -735,6 +790,7 @@ void ModelingMode::importSkinnedGLBNative(const SkinnedLoadResult& skinned) {
     //    pristine copy of the source so the A-pose neutralizer can re-derive the
     //    track at any strength later without re-importing.
     m_aposeNeutralize = 0.0f;
+    m_stancePristine.erase(obj); m_stanceWidth = 0.0f;  // fresh anim -> stance slider resets
     if (!skinned.animations.empty()) {
         m_importedClipSource[obj] = { glbSkel, skinned.animations[0] };
         buildNativeTrackFromClip(obj, glbSkel, skinned.animations[0]);
