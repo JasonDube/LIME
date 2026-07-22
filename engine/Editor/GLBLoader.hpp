@@ -99,12 +99,17 @@ public:
                      const std::string& meshName = "mesh",
                      const std::string& animName = "Take 001");
 
-    // One named animation clip (LIME translation-only rig): per-key bone world
-    // head positions on a shared timeline.
+    // One named animation clip: per-key bone world head positions + world
+    // rotation deltas from rest (LIME's native track format) on a shared
+    // timeline. boneWorldRotPerKey may be empty (legacy translation-only
+    // clips) — bones then keep their rest orientation, which shears any limb
+    // posed away from bind. With rotations present the export reproduces
+    // LIME's native reskin exactly: v' = R*(v - bindHead) + animHead.
     struct SkinnedAnimClip {
         std::string name;
         std::vector<float> times;
         std::vector<std::vector<glm::vec3>> boneWorldPosPerKey;  // [key][bone]
+        std::vector<std::vector<glm::quat>> boneWorldRotPerKey;  // [key][bone], world delta from rest; may be empty
     };
     // Export a skinned mesh with MULTIPLE named animation clips into one GLB
     // (e.g. "idle" + "walk" on the same model). Each clip becomes its own glTF

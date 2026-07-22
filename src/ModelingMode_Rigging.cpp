@@ -231,7 +231,10 @@ void ModelingMode::exportMultiClipGLB() {
     std::vector<glm::vec4>  boneWts(heVerts.size());
     for (size_t i = 0; i < heVerts.size(); ++i) { boneIdx[i] = heVerts[i].boneIndices; boneWts[i] = heVerts[i].boneWeights; }
 
-    // Gather every saved clip (only its rigged keys) into the multi-clip format.
+    // Gather every saved clip (only its rigged keys) into the multi-clip
+    // format — head positions AND world rotation deltas (without rotations,
+    // GPU skinning translates verts but never rotates them around the bone,
+    // shearing any limb posed away from bind — e.g. arms out of an A-pose).
     std::vector<GLBLoader::SkinnedAnimClip> clips;
     for (const auto& [name, tr] : libIt->second) {
         GLBLoader::SkinnedAnimClip clip; clip.name = name;
@@ -239,6 +242,11 @@ void ModelingMode::exportMultiClipGLB() {
             if (k < tr.bonePositionsPerKey.size() && !tr.bonePositionsPerKey[k].empty()) {
                 clip.times.push_back(tr.times[k]);
                 clip.boneWorldPosPerKey.push_back(tr.bonePositionsPerKey[k]);
+                clip.boneWorldRotPerKey.push_back(
+                    k < tr.boneRotationsPerKey.size()
+                        ? tr.boneRotationsPerKey[k]
+                        : std::vector<glm::quat>(tr.bonePositionsPerKey[k].size(),
+                                                 glm::quat(1.0f, 0.0f, 0.0f, 0.0f)));
             }
         }
         if (!clip.times.empty()) clips.push_back(std::move(clip));

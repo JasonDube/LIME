@@ -436,8 +436,8 @@ bool GLBLoader::saveSkinnedAnimatedMulti(const std::string& filepath,
     const size_t off_weights=align4(off_joints+jointsLen), off_index=align4(off_weights+weightsLen);
     const size_t off_ibm=align4(off_index+indexLen);
 
-    // Per-clip anim sections (time + interleaved per-bone translations).
-    struct ClipOff { size_t offTime, timeLen, offTrans, translLen, keyCount; bool has; };
+    // Per-clip anim sections (time + interleaved per-bone translations + rotations).
+    struct ClipOff { size_t offTime, timeLen, offTrans, translLen, offRot, rotLen, keyCount; bool has; };
     std::vector<ClipOff> co(clips.size());
     size_t cursor = align4(off_ibm + ibmLen);
     for (size_t c = 0; c < clips.size(); ++c) {
@@ -446,8 +446,10 @@ bool GLBLoader::saveSkinnedAnimatedMulti(const std::string& filepath,
         co[c].keyCount = kc;
         co[c].timeLen   = co[c].has ? kc*sizeof(float) : 0;
         co[c].translLen = co[c].has ? boneCount*kc*sizeof(float)*3 : 0;
+        co[c].rotLen    = co[c].has ? boneCount*kc*sizeof(float)*4 : 0;
         co[c].offTime  = cursor; cursor = align4(cursor + co[c].timeLen);
         co[c].offTrans = cursor; cursor = align4(cursor + co[c].translLen);
+        co[c].offRot   = cursor; cursor = align4(cursor + co[c].rotLen);
     }
     tinygltf::Buffer buffer;
     buffer.data.resize(cursor, 0);
@@ -477,20 +479,41 @@ bool GLBLoader::saveSkinnedAnimatedMulti(const std::string& filepath,
         glm::mat4 ibm=glm::inverse(glm::translate(glm::mat4(1.0f), bindBoneWorldPos[i]));
         std::memcpy(base+off_ibm+i*sizeof(float)*16, glm::value_ptr(ibm), sizeof(float)*16);
     }
-    // Each clip's anim data (world head -> local translation = this - parent).
+    // Each clip's anim data. Per key, LIME's native track gives each bone a
+    // world head position + world rotation delta from rest. glTF wants
+    // parent-LOCAL TRS, so per bone:
+    //   localRot = inverse(parentWorldRot) * worldRot
+    //   localT   = inverse(parentWorldRot) * (worldHead - parentWorldHead)
+    // (rest world rotations are identity here — bone nodes are written with
+    // translation only — so the deltas ARE the world rotations). Under FK this
+    // composes to W[i] = T(head_i)*R(rot_i), and with the translation-only
+    // IBMs the GPU skins v' = rot*(v - bindHead) + head — exactly LIME's
+    // native reskin. Missing rotations (legacy clips) fall back to identity,
+    // which degenerates to the old translation-only behavior.
     for (size_t c=0;c<clips.size();++c){
         if (!co[c].has) continue;
         std::memcpy(base+co[c].offTime, clips[c].times.data(), co[c].timeLen);
+        const bool hasRot = clips[c].boneWorldRotPerKey.size()==co[c].keyCount;
         for (size_t i=0;i<boneCount;++i){
             int parent=skeleton.bones[i].parentIndex;
             for (size_t k=0;k<co[c].keyCount;++k){
                 const auto& wa=clips[c].boneWorldPosPerKey[k];
                 glm::vec3 wt=(i<wa.size())?wa[i]:bindBoneWorldPos[i];
                 glm::vec3 wp(0.0f);
+                glm::quat wr(1.0f,0.0f,0.0f,0.0f), pr(1.0f,0.0f,0.0f,0.0f);
+                if (hasRot){
+                    const auto& ra=clips[c].boneWorldRotPerKey[k];
+                    if (i<ra.size()) wr=ra[i];
+                    if (parent>=0 && parent<(int)ra.size()) pr=ra[parent];
+                }
                 if (parent>=0 && parent<(int)boneCount && parent<(int)wa.size()) wp=wa[parent];
-                glm::vec3 local=wt-wp;
+                glm::quat prInv=glm::inverse(pr);
+                glm::vec3 local=prInv*(wt-wp);
+                glm::quat localRot=glm::normalize(prInv*wr);
                 float* dst=reinterpret_cast<float*>(base+co[c].offTrans+i*co[c].keyCount*sizeof(float)*3+k*sizeof(float)*3);
                 dst[0]=local.x;dst[1]=local.y;dst[2]=local.z;
+                float* rdst=reinterpret_cast<float*>(base+co[c].offRot+i*co[c].keyCount*sizeof(float)*4+k*sizeof(float)*4);
+                rdst[0]=localRot.x;rdst[1]=localRot.y;rdst[2]=localRot.z;rdst[3]=localRot.w;  // glTF quat = xyzw
             }
         }
     }
@@ -525,17 +548,22 @@ bool GLBLoader::saveSkinnedAnimatedMulti(const std::string& filepath,
 
     std::vector<int> accTime(clips.size(),-1);
     std::vector<std::vector<int>> accBoneTrans(clips.size());
+    std::vector<std::vector<int>> accBoneRot(clips.size());
     for (size_t c=0;c<clips.size();++c){
         if (!co[c].has) continue;
         int bvTime=pushView(co[c].offTime,co[c].timeLen,0);
         int bvTrans=pushView(co[c].offTrans,co[c].translLen,0);
+        int bvRot=pushView(co[c].offRot,co[c].rotLen,0);
         accTime[c]=pushAccessor(bvTime,0,TINYGLTF_COMPONENT_TYPE_FLOAT,co[c].keyCount,TINYGLTF_TYPE_SCALAR);
         float mn=clips[c].times.front(),mx=clips[c].times.back();
         for(float tt:clips[c].times){ if(tt<mn)mn=tt; if(tt>mx)mx=tt; }
         model.accessors[accTime[c]].minValues={mn}; model.accessors[accTime[c]].maxValues={mx};
         accBoneTrans[c].assign(boneCount,-1);
-        for (size_t i=0;i<boneCount;++i)
+        accBoneRot[c].assign(boneCount,-1);
+        for (size_t i=0;i<boneCount;++i){
             accBoneTrans[c][i]=pushAccessor(bvTrans,i*co[c].keyCount*sizeof(float)*3,TINYGLTF_COMPONENT_TYPE_FLOAT,co[c].keyCount,TINYGLTF_TYPE_VEC3);
+            accBoneRot[c][i]=pushAccessor(bvRot,i*co[c].keyCount*sizeof(float)*4,TINYGLTF_COMPONENT_TYPE_FLOAT,co[c].keyCount,TINYGLTF_TYPE_VEC4);
+        }
     }
 
     tinygltf::Primitive prim;
@@ -600,6 +628,10 @@ bool GLBLoader::saveSkinnedAnimatedMulti(const std::string& filepath,
             int si=(int)anim.samplers.size(); anim.samplers.push_back(samp);
             tinygltf::AnimationChannel chan; chan.sampler=si; chan.target_node=firstBoneNode+(int)i; chan.target_path="translation";
             anim.channels.push_back(chan);
+            tinygltf::AnimationSampler rsamp; rsamp.input=accTime[c]; rsamp.output=accBoneRot[c][i]; rsamp.interpolation="LINEAR";
+            int rsi=(int)anim.samplers.size(); anim.samplers.push_back(rsamp);
+            tinygltf::AnimationChannel rchan; rchan.sampler=rsi; rchan.target_node=firstBoneNode+(int)i; rchan.target_path="rotation";
+            anim.channels.push_back(rchan);
         }
         model.animations.push_back(anim);
     }
