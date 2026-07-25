@@ -111,6 +111,16 @@ private:
     float m_plantFeet = 0.0f;
     std::unordered_map<SceneObject*, ObjectAnimTrack> m_feetPristine;
 
+    // Live "Relax Shoulders" — drops the shoulder girdle (collar+arm subtree) in the
+    // frontal plane, fixing the shrugged look mocap gets from the SMPL rest mismatch.
+    float m_relaxShoulders = 0.0f;   // degrees down
+    std::unordered_map<SceneObject*, ObjectAnimTrack> m_shoulderPristine;
+
+    // Live "Foot Roll" — procedural heel-to-toe added on top of the (noisy) mocap
+    // ankle, phased to ground contact so a run reads as a real gait, not flat/heel.
+    float m_footRoll = 0.0f;   // 0 = mocap only, 1 = full procedural roll
+    std::unordered_map<SceneObject*, ObjectAnimTrack> m_rollPristine;
+
     // Keyframe thinning: keep every Nth key, delete the rest (mocap is often way
     // denser than a game clip needs).
     int m_thinKeepEvery = 10;
@@ -701,6 +711,19 @@ private:
     void applyPlantFeet(SceneObject* obj, float amount);
     // Keyframe thinning: keep every keepEvery-th key (+ the last), delete the rest.
     void thinKeyframes(SceneObject* obj, int keepEvery);
+
+    // ── Hand-keying cycle tools ─────────────────────────────────────────────
+    bool m_ikLockFeet = false;   // freeze IK foot goals so posing the body can't slide planted feet
+    std::vector<int> m_boneMirror; // bone i -> its L/R partner (self if centre); built lazily from rest
+    void buildBoneMirrorPairs();          // match bones across X=0 in the rest pose
+    void plantFeetAtCurrent();            // re-plant each IK leg's goal at its current ankle position
+    void mirrorPoseAtCurrentTime();       // mirror the keyframe at the playhead L<->R (build a mirrored stride)
+    void makeLoopClosed();                // copy the first key's pose to a new key at the end (seamless loop)
+    // Shoulders: drop the collar+arm subtree by `degrees` in the frontal plane.
+    void applyRelaxShoulders(SceneObject* obj, float degrees);
+    // Feet: add procedural heel-to-toe ankle roll phased to ground contact, blended
+    // in by amount 0..1 (the mocap ankle is too noisy to read as a gait on a run).
+    void applyFootRoll(SceneObject* obj, float amount);
     // Legs: constant LOCAL Y+Z euler floor per UpLeg bone (deg; X=0).
     std::vector<glm::vec3> detectAPoseSpread(const eden::Skeleton& skel,
                                              const eden::AnimationClip& clip);

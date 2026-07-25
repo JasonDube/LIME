@@ -256,6 +256,7 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
     m_timelineLastAppliedTime = -1.0f;  // force re-apply on next tick
     m_stancePristine.erase(obj); m_stanceWidth = 0.0f;  // fresh anim -> stance slider resets
     m_feetPristine.erase(obj); m_plantFeet = 0.0f;       // and the plant-feet slider
+    m_shoulderPristine.erase(obj); m_relaxShoulders = 0.0f; m_rollPristine.erase(obj); m_footRoll = 0.0f;
 
     // Body-part -> rig-bone map from the retargeter, so correction sliders find
     // the right bones on any rig (esp. anonymous UniRig bone_N names).
@@ -849,8 +850,245 @@ void ModelingMode::thinKeyframes(SceneObject* obj, int keepEvery) {
     // Base track changed → drop corrective pristines + reset sliders so they
     // recapture from the thinned track.
     m_stancePristine.erase(obj); m_feetPristine.erase(obj);
-    m_stanceWidth = 0.0f; m_plantFeet = 0.0f;
+    m_shoulderPristine.erase(obj); m_rollPristine.erase(obj);
+    m_stanceWidth = 0.0f; m_plantFeet = 0.0f; m_relaxShoulders = 0.0f; m_footRoll = 0.0f;
     m_timelineLastAppliedTime = -1.0f;
+    reskinFromBoneDeltas();
+}
+
+// Drop the shoulder girdle. SMPL's rest has raised/shrugged collars vs most rigs,
+// so the retarget bakes in a permanent shrug; this swings each collar+arm subtree
+// DOWN in the frontal plane about the collar root, by `degrees`. Same shape as
+// applyStanceWidth (legs), different bones + a known L/R side from the role name.
+void ModelingMode::applyRelaxShoulders(SceneObject* obj, float degrees) {
+    auto ai = m_objectAnims.find(obj);
+    if (ai == m_objectAnims.end()) return;
+    if (!m_ctx.editableMesh.hasSkeleton()) return;
+    const Skeleton& skel = m_ctx.editableMesh.getSkeleton();
+    const size_t n = skel.bones.size();
+
+    if (!m_shoulderPristine.count(obj)) m_shoulderPristine[obj] = ai->second;
+    ObjectAnimTrack out = m_shoulderPristine[obj];
+    m_relaxShoulders = degrees;
+
+    std::vector<int> shs;
+    auto ci = m_correctionBones.find(obj);
+    if (ci != m_correctionBones.end()) {
+        for (const char* role : {"shoulder_l", "shoulder_r"}) {
+            auto r = ci->second.find(role);
+            if (r != ci->second.end() && r->second >= 0 && r->second < static_cast<int>(n))
+                shs.push_back(r->second);
+        }
+    }
+    std::cout << "[Shoulders] drop " << degrees << ", matched " << shs.size() << " collar(s):";
+    for (int s : shs) std::cout << " '" << skel.bones[s].name << "'";
+    if (shs.empty()) std::cout << " -- NONE (regenerate the anim so it exports shoulder roles)";
+    std::cout << std::endl;
+
+    // Straight DOWN: translate the whole collar+arm subtree in −Y. A rotation about
+    // the collar root would arc the arm toward the centerline (the "brings arms in"
+    // the user saw); a pure translation drops the shoulders vertically and leaves
+    // the arms hanging where they are. `degrees` is reused as a downward distance.
+    if (degrees > 1e-4f && !shs.empty()) {
+        const glm::vec3 downV(0.0f, -degrees, 0.0f);
+        const size_t F = out.times.size();
+        for (size_t f = 0; f < F; ++f) {
+            if (f >= out.bonePositionsPerKey.size()) continue;
+            auto& heads = out.bonePositionsPerKey[f];
+            if (heads.size() < n) continue;
+            for (int sh : shs)
+                for (size_t k = 0; k < n; ++k)
+                    if (isInSubtree(skel, static_cast<int>(k), sh)) heads[k] += downV;
+        }
+    }
+
+    m_objectAnims[obj] = std::move(out);
+    m_timelineLastAppliedTime = -1.0f;
+    reskinFromBoneDeltas();
+}
+
+// Add a clean, procedural HEEL-TO-TOE roll, phased to ground contact. Monocular
+// mocap barely reads foot articulation on a fast run, so the ankle roll it does
+// capture is noisy and out of phase → looks flat/heel-planted. We detect each
+// foot's contact from its toe height, then during STANCE roll it heel→toe (a bit
+// dorsiflexed at strike → plantarflexed at push-off) and during SWING lift the
+// toe for clearance, about the foot's own lateral axis. Blended in by `amount`.
+// v1 — the angle constants below are eyeball starting points.
+void ModelingMode::applyFootRoll(SceneObject* obj, float amount) {
+    auto ai = m_objectAnims.find(obj);
+    if (ai == m_objectAnims.end()) return;
+    if (!m_ctx.editableMesh.hasSkeleton()) return;
+    const Skeleton& skel = m_ctx.editableMesh.getSkeleton();
+    const size_t n = skel.bones.size();
+
+    if (!m_rollPristine.count(obj)) m_rollPristine[obj] = ai->second;
+    ObjectAnimTrack out = m_rollPristine[obj];
+    m_footRoll = amount;
+
+    // Ankle + its toe (toe from the role map if present, else the ankle's child).
+    struct Foot { int ankle; int toe; };
+    std::vector<Foot> feet;
+    auto ci = m_correctionBones.find(obj);
+    if (ci != m_correctionBones.end()) {
+        auto grab = [&](const char* r){ auto it=ci->second.find(r); return (it!=ci->second.end())?it->second:-1; };
+        for (auto pr : {std::make_pair("ankle_l","toe_l"), std::make_pair("ankle_r","toe_r")}) {
+            int a = grab(pr.first); if (a < 0 || a >= (int)n) continue;
+            int t = grab(pr.second);
+            if (t < 0)   // no toe role — take the ankle's first child
+                for (size_t b = 0; b < n; ++b) if (skel.bones[b].parentIndex == a) { t = (int)b; break; }
+            feet.push_back({a, t});
+        }
+    }
+    std::cout << "[FootRoll] " << amount << ", feet: " << feet.size() << std::endl;
+
+    const size_t F = out.times.size();
+    if (amount > 1e-4f && !feet.empty() && F > 2) {
+        // Roll shape (degrees): + = toe UP (dorsiflex), - = toe DOWN (plantarflex).
+        // A run pushes off the BALL of the foot, so push-off needs strong toe-down
+        // (heel-to-flat isn't enough); strike is light since a run is mid/forefoot.
+        const float STRIKE = +5.0f, PUSHOFF = -60.0f, SWING = +15.0f;
+        // Bias the roll toward push-off across stance so it keeps rolling onto the
+        // ball rather than settling at flat mid-stride.
+        auto rollAt = [&](float p) {
+            float t = p * p;                       // ease-IN: reach push-off sooner + harder
+            return STRIKE * (1.0f - t) + PUSHOFF * t;
+        };
+        for (auto& ft : feet) {
+            // Contact from toe height: planted when low.
+            std::vector<float> toeY(F);
+            for (size_t f = 0; f < F; ++f)
+                toeY[f] = (ft.toe >= 0 && ft.toe < (int)out.bonePositionsPerKey[f].size())
+                          ? out.bonePositionsPerKey[f][ft.toe].y : 0.0f;
+            float lo = *std::min_element(toeY.begin(), toeY.end());
+            float hi = *std::max_element(toeY.begin(), toeY.end());
+            float thresh = lo + 0.30f * (hi - lo);
+            std::vector<char> planted(F);
+            for (size_t f = 0; f < F; ++f) planted[f] = toeY[f] < thresh;
+
+            for (size_t f = 0; f < F; ++f) {
+                if (f >= out.bonePositionsPerKey.size() || f >= out.boneRotationsPerKey.size()) continue;
+                auto& heads = out.bonePositionsPerKey[f];
+                auto& rots  = out.boneRotationsPerKey[f];
+                if ((int)heads.size() <= ft.ankle || (int)rots.size() <= ft.ankle) continue;
+
+                float pitch;   // degrees this frame
+                if (planted[f]) {
+                    // phase within this contiguous stance segment
+                    size_t s = f; while (s > 0 && planted[s - 1]) --s;
+                    size_t e = f; while (e + 1 < F && planted[e + 1]) ++e;
+                    float p = (e > s) ? float(f - s) / float(e - s) : 0.0f;
+                    pitch = rollAt(p);
+                } else {
+                    pitch = SWING;
+                }
+                pitch *= amount;
+
+                // Rotate the foot (ankle + toe) about its own lateral axis.
+                glm::vec3 aH = heads[ft.ankle];
+                glm::vec3 tH = (ft.toe >= 0 && ft.toe < (int)heads.size()) ? heads[ft.toe] : aH + glm::vec3(0,0,0.1f);
+                glm::vec3 fwd = tH - aH; fwd.y = 0.0f;
+                if (glm::length(fwd) < 1e-4f) fwd = glm::vec3(0, 0, 1);
+                fwd = glm::normalize(fwd);
+                glm::vec3 lateral = glm::normalize(glm::cross(glm::vec3(0, 1, 0), fwd)); // med-lateral
+                glm::quat R = glm::angleAxis(glm::radians(pitch), lateral);
+                glm::mat3 Rm = glm::mat3_cast(R);
+                for (size_t k = 0; k < n; ++k) {
+                    if (!isInSubtree(skel, static_cast<int>(k), ft.ankle)) continue;
+                    heads[k] = aH + Rm * (heads[k] - aH);
+                    rots[k]  = glm::normalize(R * rots[k]);
+                }
+            }
+        }
+    }
+
+    m_objectAnims[obj] = std::move(out);
+    m_timelineLastAppliedTime = -1.0f;
+    reskinFromBoneDeltas();
+}
+
+// Pair each bone with its left/right partner by matching rest heads across X=0.
+// Centre bones (spine/head, x≈0) pair with themselves. Used by Mirror Pose.
+void ModelingMode::buildBoneMirrorPairs() {
+    const auto& rest = m_bindPoseBonePositions;
+    const size_t n = rest.size();
+    m_boneMirror.assign(n, -1);
+    for (size_t i = 0; i < n; ++i) {
+        if (std::abs(rest[i].x) < 0.02f) { m_boneMirror[i] = (int)i; continue; }  // centre → self
+        glm::vec3 want(-rest[i].x, rest[i].y, rest[i].z);
+        int best = -1; float bd = 1e9f;
+        for (size_t j = 0; j < n; ++j) {
+            if (j == i) continue;
+            float d = glm::length(rest[j] - want);
+            if (d < bd) { bd = d; best = (int)j; }
+        }
+        m_boneMirror[i] = (bd < 0.05f) ? best : (int)i;   // no partner found → treat as centre
+    }
+}
+
+// Re-plant every IK leg's goal at its current ankle position — locks the feet
+// where they are now so posing the body won't drag them.
+void ModelingMode::plantFeetAtCurrent() {
+    for (IKLeg& leg : m_ikLegs) {
+        if (leg.foot >= 0 && leg.foot < (int)m_bonePositions.size())
+            leg.goal = m_bonePositions[leg.foot];
+    }
+    std::cout << "[IK] planted " << m_ikLegs.size() << " foot goal(s) at current position\n";
+}
+
+// Mirror the keyframe at the playhead left<->right: pose one stride, then mirror it
+// to get the opposite stride. Reflects across the sagittal (X=0) plane — swaps L/R
+// bones and flips each transform.
+void ModelingMode::mirrorPoseAtCurrentTime() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) return;
+    auto ai = m_objectAnims.find(obj);
+    if (ai == m_objectAnims.end()) { std::cout << "[Mirror] no animation\n"; return; }
+    ObjectAnimTrack& t = ai->second;
+    if (m_boneMirror.size() != m_bindPoseBonePositions.size()) buildBoneMirrorPairs();
+    const size_t n = m_bindPoseBonePositions.size();
+
+    // Find the key at the playhead.
+    int idx = -1;
+    for (size_t k = 0; k < t.times.size(); ++k)
+        if (std::abs(t.times[k] - m_timelineCurrentTime) < 1e-3f) { idx = (int)k; break; }
+    if (idx < 0) { std::cout << "[Mirror] no key at the playhead — Set Key first\n"; return; }
+    if (idx >= (int)t.bonePositionsPerKey.size() || idx >= (int)t.boneRotationsPerKey.size()) return;
+
+    auto& heads = t.bonePositionsPerKey[idx];
+    auto& rots  = t.boneRotationsPerKey[idx];
+    if (heads.size() < n || rots.size() < n) { std::cout << "[Mirror] key has no rig pose\n"; return; }
+
+    std::vector<glm::vec3> nh(heads);
+    std::vector<glm::quat> nr(rots);
+    for (size_t i = 0; i < n; ++i) {
+        int p = (i < m_boneMirror.size() && m_boneMirror[i] >= 0) ? m_boneMirror[i] : (int)i;
+        glm::vec3 h = heads[p]; glm::quat q = rots[p];
+        nh[i] = glm::vec3(-h.x, h.y, h.z);              // reflect position across X=0
+        nr[i] = glm::quat(q.w, q.x, -q.y, -q.z);        // reflect rotation across X=0
+    }
+    heads = std::move(nh); rots = std::move(nr);
+    m_timelineLastAppliedTime = -1.0f;
+    reskinFromBoneDeltas();
+    std::cout << "[Mirror] mirrored the key at t=" << m_timelineCurrentTime << "\n";
+}
+
+// Copy the FIRST key's pose to a new key one frame past the last, so the clip ends
+// on its start pose and loops seamlessly.
+void ModelingMode::makeLoopClosed() {
+    SceneObject* obj = m_ctx.selectedObject;
+    if (!obj) return;
+    auto ai = m_objectAnims.find(obj);
+    if (ai == m_objectAnims.end() || ai->second.times.size() < 2) { std::cout << "[Loop] need >=2 keys\n"; return; }
+    ObjectAnimTrack& t = ai->second;
+    float dt = t.times[1] - t.times[0];
+    float endT = t.times.back() + (dt > 1e-4f ? dt : 1.0f / 24.0f);
+    t.times.push_back(endT);
+    t.positions.push_back(t.positions.front());
+    t.rotations.push_back(t.rotations.front());
+    t.scales.push_back(t.scales.front());
+    if (!t.bonePositionsPerKey.empty()) t.bonePositionsPerKey.push_back(t.bonePositionsPerKey.front());
+    if (!t.boneRotationsPerKey.empty()) t.boneRotationsPerKey.push_back(t.boneRotationsPerKey.front());
+    std::cout << "[Loop] closed: copied start pose to t=" << endT << " (" << t.times.size() << " keys)\n";
     reskinFromBoneDeltas();
 }
 
@@ -951,6 +1189,7 @@ void ModelingMode::importSkinnedGLBNative(const SkinnedLoadResult& skinned) {
     m_aposeNeutralize = 0.0f;
     m_stancePristine.erase(obj); m_stanceWidth = 0.0f;  // fresh anim -> stance slider resets
     m_feetPristine.erase(obj); m_plantFeet = 0.0f;       // and the plant-feet slider
+    m_shoulderPristine.erase(obj); m_relaxShoulders = 0.0f; m_rollPristine.erase(obj); m_footRoll = 0.0f;
     if (!skinned.animations.empty()) {
         m_importedClipSource[obj] = { glbSkel, skinned.animations[0] };
         buildNativeTrackFromClip(obj, glbSkel, skinned.animations[0]);
@@ -1282,6 +1521,29 @@ void ModelingMode::renderAnimationTimeline() {
         if (ImGui::Button("Set Key")) setKeyOnSelected();
         ImGui::SameLine();
         if (ImGui::Button("Delete Key")) deleteKeyOnSelectedNearTime();
+        if (!haveObj) ImGui::EndDisabled();
+
+        // ── Cycle tools: hand-key locomotion without fighting mocap ──
+        if (!haveObj) ImGui::BeginDisabled();
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Cycle Tools");
+        // Foot-plant: keep planted feet from sliding while you pose the body.
+        ImGui::Checkbox("Lock Feet (IK)", &m_ikLockFeet);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Freeze the IK foot goals so moving the pelvis/body can't\n"
+                              "drag the planted feet. Turn off to step a foot forward.");
+        ImGui::SameLine();
+        if (ImGui::Button("Plant Feet Here")) plantFeetAtCurrent();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Re-lock each IK foot goal at its CURRENT position.");
+        if (ImGui::Button("Mirror Pose")) mirrorPoseAtCurrentTime();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Mirror the key at the playhead left<->right. Pose one stride,\n"
+                              "copy it to the opposite phase, then Mirror Pose there.");
+        ImGui::SameLine();
+        if (ImGui::Button("Close Loop")) makeLoopClosed();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Append the start pose one frame past the end so the clip\n"
+                              "loops seamlessly.");
         if (!haveObj) ImGui::EndDisabled();
 
         ImGui::SameLine();

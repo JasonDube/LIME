@@ -2205,6 +2205,33 @@ void ModelingMode::renderModelingEditorUI() {
                                           "1.0 = flat/planted (right for standing clips); real foot\n"
                                           "motion is kept. Non-destructive.");
 
+                    // Relax Shoulders — drop the shrugged mocap shoulders.
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Relax Shoulders");
+                    ImGui::SetNextItemWidth(180);
+                    float shoulders = m_relaxShoulders;
+                    if (ImGui::SliderFloat("Drop Shoulders", &shoulders, 0.0f, 0.30f, "%.3f",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyRelaxShoulders(m_ctx.selectedObject, shoulders);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Lowers both shoulders (collar + arm) STRAIGHT DOWN, fixing\n"
+                                          "the shrug the SMPL rest bakes in — without pulling the arms in.\n"
+                                          "Distance in world units. Regenerate the anim for shoulder\n"
+                                          "roles. Non-destructive.");
+
+                    // Foot Roll — add procedural heel-to-toe on a flat/heel run.
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Foot Roll");
+                    ImGui::SetNextItemWidth(180);
+                    float roll = m_footRoll;
+                    if (ImGui::SliderFloat("Heel-to-Toe", &roll, 0.0f, 1.0f, "%.2f",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyFootRoll(m_ctx.selectedObject, roll);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Adds a clean heel-to-toe ankle roll phased to ground contact,\n"
+                                          "so a run reads as a real gait instead of flat/on-the-heels.\n"
+                                          "0 = mocap only, 1 = full procedural roll. v1 — tune by eye.");
+
                     // Thin Keyframes — keep every Nth key, delete the in-betweens.
                     ImGui::Separator();
                     ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Thin Keyframes");
@@ -6713,7 +6740,8 @@ void ModelingMode::processModelingInput(float deltaTime, bool gizmoActive) {
         if (m_ikDragLeg < 0 && Input::isMouseButtonPressed(Input::MOUSE_LEFT)) {
             glm::vec2 mp = Input::getMousePosition();
             int poleLeg = pickIKPoleAtScreenPos(mp);
-            int goalLeg = pickIKGoalAtScreenPos(mp);
+            // Lock Feet: ignore foot-GOAL grabs (planted feet stay put); poles still move.
+            int goalLeg = m_ikLockFeet ? -1 : pickIKGoalAtScreenPos(mp);
             int leg = (poleLeg >= 0) ? poleLeg : goalLeg;
             bool isPole = (poleLeg >= 0);
             if (leg >= 0 && m_ctx.selectedObject) {
