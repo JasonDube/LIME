@@ -389,6 +389,8 @@ struct EditorContext {
     std::function<void()> clearPoseReferenceCallback;
 
     bool showAIGenerateWindow = false;
+    bool showRiggingWindow = true;   // dedicated Rigging window (pulled out of Scene)
+    bool showAnimationWindow = true; // dedicated Animation window (clips, import, corrections)
 
     // Callback to update widget properties UI when a .lime is loaded
     std::function<void(const std::unordered_map<std::string, std::string>&)> onMetadataLoaded;

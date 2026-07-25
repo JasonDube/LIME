@@ -2162,6 +2162,429 @@ void ModelingMode::renderModelingEditorUI() {
             }
         }
 
+
+        // Vertex color for solid-colored objects
+        if (m_ctx.selectedObject && m_ctx.selectedObject->hasMeshData()) {
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), "Vertex Color");
+            ImGui::Separator();
+
+            static glm::vec3 solidColor(0.7f, 0.7f, 0.7f);
+            ImGui::ColorEdit3("Color", &solidColor.x);
+
+            if (ImGui::Button("Apply to Object")) {
+                // Sync current edits first
+                if (m_ctx.meshDirty) {
+                    updateMeshFromEditable();
+                }
+
+                // Get current mesh data
+                auto verts = m_ctx.selectedObject->getVertices();  // Copy
+                const auto& indices = m_ctx.selectedObject->getIndices();
+
+                // Apply color to all vertices
+                for (auto& v : verts) {
+                    v.color = glm::vec4(solidColor, 1.0f);
+                }
+
+                // Update GPU mesh (preserve texture)
+                uint32_t oldHandle = m_ctx.selectedObject->getBufferHandle();
+                uint32_t newHandle;
+                if (m_ctx.selectedObject->hasTextureData()) {
+                    const auto& texData = m_ctx.selectedObject->getTextureData();
+                    newHandle = m_ctx.modelRenderer.createModel(verts, indices, texData.data(),
+                        m_ctx.selectedObject->getTextureWidth(), m_ctx.selectedObject->getTextureHeight());
+                } else {
+                    newHandle = m_ctx.modelRenderer.createModel(verts, indices, nullptr, 0, 0);
+                }
+                m_ctx.selectedObject->setBufferHandle(newHandle);
+                m_ctx.selectedObject->setMeshData(verts, indices);
+
+                // Update editable mesh vertex colors too
+                if (m_ctx.editableMesh.isValid()) {
+                    for (size_t i = 0; i < m_ctx.editableMesh.getVertexCount(); ++i) {
+                        m_ctx.editableMesh.getVertex(i).color = glm::vec4(solidColor, 1.0f);
+                    }
+                }
+
+                std::cout << "[Color] Applied solid color (" << solidColor.r << ", "
+                          << solidColor.g << ", " << solidColor.b << ") to "
+                          << verts.size() << " vertices" << std::endl;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Set all vertices to this solid color.\nUseful for detail pieces before combining.");
+            }
+            ImGui::Spacing();
+        }
+
+        // Combine selected objects button
+        if (m_ctx.selectedObjects.size() >= 2) {
+            if (ImGui::Button("Combine Selected")) {
+                // Sync current edits before combining
+                if (m_ctx.meshDirty && m_ctx.selectedObject) {
+                    updateMeshFromEditable();
+                }
+
+                // Merge selected objects into one
+                std::vector<ModelVertex> combinedVerts;
+                std::vector<uint32_t> combinedIndices;
+
+                // Also combine half-edge data to preserve quad topology
+                std::vector<SceneObject::StoredHEVertex> combinedHEVerts;
+                std::vector<SceneObject::StoredHalfEdge> combinedHE;
+                std::vector<SceneObject::StoredHEFace> combinedHEFaces;
+                bool allHaveHEData = true;
+
+                for (auto& obj : m_ctx.sceneObjects) {
+                    if (m_ctx.selectedObjects.count(obj.get()) == 0) continue;
+                    if (!obj->hasMeshData()) continue;
+
+                    const auto& verts = obj->getVertices();
+                    const auto& indices = obj->getIndices();
+                    const auto& transform = obj->getTransform();
+                    glm::mat4 modelMatrix = transform.getMatrix();
+                    glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
+
+                    uint32_t indexOffset = static_cast<uint32_t>(combinedVerts.size());
+
+                    for (const auto& v : verts) {
+                        ModelVertex newVert = v;
+                        glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
+                        newVert.position = glm::vec3(worldPos);
+                        newVert.normal = glm::normalize(normalMatrix * v.normal);
+                        combinedVerts.push_back(newVert);
+                    }
+
+                    for (uint32_t idx : indices) {
+                        combinedIndices.push_back(idx + indexOffset);
+                    }
+
+                    // Combine half-edge data if available
+                    if (obj->hasEditableMeshData()) {
+                        uint32_t heVertOffset = static_cast<uint32_t>(combinedHEVerts.size());
+                        uint32_t heOffset = static_cast<uint32_t>(combinedHE.size());
+                        uint32_t heFaceOffset = static_cast<uint32_t>(combinedHEFaces.size());
+
+                        for (const auto& v : obj->getHEVertices()) {
+                            SceneObject::StoredHEVertex newV = v;
+                            glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
+                            newV.position = glm::vec3(worldPos);
+                            newV.normal = glm::normalize(normalMatrix * v.normal);
+                            if (newV.halfEdgeIndex != UINT32_MAX) newV.halfEdgeIndex += heOffset;
+                            combinedHEVerts.push_back(newV);
+                        }
+
+                        for (const auto& he : obj->getHEHalfEdges()) {
+                            SceneObject::StoredHalfEdge newHE = he;
+                            if (newHE.vertexIndex != UINT32_MAX) newHE.vertexIndex += heVertOffset;
+                            if (newHE.faceIndex != UINT32_MAX) newHE.faceIndex += heFaceOffset;
+                            if (newHE.nextIndex != UINT32_MAX) newHE.nextIndex += heOffset;
+                            if (newHE.prevIndex != UINT32_MAX) newHE.prevIndex += heOffset;
+                            if (newHE.twinIndex != UINT32_MAX) newHE.twinIndex += heOffset;
+                            combinedHE.push_back(newHE);
+                        }
+
+                        for (const auto& f : obj->getHEFaces()) {
+                            SceneObject::StoredHEFace newF = f;
+                            if (newF.halfEdgeIndex != UINT32_MAX) newF.halfEdgeIndex += heOffset;
+                            combinedHEFaces.push_back(newF);
+                        }
+                    } else {
+                        allHaveHEData = false;
+                    }
+                }
+
+                if (!combinedVerts.empty()) {
+                    auto combinedObj = std::make_unique<SceneObject>("Combined");
+                    uint32_t handle = m_ctx.modelRenderer.createModel(combinedVerts, combinedIndices, nullptr, 0, 0);
+                    combinedObj->setBufferHandle(handle);
+                    combinedObj->setIndexCount(static_cast<uint32_t>(combinedIndices.size()));
+                    combinedObj->setVertexCount(static_cast<uint32_t>(combinedVerts.size()));
+                    combinedObj->setMeshData(combinedVerts, combinedIndices);
+
+                    // Store combined half-edge data if all sources had it
+                    if (allHaveHEData && !combinedHEVerts.empty()) {
+                        combinedObj->setEditableMeshData(combinedHEVerts, combinedHE, combinedHEFaces);
+                    }
+
+                    // Queue selected objects for deletion
+                    for (SceneObject* obj : m_ctx.selectedObjects) {
+                        m_ctx.pendingDeletions.push_back(obj);
+                    }
+
+                    // Clear selection
+                    m_ctx.selectedObject = nullptr;
+                    m_ctx.selectedObjects.clear();
+                    m_ctx.editableMesh.clear();
+                    m_ctx.meshDirty = false;
+
+                    m_ctx.sceneObjects.push_back(std::move(combinedObj));
+
+                    std::cout << "[Combine Selected] Created combined mesh with " << combinedVerts.size()
+                              << " vertices, " << combinedIndices.size() / 3 << " triangles" << std::endl;
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Merge selected objects into one combined mesh.\nCtrl+Click or Shift+Click to multi-select in list.");
+            }
+            ImGui::SameLine();
+
+            // Connect CPs button - enabled when exactly 2 objects selected with matching CPs
+            {
+                bool canConnect = false;
+                if (m_ctx.selectedObjects.size() == 2) {
+                    // Check for matching CP names between the two objects
+                    std::vector<SceneObject*> selVec(m_ctx.selectedObjects.begin(), m_ctx.selectedObjects.end());
+                    auto& cps1 = selVec[0]->getControlPoints();
+                    auto& cps2 = selVec[1]->getControlPoints();
+                    int matchCount = 0;
+                    for (auto& cp1 : cps1)
+                        for (auto& cp2 : cps2)
+                            if (cp1.name == cp2.name) matchCount++;
+                    canConnect = (matchCount >= 2);
+                }
+                if (!canConnect) ImGui::BeginDisabled();
+                if (ImGui::Button("Connect CPs")) {
+                    // Clear all selections before connecting
+                    m_ctx.editableMesh.clearSelection();
+                    m_ctx.selectedFaces.clear();
+                    m_ctx.hiddenFaces.clear();
+                    connectByControlPoints();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Connect two objects by matching control points.\nAligns obj2 to obj1, merges boundary rings, removes caps.\nRequires 2 selected objects with 2+ matching CP names.");
+                }
+                if (!canConnect) ImGui::EndDisabled();
+                if (m_connectCPsBackup.valid) {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Undo Connect")) {
+                        undoConnectCPs();
+                    }
+                }
+            }
+        }
+
+        // Combine all objects button
+        if (m_ctx.sceneObjects.size() >= 2) {
+            if (ImGui::Button("Combine All")) {
+                // Sync current edits before combining
+                if (m_ctx.meshDirty && m_ctx.selectedObject) {
+                    updateMeshFromEditable();
+                }
+
+                // Merge all objects into one
+                std::vector<ModelVertex> combinedVerts;
+                std::vector<uint32_t> combinedIndices;
+
+                // Also combine half-edge data to preserve quad topology
+                std::vector<SceneObject::StoredHEVertex> combinedHEVerts;
+                std::vector<SceneObject::StoredHalfEdge> combinedHE;
+                std::vector<SceneObject::StoredHEFace> combinedHEFaces;
+                bool allHaveHEData = true;
+
+                // Find the first textured object to preserve its texture
+                SceneObject* texturedSource = nullptr;
+                for (auto& obj : m_ctx.sceneObjects) {
+                    if (obj->hasTextureData()) {
+                        texturedSource = obj.get();
+                        break;
+                    }
+                }
+
+                for (auto& obj : m_ctx.sceneObjects) {
+                    if (!obj->hasMeshData()) continue;
+
+                    const auto& verts = obj->getVertices();
+                    const auto& indices = obj->getIndices();
+                    const auto& transform = obj->getTransform();
+                    glm::mat4 modelMatrix = transform.getMatrix();
+                    glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
+
+                    uint32_t indexOffset = static_cast<uint32_t>(combinedVerts.size());
+
+                    // Add vertices with transform applied
+                    for (const auto& v : verts) {
+                        ModelVertex newVert = v;
+                        glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
+                        newVert.position = glm::vec3(worldPos);
+                        newVert.normal = glm::normalize(normalMatrix * v.normal);
+                        // Offset UVs of non-textured objects outside 0-1 to avoid texture clash
+                        if (texturedSource && obj.get() != texturedSource) {
+                            newVert.texCoord.x += 1.0f;
+                        }
+                        combinedVerts.push_back(newVert);
+                    }
+
+                    // Add indices with offset
+                    for (uint32_t idx : indices) {
+                        combinedIndices.push_back(idx + indexOffset);
+                    }
+
+                    // Combine half-edge data if available
+                    if (obj->hasEditableMeshData()) {
+                        uint32_t heVertOffset = static_cast<uint32_t>(combinedHEVerts.size());
+                        uint32_t heOffset = static_cast<uint32_t>(combinedHE.size());
+                        uint32_t heFaceOffset = static_cast<uint32_t>(combinedHEFaces.size());
+
+                        for (const auto& v : obj->getHEVertices()) {
+                            SceneObject::StoredHEVertex newV = v;
+                            glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
+                            newV.position = glm::vec3(worldPos);
+                            newV.normal = glm::normalize(normalMatrix * v.normal);
+                            if (newV.halfEdgeIndex != UINT32_MAX) newV.halfEdgeIndex += heOffset;
+                            // Offset UVs of non-textured objects outside 0-1
+                            if (texturedSource && obj.get() != texturedSource) {
+                                newV.uv.x += 1.0f;
+                            }
+                            combinedHEVerts.push_back(newV);
+                        }
+
+                        for (const auto& he : obj->getHEHalfEdges()) {
+                            SceneObject::StoredHalfEdge newHE = he;
+                            if (newHE.vertexIndex != UINT32_MAX) newHE.vertexIndex += heVertOffset;
+                            if (newHE.faceIndex != UINT32_MAX) newHE.faceIndex += heFaceOffset;
+                            if (newHE.nextIndex != UINT32_MAX) newHE.nextIndex += heOffset;
+                            if (newHE.prevIndex != UINT32_MAX) newHE.prevIndex += heOffset;
+                            if (newHE.twinIndex != UINT32_MAX) newHE.twinIndex += heOffset;
+                            combinedHE.push_back(newHE);
+                        }
+
+                        for (const auto& f : obj->getHEFaces()) {
+                            SceneObject::StoredHEFace newF = f;
+                            if (newF.halfEdgeIndex != UINT32_MAX) newF.halfEdgeIndex += heOffset;
+                            combinedHEFaces.push_back(newF);
+                        }
+                    } else {
+                        allHaveHEData = false;
+                    }
+                }
+
+                if (!combinedVerts.empty()) {
+                    // Create new combined object
+                    auto combinedObj = std::make_unique<SceneObject>("Combined");
+
+                    // Pass texture from the textured source object
+                    const unsigned char* texPtr = nullptr;
+                    int texW = 0, texH = 0;
+                    if (texturedSource && texturedSource->hasTextureData()) {
+                        texPtr = texturedSource->getTextureData().data();
+                        texW = texturedSource->getTextureWidth();
+                        texH = texturedSource->getTextureHeight();
+                    }
+                    uint32_t handle = m_ctx.modelRenderer.createModel(combinedVerts, combinedIndices, texPtr, texW, texH);
+                    combinedObj->setBufferHandle(handle);
+                    combinedObj->setIndexCount(static_cast<uint32_t>(combinedIndices.size()));
+                    combinedObj->setVertexCount(static_cast<uint32_t>(combinedVerts.size()));
+                    combinedObj->setMeshData(combinedVerts, combinedIndices);
+
+                    // Store combined half-edge data if all sources had it
+                    if (allHaveHEData && !combinedHEVerts.empty()) {
+                        combinedObj->setEditableMeshData(combinedHEVerts, combinedHE, combinedHEFaces);
+                    }
+
+                    // Copy texture data to combined object so it persists
+                    if (texturedSource && texturedSource->hasTextureData()) {
+                        combinedObj->setTextureData(texturedSource->getTextureData(),
+                                                    texturedSource->getTextureWidth(),
+                                                    texturedSource->getTextureHeight());
+                    }
+
+                    // Queue all existing objects for deletion
+                    for (auto& obj : m_ctx.sceneObjects) {
+                        m_ctx.pendingDeletions.push_back(obj.get());
+                    }
+
+                    // Clear selection
+                    m_ctx.selectedObject = nullptr;
+                    m_ctx.selectedObjects.clear();
+                    m_ctx.editableMesh.clear();
+                    m_ctx.meshDirty = false;
+
+                    // Add combined object
+                    m_ctx.sceneObjects.push_back(std::move(combinedObj));
+
+                    std::cout << "[Combine] Created combined mesh with " << combinedVerts.size()
+                              << " vertices, " << combinedIndices.size() / 3 << " triangles" << std::endl;
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Merge all objects into one combined mesh.\nTransforms are baked in, UVs preserved.");
+            }
+        }
+
+        ImGui::Spacing();
+
+        // Transform controls for selected object
+        if (m_ctx.selectedObject) {
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), "Transform");
+            ImGui::Separator();
+
+            auto& transform = m_ctx.selectedObject->getTransform();
+            glm::vec3 pos = transform.getPosition();
+            glm::vec3 rot = glm::degrees(glm::eulerAngles(transform.getRotation()));
+            glm::vec3 scale = transform.getScale();
+
+            // Position - directly editable input fields
+            ImGui::Text("Position");
+            ImGui::PushItemWidth(-1);
+            if (ImGui::InputFloat3("##pos", &pos.x, "%.3f")) {
+                transform.setPosition(pos);
+            }
+            ImGui::PopItemWidth();
+
+            // Rotation - directly editable input fields
+            ImGui::Text("Rotation");
+            ImGui::PushItemWidth(-1);
+            if (ImGui::InputFloat3("##rot", &rot.x, "%.1f")) {
+                transform.setRotation(rot);
+            }
+            ImGui::PopItemWidth();
+
+            // Scale - directly editable input fields
+            ImGui::Text("Scale");
+            ImGui::PushItemWidth(-1);
+            if (ImGui::InputFloat3("##scale", &scale.x, "%.3f")) {
+                transform.setScale(scale);
+            }
+            ImGui::PopItemWidth();
+
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1), "Snap Settings");
+            ImGui::Separator();
+
+            ImGui::Checkbox("Enable Snap", &m_ctx.snapEnabled);
+
+            if (m_ctx.snapEnabled) {
+                ImGui::PushItemWidth(80);
+                ImGui::InputFloat("Move", &m_ctx.moveSnapIncrement, 0.0f, 0.0f, "%.2f");
+                if (m_ctx.moveSnapIncrement < 0.01f) m_ctx.moveSnapIncrement = 0.01f;
+
+                ImGui::InputFloat("Rotate", &m_ctx.rotateSnapIncrement, 0.0f, 0.0f, "%.0f");
+                if (m_ctx.rotateSnapIncrement < 1.0f) m_ctx.rotateSnapIncrement = 1.0f;
+                ImGui::PopItemWidth();
+
+                // Quick preset buttons for rotation
+                ImGui::SameLine();
+                if (ImGui::SmallButton("15")) m_ctx.rotateSnapIncrement = 15.0f;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("45")) m_ctx.rotateSnapIncrement = 45.0f;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("90")) m_ctx.rotateSnapIncrement = 90.0f;
+            }
+        }
+    }
+    ImGui::End();
+    }
+
+
+    // ===== Rigging window — skeleton, weights, pose refs, corrections =====
+    // Pulled out of the Scene tab (View > Rigging to toggle). Animation/rigging
+    // is its own subject; the Scene tab keeps just objects, transforms, snapping.
+    if (m_ctx.showRiggingWindow) {
+    ImGui::SetNextWindowPos(ImVec2(0, 40), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(350, 680), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Rigging", &m_ctx.showRiggingWindow)) {
+        if (!(m_ctx.selectedObject && m_ctx.editableMesh.isValid()))
+            ImGui::TextDisabled("Select a mesh to rig (add a primitive if the scene is empty).");
         // Rigging / Skeleton tools
         if (m_ctx.selectedObject && m_ctx.editableMesh.isValid()) {
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Rigging");
@@ -2225,153 +2648,6 @@ void ModelingMode::renderModelingEditorUI() {
                 ImGui::Checkbox("Show IK Controls", &m_showIKControls);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Show/hide IK goal + pole handles independently of the skeleton.");
-
-                // Stance Width — live leg correction that works on ANY animation
-                // with a native track (imported OR generated from video), so it's
-                // persistent unlike A-Pose Fix (which needs the source clip).
-                if (m_ctx.selectedObject && m_objectAnims.count(m_ctx.selectedObject)) {
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Stance Width");
-                    ImGui::SetNextItemWidth(180);
-                    float stance = m_stanceWidth;
-                    if (ImGui::SliderFloat("Bring Legs In", &stance, 0.0f, 30.0f, "%.0f deg",
-                                           ImGuiSliderFlags_AlwaysClamp)) {
-                        applyStanceWidth(m_ctx.selectedObject, stance);
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Swings both legs inward at the hip to bring the feet\n"
-                                          "closer together (past the A-pose rest). Works on\n"
-                                          "generated animations too. Non-destructive.");
-
-                    // Plant Feet — kill the constant foot twist monocular mocap injects
-                    // (roll a yaw fix can't see). 0 = as-generated, 1 = flat/planted.
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Plant Feet");
-                    ImGui::SetNextItemWidth(180);
-                    float plant = m_plantFeet;
-                    if (ImGui::SliderFloat("Untwist Feet", &plant, 0.0f, 1.0f, "%.2f",
-                                           ImGuiSliderFlags_AlwaysClamp)) {
-                        applyPlantFeet(m_ctx.selectedObject, plant);
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Blends each foot toward its rest orientation on ALL axes,\n"
-                                          "removing the constant roll/twist mocap wrings into feet.\n"
-                                          "1.0 = flat/planted (right for standing clips); real foot\n"
-                                          "motion is kept. Non-destructive.");
-
-                    // Relax Shoulders — drop the shrugged mocap shoulders.
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Relax Shoulders");
-                    ImGui::SetNextItemWidth(180);
-                    float shoulders = m_relaxShoulders;
-                    if (ImGui::SliderFloat("Drop Shoulders", &shoulders, 0.0f, 0.30f, "%.3f",
-                                           ImGuiSliderFlags_AlwaysClamp)) {
-                        applyRelaxShoulders(m_ctx.selectedObject, shoulders);
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Lowers both shoulders (collar + arm) STRAIGHT DOWN, fixing\n"
-                                          "the shrug the SMPL rest bakes in — without pulling the arms in.\n"
-                                          "Distance in world units. Regenerate the anim for shoulder\n"
-                                          "roles. Non-destructive.");
-
-                    // Foot Roll — add procedural heel-to-toe on a flat/heel run.
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Foot Roll");
-                    ImGui::SetNextItemWidth(180);
-                    float roll = m_footRoll;
-                    if (ImGui::SliderFloat("Heel-to-Toe", &roll, 0.0f, 1.0f, "%.2f",
-                                           ImGuiSliderFlags_AlwaysClamp)) {
-                        applyFootRoll(m_ctx.selectedObject, roll);
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Adds a clean heel-to-toe ankle roll phased to ground contact,\n"
-                                          "so a run reads as a real gait instead of flat/on-the-heels.\n"
-                                          "0 = mocap only, 1 = full procedural roll. v1 — tune by eye.");
-
-                    // Thin Keyframes — keep every Nth key, delete the in-betweens.
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Thin Keyframes");
-                    {
-                        size_t nKeys = m_objectAnims[m_ctx.selectedObject].times.size();
-                        ImGui::TextDisabled("%zu keys", nKeys);
-                    }
-                    ImGui::SetNextItemWidth(120);
-                    ImGui::InputInt("Keep every Nth", &m_thinKeepEvery);
-                    if (m_thinKeepEvery < 2) m_thinKeepEvery = 2;
-                    if (ImGui::Button("Thin Keyframes")) {
-                        thinKeyframes(m_ctx.selectedObject, m_thinKeepEvery);
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Deletes every key EXCEPT every Nth (and the last one),\n"
-                                          "clearing all the keys in between. Destructive to the\n"
-                                          "loaded track — re-import the anim to get full density back.");
-                }
-
-                // A-Pose spread fix — only for imported skinned GLBs (Meshy/Mixamo)
-                // that carry a baked-in limb spread from the source rig pose.
-                if (m_ctx.selectedObject && m_importedClipSource.count(m_ctx.selectedObject)) {
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "A-Pose Fix");
-                    ImGui::SetNextItemWidth(180);
-                    float aposePct = m_aposeNeutralize * 100.0f;
-                    if (ImGui::SliderFloat("Neutralize Spread", &aposePct, 0.0f, 100.0f, "%.0f%%",
-                                           ImGuiSliderFlags_AlwaysClamp)) {
-                        m_aposeNeutralize = aposePct / 100.0f;
-                        applyAPoseNeutralize(m_ctx.selectedObject, m_aposeNeutralize);
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Removes the constant outward spread baked into the arms/legs\n"
-                                          "by the source A-pose rig. 0%% = original mocap, 100%% = the\n"
-                                          "limbs reach neutral at their most-closed frame. Re-derives\n"
-                                          "from the pristine clip, so it's non-destructive.");
-                }
-
-                // --- Imported GLB animation (skinned model) ---
-                if (m_ctx.selectedObject && m_ctx.selectedObject->isSkinned()) {
-                    uint32_t sh = m_ctx.selectedObject->getSkinnedModelHandle();
-                    auto* data = (sh != UINT32_MAX)
-                        ? m_ctx.skinnedModelRenderer.getModelData(sh) : nullptr;
-                    if (data) {
-                        ImGui::Separator();
-                        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "GLB Animation");
-                        ImGui::Checkbox("Show Animated Skeleton", &m_showSkinnedSkeleton);
-
-                        const auto& names = m_ctx.selectedObject->getAnimationNames();
-                        // Clip selector
-                        if (names.size() > 1) {
-                            std::string cur = m_ctx.selectedObject->getCurrentAnimation();
-                            if (ImGui::BeginCombo("Clip", cur.c_str())) {
-                                for (const auto& n : names) {
-                                    bool sel = (n == cur);
-                                    if (ImGui::Selectable(n.c_str(), sel)) {
-                                        m_ctx.skinnedModelRenderer.playAnimation(sh, n, true);
-                                        m_ctx.selectedObject->setCurrentAnimation(n);
-                                    }
-                                    if (sel) ImGui::SetItemDefaultFocus();
-                                }
-                                ImGui::EndCombo();
-                            }
-                        } else if (names.size() == 1) {
-                            ImGui::Text("Clip: %s", names[0].c_str());
-                        }
-
-                        // Play / pause + frame scrubber
-                        const AnimationClip* clip = data->animPlayer.getCurrentClip();
-                        float duration = clip ? clip->duration : 0.0f;
-                        bool playing = data->animPlayer.getPlaybackSpeed() > 0.0f;
-                        if (ImGui::Checkbox("Play", &playing)) {
-                            data->animPlayer.setPlaybackSpeed(playing ? 1.0f : 0.0f);
-                        }
-                        if (duration > 0.0f) {
-                            float t = data->animPlayer.getCurrentTime();
-                            ImGui::SetNextItemWidth(220);
-                            if (ImGui::SliderFloat("Frame", &t, 0.0f, duration, "%.3fs")) {
-                                // Scrub: pause and jump to the chosen time.
-                                data->animPlayer.setPlaybackSpeed(0.0f);
-                                data->animPlayer.setCurrentTime(t);
-                            }
-                            ImGui::SameLine();
-                            ImGui::TextDisabled("/ %.2fs", duration);
-                        }
-                    }
-                }
 
                 if (ImGui::Checkbox("Weight Heatmap", &m_showWeightHeatMap)) {
                     m_heatMapDirty = true;
@@ -2895,221 +3171,6 @@ void ModelingMode::renderModelingEditorUI() {
                         ImGui::SetTooltip("Save mesh + skeleton + weights + keyframed animation\nas a GLB the engine can play with GPU skinning.\nRequires Set Bind Pose + at least one keyframe.");
                     }
 
-                    // --- Named clip library: assemble idle+walk+... on ONE model,
-                    //     then export a single multi-clip GLB for the game.
-                    if (m_ctx.selectedObject && m_objectAnims.count(m_ctx.selectedObject)) {
-                        ImGui::Separator();
-                        ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f), "Animation Clips (for the game)");
-                        ImGui::SetNextItemWidth(110);
-                        ImGui::InputText("##clipname", m_clipNameBuf, sizeof(m_clipNameBuf));
-                        ImGui::SameLine();
-                        if (ImGui::Button("Save Current Clip")) {
-                            auto& lib = m_namedClips[m_ctx.selectedObject];
-                            std::string nm = m_clipNameBuf[0] ? m_clipNameBuf : ("clip" + std::to_string(lib.size() + 1));
-                            bool replaced = false;
-                            for (auto& pr : lib) if (pr.first == nm) { pr.second = m_objectAnims[m_ctx.selectedObject]; replaced = true; break; }
-                            if (!replaced) lib.push_back({nm, m_objectAnims[m_ctx.selectedObject]});
-                            std::cout << "[Clips] saved '" << nm << "' (" << lib.size() << " total)\n";
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Save the CURRENT (corrected) animation under this name.\n"
-                                              "Import idle -> correct -> Save 'idle'; import walk -> Save 'walk';\n"
-                                              "then Export Multi-Clip GLB. Re-saving a name overwrites it.");
-
-                        auto& lib = m_namedClips[m_ctx.selectedObject];
-                        for (size_t ci = 0; ci < lib.size(); ++ci) {
-                            ImGui::BulletText("%s", lib[ci].first.c_str());
-                            ImGui::SameLine(); ImGui::PushID(static_cast<int>(ci));
-                            if (ImGui::SmallButton("remove")) { lib.erase(lib.begin() + ci); ImGui::PopID(); break; }
-                            ImGui::PopID();
-                        }
-                        if (!lib.empty()) {
-                            if (ImGui::Button("Export Multi-Clip GLB")) exportMultiClipGLB();
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Export the model with ALL saved clips as one GLB\n(e.g. idle+walk) for the game. Requires Set Bind Pose.");
-                        }
-                    }
-
-                    // pose2anim: load a video-derived bone animation onto this rig.
-                    sameLineIfButtonFits("Import Anim (JSON)");
-                    if (ImGui::Button("Import Anim (JSON)")) {
-                        nfdchar_t* outPath = nullptr;
-                        nfdfilteritem_t filters[2] = {{"LIME animation", "limeanim.json"}, {"JSON", "json"}};
-                        if (NFD_OpenDialog(&outPath, filters, 2, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
-                            importBoneAnimationJSON(outPath);
-                            NFD_FreePath(outPath);
-                        }
-                    }
-
-                    // Anim from Video: full pipeline — pick ANY video (Grok Imagine,
-                    // phone footage, ...), run local 3D mocap (GVHMR) + rotation
-                    // retarget in the background, auto-import onto this rig.
-                    if (m_vid2animRunning) {
-                        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
-                                           "Generating anim from video... (~1 min, GPU busy)");
-                    } else {
-                        sameLineIfButtonFits("Anim from Video...");
-                        if (ImGui::Button("Anim from Video...")) {
-                            nfdchar_t* vPath = nullptr;
-                            nfdfilteritem_t vf[1] = {{"Video", "mp4,mov,webm,mkv,avi"}};
-                            if (NFD_OpenDialog(&vPath, vf, 1, nullptr) == NFD_OKAY) {
-                                m_vid2animVideoPath = vPath;
-                                NFD_FreePath(vPath);
-                                m_vid2animStartFrame = 0;
-                                m_vid2animEndFrame = 0;
-                                probeVideoInfo();  // fill total frames + fps
-                                m_vid2animShowPopup = true;
-                            }
-                        }
-                        if (ImGui::IsItemHovered()) {
-                            ImGui::SetTooltip("Generate an animation FROM a video clip:\n"
-                                              "local 3D mocap (GVHMR) + retarget onto this rig.\n"
-                                              "Prompt a clip in Grok Imagine, point this at it.");
-                        }
-                    }
-                    // Persistent status so a fast failure / a finished run doesn't vanish.
-                    if (!m_vid2animStatus.empty() && !m_vid2animRunning) {
-                        bool failed = m_vid2animStatus.rfind("FAILED", 0) == 0;
-                        ImGui::TextColored(failed ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
-                                                  : ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
-                                           "%s", m_vid2animStatus.c_str());
-                    }
-                    if (m_vid2animShowPopup) {
-                        ImGui::OpenPopup("Anim from Video");
-                        m_vid2animShowPopup = false;
-                    }
-                    if (ImGui::BeginPopupModal("Anim from Video", nullptr,
-                                               ImGuiWindowFlags_AlwaysAutoResize)) {
-                        ImGui::Text("Video: %s",
-                                    std::filesystem::path(m_vid2animVideoPath).filename().string().c_str());
-                        if (m_vid2animTotalFrames > 0)
-                            ImGui::Text("%d frames @ %.0f fps  (frame 0 .. %d)",
-                                        m_vid2animTotalFrames, m_vid2animFps,
-                                        m_vid2animTotalFrames - 1);
-                        ImGui::Separator();
-
-                        // Backend picker: GVHMR (SMPL, best quality, non-commercial
-                        // model) vs RTM (RTMPose3D, Apache-licensed local 3D).
-                        const char* vidBackends[] = { "GVHMR (SMPL)", "RTM (RTMPose3D)" };
-                        ImGui::SetNextItemWidth(180);
-                        ImGui::Combo("Backend", &m_vid2animBackend, vidBackends, 2);
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("GVHMR: SMPL mocap, best quality (non-commercial model).\n"
-                                              "RTM: RTMPose3D 3D joints, Apache-licensed, body-only\n"
-                                              "(no fingers). Both retarget onto this rig by bone name.");
-                        if (m_vid2animBackend == 1)
-                            ImGui::TextDisabled("(RTM: whole clip only — no frame-range trim yet)");
-                        ImGui::Separator();
-                        ImGui::Checkbox("Use clip range (frames)", &m_vid2animUseRange);
-                        int maxF = (m_vid2animTotalFrames > 0) ? m_vid2animTotalFrames - 1 : 100000;
-                        if (m_vid2animUseRange) {
-                            ImGui::SetNextItemWidth(110);
-                            ImGui::InputInt("Start frame", &m_vid2animStartFrame);
-                            ImGui::SetNextItemWidth(110);
-                            ImGui::InputInt("End frame", &m_vid2animEndFrame);
-                            m_vid2animStartFrame = std::clamp(m_vid2animStartFrame, 0, maxF);
-                            m_vid2animEndFrame   = std::clamp(m_vid2animEndFrame, 0, maxF);
-                        } else {
-                            ImGui::TextDisabled("The whole video will be used.");
-                        }
-                        bool rangeOk = !m_vid2animUseRange ||
-                                       (m_vid2animEndFrame > m_vid2animStartFrame);
-                        if (!rangeOk)
-                            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "End frame must be after Start");
-                        if (ImGui::Button("Generate") && rangeOk) {
-                            launchVideoToAnim();
-                            ImGui::CloseCurrentPopup();
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
-                        ImGui::EndPopup();
-                    }
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Load a pose2anim *.limeanim.json (per-frame bone positions\nderived from a video) onto this rig. Bones matched by name.\nSet Bind Pose first to see it deform. Rung 1: positions only.");
-                    }
-
-                    // ---- Pose Reference stepper --------------------------------
-                    // Point at a folder of meshes; each shows as a ghost to hand-pose
-                    // the skeleton against. Step through, Set Key on each, to build a
-                    // clip. (Meshes are display-only — excluded from selection/save.)
-                    ImGui::Separator();
-                    ImGui::TextDisabled("Pose Reference (folder -> keys)");
-                    if (ImGui::Button("Load Pose References...")) {
-                        nfdchar_t* dir = nullptr;
-                        if (NFD_PickFolder(&dir, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
-                            loadPoseRefFolder(dir);
-                            NFD_FreePath(dir);
-                        }
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Pick a folder of meshes (GLB). Each is shown as a ghost\n"
-                                          "silhouette to hand-pose the skeleton against; step through\n"
-                                          "and Set Key on each pose to build one animation clip.");
-                    if (!m_poseRefFiles.empty()) {
-                        ImGui::BeginDisabled(m_poseRefIndex <= 0);
-                        if (ImGui::Button("Prev##poseref")) showPoseRef(m_poseRefIndex - 1);
-                        ImGui::EndDisabled();
-                        ImGui::SameLine();
-                        ImGui::BeginDisabled(m_poseRefIndex >= static_cast<int>(m_poseRefFiles.size()) - 1);
-                        if (ImGui::Button("Next##poseref")) showPoseRef(m_poseRefIndex + 1);
-                        ImGui::EndDisabled();
-                        ImGui::SameLine();
-                        std::string rn = (m_poseRefIndex >= 0)
-                            ? std::filesystem::path(m_poseRefFiles[m_poseRefIndex]).filename().string()
-                            : std::string("(none)");
-                        ImGui::Text("Ref %d/%d: %s", m_poseRefIndex + 1,
-                                    static_cast<int>(m_poseRefFiles.size()), rn.c_str());
-
-                        // Registration controls appear when we're showing a reference
-                        // SKELETON (a .bones.json sidecar was found) rather than a mesh.
-                        if (!m_poseRefBoneHeads.empty()) {
-                            ImGui::Checkbox("Show ref skeleton", &m_showPoseRefSkeleton);
-                            ImGui::SameLine();
-                            if (ImGui::Checkbox("Z-up", &m_poseRefZUp)) applyPoseRefTransform();
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("UniRig armatures are Z-up; LIME is Y-up.\nLeave on unless the reference lies on its side.");
-                            ImGui::SetNextItemWidth(150);
-                            if (ImGui::SliderFloat("Ref scale", &m_poseRefScale, 0.05f, 10.0f, "%.2f",
-                                                   ImGuiSliderFlags_Logarithmic))
-                                applyPoseRefTransform();
-                            ImGui::SetNextItemWidth(220);
-                            if (ImGui::DragFloat3("Ref offset", &m_poseRefOffset.x, 0.01f))
-                                applyPoseRefTransform();
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Nudge the magenta reference bones to line up with\nyour working skeleton, then pose to match.");
-
-                            // Conform: snap the working skeleton onto the reference.
-                            ImGui::Separator();
-                            if (ImGui::Button("Conform All to Ref")) {
-                                conformBonesToReference(true);
-                            }
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Snap EVERY working bone to its nearest reference bone and\n"
-                                                  "orient it to match — adopts the whole reference pose in one\n"
-                                                  "click. Then fix hands/fingers per-bone below. (Register the\n"
-                                                  "overlay with scale/offset first so 'nearest' is meaningful.)");
-                            ImGui::SameLine();
-                            ImGui::BeginDisabled(m_selectedBone < 0);
-                            if (ImGui::Button("Conform Selected to Ref")) {
-                                conformBonesToReference(false);
-                            }
-                            ImGui::EndDisabled();
-                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                                ImGui::SetTooltip(m_selectedBone < 0
-                                    ? "Select a bone first (click it in the bone list or viewport)."
-                                    : "Snap ONLY the selected bone to its nearest reference bone.\n"
-                                      "Use to fix bones the bulk conform mismatched (esp. fingers).");
-                        }
-
-                        if (ImGui::Button("Clear Reference")) {
-                            if (m_ctx.clearPoseReferenceCallback) m_ctx.clearPoseReferenceCallback();
-                            m_poseRefFiles.clear();
-                            m_poseRefIndex = -1;
-                            m_poseRefBoneHeadsRaw.clear();
-                            m_poseRefBoneParents.clear();
-                            m_poseRefBoneHeads.clear();
-                        }
-                    }
                 }
 
                 // Delete entire skeleton
@@ -3326,414 +3387,423 @@ void ModelingMode::renderModelingEditorUI() {
                 }
             }
         }
+    }
+    ImGui::End();
+    }
 
-        // Vertex color for solid-colored objects
-        if (m_ctx.selectedObject && m_ctx.selectedObject->hasMeshData()) {
-            ImGui::TextColored(ImVec4(1, 1, 0, 1), "Vertex Color");
-            ImGui::Separator();
 
-            static glm::vec3 solidColor(0.7f, 0.7f, 0.7f);
-            ImGui::ColorEdit3("Color", &solidColor.x);
-
-            if (ImGui::Button("Apply to Object")) {
-                // Sync current edits first
-                if (m_ctx.meshDirty) {
-                    updateMeshFromEditable();
-                }
-
-                // Get current mesh data
-                auto verts = m_ctx.selectedObject->getVertices();  // Copy
-                const auto& indices = m_ctx.selectedObject->getIndices();
-
-                // Apply color to all vertices
-                for (auto& v : verts) {
-                    v.color = glm::vec4(solidColor, 1.0f);
-                }
-
-                // Update GPU mesh (preserve texture)
-                uint32_t oldHandle = m_ctx.selectedObject->getBufferHandle();
-                uint32_t newHandle;
-                if (m_ctx.selectedObject->hasTextureData()) {
-                    const auto& texData = m_ctx.selectedObject->getTextureData();
-                    newHandle = m_ctx.modelRenderer.createModel(verts, indices, texData.data(),
-                        m_ctx.selectedObject->getTextureWidth(), m_ctx.selectedObject->getTextureHeight());
-                } else {
-                    newHandle = m_ctx.modelRenderer.createModel(verts, indices, nullptr, 0, 0);
-                }
-                m_ctx.selectedObject->setBufferHandle(newHandle);
-                m_ctx.selectedObject->setMeshData(verts, indices);
-
-                // Update editable mesh vertex colors too
-                if (m_ctx.editableMesh.isValid()) {
-                    for (size_t i = 0; i < m_ctx.editableMesh.getVertexCount(); ++i) {
-                        m_ctx.editableMesh.getVertex(i).color = glm::vec4(solidColor, 1.0f);
-                    }
-                }
-
-                std::cout << "[Color] Applied solid color (" << solidColor.r << ", "
-                          << solidColor.g << ", " << solidColor.b << ") to "
-                          << verts.size() << " vertices" << std::endl;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Set all vertices to this solid color.\nUseful for detail pieces before combining.");
-            }
-            ImGui::Spacing();
-        }
-
-        // Combine selected objects button
-        if (m_ctx.selectedObjects.size() >= 2) {
-            if (ImGui::Button("Combine Selected")) {
-                // Sync current edits before combining
-                if (m_ctx.meshDirty && m_ctx.selectedObject) {
-                    updateMeshFromEditable();
-                }
-
-                // Merge selected objects into one
-                std::vector<ModelVertex> combinedVerts;
-                std::vector<uint32_t> combinedIndices;
-
-                // Also combine half-edge data to preserve quad topology
-                std::vector<SceneObject::StoredHEVertex> combinedHEVerts;
-                std::vector<SceneObject::StoredHalfEdge> combinedHE;
-                std::vector<SceneObject::StoredHEFace> combinedHEFaces;
-                bool allHaveHEData = true;
-
-                for (auto& obj : m_ctx.sceneObjects) {
-                    if (m_ctx.selectedObjects.count(obj.get()) == 0) continue;
-                    if (!obj->hasMeshData()) continue;
-
-                    const auto& verts = obj->getVertices();
-                    const auto& indices = obj->getIndices();
-                    const auto& transform = obj->getTransform();
-                    glm::mat4 modelMatrix = transform.getMatrix();
-                    glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
-
-                    uint32_t indexOffset = static_cast<uint32_t>(combinedVerts.size());
-
-                    for (const auto& v : verts) {
-                        ModelVertex newVert = v;
-                        glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
-                        newVert.position = glm::vec3(worldPos);
-                        newVert.normal = glm::normalize(normalMatrix * v.normal);
-                        combinedVerts.push_back(newVert);
-                    }
-
-                    for (uint32_t idx : indices) {
-                        combinedIndices.push_back(idx + indexOffset);
-                    }
-
-                    // Combine half-edge data if available
-                    if (obj->hasEditableMeshData()) {
-                        uint32_t heVertOffset = static_cast<uint32_t>(combinedHEVerts.size());
-                        uint32_t heOffset = static_cast<uint32_t>(combinedHE.size());
-                        uint32_t heFaceOffset = static_cast<uint32_t>(combinedHEFaces.size());
-
-                        for (const auto& v : obj->getHEVertices()) {
-                            SceneObject::StoredHEVertex newV = v;
-                            glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
-                            newV.position = glm::vec3(worldPos);
-                            newV.normal = glm::normalize(normalMatrix * v.normal);
-                            if (newV.halfEdgeIndex != UINT32_MAX) newV.halfEdgeIndex += heOffset;
-                            combinedHEVerts.push_back(newV);
-                        }
-
-                        for (const auto& he : obj->getHEHalfEdges()) {
-                            SceneObject::StoredHalfEdge newHE = he;
-                            if (newHE.vertexIndex != UINT32_MAX) newHE.vertexIndex += heVertOffset;
-                            if (newHE.faceIndex != UINT32_MAX) newHE.faceIndex += heFaceOffset;
-                            if (newHE.nextIndex != UINT32_MAX) newHE.nextIndex += heOffset;
-                            if (newHE.prevIndex != UINT32_MAX) newHE.prevIndex += heOffset;
-                            if (newHE.twinIndex != UINT32_MAX) newHE.twinIndex += heOffset;
-                            combinedHE.push_back(newHE);
-                        }
-
-                        for (const auto& f : obj->getHEFaces()) {
-                            SceneObject::StoredHEFace newF = f;
-                            if (newF.halfEdgeIndex != UINT32_MAX) newF.halfEdgeIndex += heOffset;
-                            combinedHEFaces.push_back(newF);
-                        }
-                    } else {
-                        allHaveHEData = false;
-                    }
-                }
-
-                if (!combinedVerts.empty()) {
-                    auto combinedObj = std::make_unique<SceneObject>("Combined");
-                    uint32_t handle = m_ctx.modelRenderer.createModel(combinedVerts, combinedIndices, nullptr, 0, 0);
-                    combinedObj->setBufferHandle(handle);
-                    combinedObj->setIndexCount(static_cast<uint32_t>(combinedIndices.size()));
-                    combinedObj->setVertexCount(static_cast<uint32_t>(combinedVerts.size()));
-                    combinedObj->setMeshData(combinedVerts, combinedIndices);
-
-                    // Store combined half-edge data if all sources had it
-                    if (allHaveHEData && !combinedHEVerts.empty()) {
-                        combinedObj->setEditableMeshData(combinedHEVerts, combinedHE, combinedHEFaces);
-                    }
-
-                    // Queue selected objects for deletion
-                    for (SceneObject* obj : m_ctx.selectedObjects) {
-                        m_ctx.pendingDeletions.push_back(obj);
-                    }
-
-                    // Clear selection
-                    m_ctx.selectedObject = nullptr;
-                    m_ctx.selectedObjects.clear();
-                    m_ctx.editableMesh.clear();
-                    m_ctx.meshDirty = false;
-
-                    m_ctx.sceneObjects.push_back(std::move(combinedObj));
-
-                    std::cout << "[Combine Selected] Created combined mesh with " << combinedVerts.size()
-                              << " vertices, " << combinedIndices.size() / 3 << " triangles" << std::endl;
-                }
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Merge selected objects into one combined mesh.\nCtrl+Click or Shift+Click to multi-select in list.");
-            }
-            ImGui::SameLine();
-
-            // Connect CPs button - enabled when exactly 2 objects selected with matching CPs
-            {
-                bool canConnect = false;
-                if (m_ctx.selectedObjects.size() == 2) {
-                    // Check for matching CP names between the two objects
-                    std::vector<SceneObject*> selVec(m_ctx.selectedObjects.begin(), m_ctx.selectedObjects.end());
-                    auto& cps1 = selVec[0]->getControlPoints();
-                    auto& cps2 = selVec[1]->getControlPoints();
-                    int matchCount = 0;
-                    for (auto& cp1 : cps1)
-                        for (auto& cp2 : cps2)
-                            if (cp1.name == cp2.name) matchCount++;
-                    canConnect = (matchCount >= 2);
-                }
-                if (!canConnect) ImGui::BeginDisabled();
-                if (ImGui::Button("Connect CPs")) {
-                    // Clear all selections before connecting
-                    m_ctx.editableMesh.clearSelection();
-                    m_ctx.selectedFaces.clear();
-                    m_ctx.hiddenFaces.clear();
-                    connectByControlPoints();
-                }
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip("Connect two objects by matching control points.\nAligns obj2 to obj1, merges boundary rings, removes caps.\nRequires 2 selected objects with 2+ matching CP names.");
-                }
-                if (!canConnect) ImGui::EndDisabled();
-                if (m_connectCPsBackup.valid) {
+    // ===== Animation window — clips, import/generate, corrections, pose refs =====
+    // Split out of Rigging (View > Animation). Rigging = build the puppet;
+    // Animation = make it move.
+    if (m_ctx.showAnimationWindow) {
+    ImGui::SetNextWindowPos(ImVec2(360, 40), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(360, 620), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Animation", &m_ctx.showAnimationWindow)) {
+        if (!(m_ctx.selectedObject && m_ctx.editableMesh.isValid())) {
+            ImGui::TextDisabled("Select a rigged mesh to animate.");
+        } else {
+                // Cycle & keyframe tools (moved off the timeline bar so it stays a
+                // clean scrubber). These act on the key at the playhead.
+                {
+                    auto trackIt = m_objectAnims.find(m_ctx.selectedObject);
+                    bool haveKeys = (trackIt != m_objectAnims.end() && !trackIt->second.times.empty());
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Cycle Tools");
+                    ImGui::Checkbox("Lock Feet (IK)", &m_ikLockFeet);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Freeze the IK foot goals so moving the pelvis/body can't\n"
+                                          "drag the planted feet. Turn off to step a foot forward.");
                     ImGui::SameLine();
-                    if (ImGui::Button("Undo Connect")) {
-                        undoConnectCPs();
-                    }
-                }
-            }
-        }
+                    if (ImGui::Button("Plant Feet Here")) plantFeetAtCurrent();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Re-lock each IK foot goal at its CURRENT position.");
+                    if (ImGui::Button("Mirror Pose")) mirrorPoseAtCurrentTime();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Mirror the key at the playhead left<->right. Pose one stride,\n"
+                                          "copy it to the opposite phase, then Mirror Pose there.");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Close Loop")) makeLoopClosed();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Append the start pose one frame past the end so the clip loops.");
 
-        // Combine all objects button
-        if (m_ctx.sceneObjects.size() >= 2) {
-            if (ImGui::Button("Combine All")) {
-                // Sync current edits before combining
-                if (m_ctx.meshDirty && m_ctx.selectedObject) {
-                    updateMeshFromEditable();
-                }
-
-                // Merge all objects into one
-                std::vector<ModelVertex> combinedVerts;
-                std::vector<uint32_t> combinedIndices;
-
-                // Also combine half-edge data to preserve quad topology
-                std::vector<SceneObject::StoredHEVertex> combinedHEVerts;
-                std::vector<SceneObject::StoredHalfEdge> combinedHE;
-                std::vector<SceneObject::StoredHEFace> combinedHEFaces;
-                bool allHaveHEData = true;
-
-                // Find the first textured object to preserve its texture
-                SceneObject* texturedSource = nullptr;
-                for (auto& obj : m_ctx.sceneObjects) {
-                    if (obj->hasTextureData()) {
-                        texturedSource = obj.get();
-                        break;
-                    }
+                    if (!haveKeys) ImGui::BeginDisabled();
+                    if (ImGui::Button("Copy Key")) copyKeyAtCurrentTime();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the key nearest the playhead (within 50 ms)");
+                    if (!haveKeys) ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (!m_keyClipboard.valid) ImGui::BeginDisabled();
+                    if (ImGui::Button("Paste Key")) pasteKeyAtCurrentTime();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Insert (or overwrite) a key at the playhead from the clipboard");
+                    if (!m_keyClipboard.valid) ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset Layout")) m_layoutResetPending = true;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset all editor window positions/sizes to defaults.");
+                    ImGui::Separator();
                 }
 
-                for (auto& obj : m_ctx.sceneObjects) {
-                    if (!obj->hasMeshData()) continue;
-
-                    const auto& verts = obj->getVertices();
-                    const auto& indices = obj->getIndices();
-                    const auto& transform = obj->getTransform();
-                    glm::mat4 modelMatrix = transform.getMatrix();
-                    glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
-
-                    uint32_t indexOffset = static_cast<uint32_t>(combinedVerts.size());
-
-                    // Add vertices with transform applied
-                    for (const auto& v : verts) {
-                        ModelVertex newVert = v;
-                        glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
-                        newVert.position = glm::vec3(worldPos);
-                        newVert.normal = glm::normalize(normalMatrix * v.normal);
-                        // Offset UVs of non-textured objects outside 0-1 to avoid texture clash
-                        if (texturedSource && obj.get() != texturedSource) {
-                            newVert.texCoord.x += 1.0f;
-                        }
-                        combinedVerts.push_back(newVert);
+                // Stance Width — live leg correction that works on ANY animation
+                // with a native track (imported OR generated from video), so it's
+                // persistent unlike A-Pose Fix (which needs the source clip).
+                if (m_ctx.selectedObject && m_objectAnims.count(m_ctx.selectedObject)) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Stance Width");
+                    ImGui::SetNextItemWidth(180);
+                    float stance = m_stanceWidth;
+                    if (ImGui::SliderFloat("Bring Legs In", &stance, 0.0f, 30.0f, "%.0f deg",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyStanceWidth(m_ctx.selectedObject, stance);
                     }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Swings both legs inward at the hip to bring the feet\n"
+                                          "closer together (past the A-pose rest). Works on\n"
+                                          "generated animations too. Non-destructive.");
 
-                    // Add indices with offset
-                    for (uint32_t idx : indices) {
-                        combinedIndices.push_back(idx + indexOffset);
+                    // Plant Feet — kill the constant foot twist monocular mocap injects
+                    // (roll a yaw fix can't see). 0 = as-generated, 1 = flat/planted.
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Plant Feet");
+                    ImGui::SetNextItemWidth(180);
+                    float plant = m_plantFeet;
+                    if (ImGui::SliderFloat("Untwist Feet", &plant, 0.0f, 1.0f, "%.2f",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyPlantFeet(m_ctx.selectedObject, plant);
                     }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Blends each foot toward its rest orientation on ALL axes,\n"
+                                          "removing the constant roll/twist mocap wrings into feet.\n"
+                                          "1.0 = flat/planted (right for standing clips); real foot\n"
+                                          "motion is kept. Non-destructive.");
 
-                    // Combine half-edge data if available
-                    if (obj->hasEditableMeshData()) {
-                        uint32_t heVertOffset = static_cast<uint32_t>(combinedHEVerts.size());
-                        uint32_t heOffset = static_cast<uint32_t>(combinedHE.size());
-                        uint32_t heFaceOffset = static_cast<uint32_t>(combinedHEFaces.size());
+                    // Relax Shoulders — drop the shrugged mocap shoulders.
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Relax Shoulders");
+                    ImGui::SetNextItemWidth(180);
+                    float shoulders = m_relaxShoulders;
+                    if (ImGui::SliderFloat("Drop Shoulders", &shoulders, 0.0f, 0.30f, "%.3f",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyRelaxShoulders(m_ctx.selectedObject, shoulders);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Lowers both shoulders (collar + arm) STRAIGHT DOWN, fixing\n"
+                                          "the shrug the SMPL rest bakes in — without pulling the arms in.\n"
+                                          "Distance in world units. Regenerate the anim for shoulder\n"
+                                          "roles. Non-destructive.");
 
-                        for (const auto& v : obj->getHEVertices()) {
-                            SceneObject::StoredHEVertex newV = v;
-                            glm::vec4 worldPos = modelMatrix * glm::vec4(v.position, 1.0f);
-                            newV.position = glm::vec3(worldPos);
-                            newV.normal = glm::normalize(normalMatrix * v.normal);
-                            if (newV.halfEdgeIndex != UINT32_MAX) newV.halfEdgeIndex += heOffset;
-                            // Offset UVs of non-textured objects outside 0-1
-                            if (texturedSource && obj.get() != texturedSource) {
-                                newV.uv.x += 1.0f;
+                    // Foot Roll — add procedural heel-to-toe on a flat/heel run.
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Foot Roll");
+                    ImGui::SetNextItemWidth(180);
+                    float roll = m_footRoll;
+                    if (ImGui::SliderFloat("Heel-to-Toe", &roll, 0.0f, 1.0f, "%.2f",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyFootRoll(m_ctx.selectedObject, roll);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Adds a clean heel-to-toe ankle roll phased to ground contact,\n"
+                                          "so a run reads as a real gait instead of flat/on-the-heels.\n"
+                                          "0 = mocap only, 1 = full procedural roll. v1 — tune by eye.");
+
+                    // Thin Keyframes — keep every Nth key, delete the in-betweens.
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Thin Keyframes");
+                    {
+                        size_t nKeys = m_objectAnims[m_ctx.selectedObject].times.size();
+                        ImGui::TextDisabled("%zu keys", nKeys);
+                    }
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::InputInt("Keep every Nth", &m_thinKeepEvery);
+                    if (m_thinKeepEvery < 2) m_thinKeepEvery = 2;
+                    if (ImGui::Button("Thin Keyframes")) {
+                        thinKeyframes(m_ctx.selectedObject, m_thinKeepEvery);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Deletes every key EXCEPT every Nth (and the last one),\n"
+                                          "clearing all the keys in between. Destructive to the\n"
+                                          "loaded track — re-import the anim to get full density back.");
+                }
+
+                // A-Pose spread fix — only for imported skinned GLBs (Meshy/Mixamo)
+                // that carry a baked-in limb spread from the source rig pose.
+                if (m_ctx.selectedObject && m_importedClipSource.count(m_ctx.selectedObject)) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "A-Pose Fix");
+                    ImGui::SetNextItemWidth(180);
+                    float aposePct = m_aposeNeutralize * 100.0f;
+                    if (ImGui::SliderFloat("Neutralize Spread", &aposePct, 0.0f, 100.0f, "%.0f%%",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        m_aposeNeutralize = aposePct / 100.0f;
+                        applyAPoseNeutralize(m_ctx.selectedObject, m_aposeNeutralize);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Removes the constant outward spread baked into the arms/legs\n"
+                                          "by the source A-pose rig. 0%% = original mocap, 100%% = the\n"
+                                          "limbs reach neutral at their most-closed frame. Re-derives\n"
+                                          "from the pristine clip, so it's non-destructive.");
+                }
+
+                // --- Imported GLB animation (skinned model) ---
+                if (m_ctx.selectedObject && m_ctx.selectedObject->isSkinned()) {
+                    uint32_t sh = m_ctx.selectedObject->getSkinnedModelHandle();
+                    auto* data = (sh != UINT32_MAX)
+                        ? m_ctx.skinnedModelRenderer.getModelData(sh) : nullptr;
+                    if (data) {
+                        ImGui::Separator();
+                        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "GLB Animation");
+                        ImGui::Checkbox("Show Animated Skeleton", &m_showSkinnedSkeleton);
+
+                        const auto& names = m_ctx.selectedObject->getAnimationNames();
+                        // Clip selector
+                        if (names.size() > 1) {
+                            std::string cur = m_ctx.selectedObject->getCurrentAnimation();
+                            if (ImGui::BeginCombo("Clip", cur.c_str())) {
+                                for (const auto& n : names) {
+                                    bool sel = (n == cur);
+                                    if (ImGui::Selectable(n.c_str(), sel)) {
+                                        m_ctx.skinnedModelRenderer.playAnimation(sh, n, true);
+                                        m_ctx.selectedObject->setCurrentAnimation(n);
+                                    }
+                                    if (sel) ImGui::SetItemDefaultFocus();
+                                }
+                                ImGui::EndCombo();
                             }
-                            combinedHEVerts.push_back(newV);
+                        } else if (names.size() == 1) {
+                            ImGui::Text("Clip: %s", names[0].c_str());
                         }
 
-                        for (const auto& he : obj->getHEHalfEdges()) {
-                            SceneObject::StoredHalfEdge newHE = he;
-                            if (newHE.vertexIndex != UINT32_MAX) newHE.vertexIndex += heVertOffset;
-                            if (newHE.faceIndex != UINT32_MAX) newHE.faceIndex += heFaceOffset;
-                            if (newHE.nextIndex != UINT32_MAX) newHE.nextIndex += heOffset;
-                            if (newHE.prevIndex != UINT32_MAX) newHE.prevIndex += heOffset;
-                            if (newHE.twinIndex != UINT32_MAX) newHE.twinIndex += heOffset;
-                            combinedHE.push_back(newHE);
+                        // Play / pause + frame scrubber
+                        const AnimationClip* clip = data->animPlayer.getCurrentClip();
+                        float duration = clip ? clip->duration : 0.0f;
+                        bool playing = data->animPlayer.getPlaybackSpeed() > 0.0f;
+                        if (ImGui::Checkbox("Play", &playing)) {
+                            data->animPlayer.setPlaybackSpeed(playing ? 1.0f : 0.0f);
                         }
+                        if (duration > 0.0f) {
+                            float t = data->animPlayer.getCurrentTime();
+                            ImGui::SetNextItemWidth(220);
+                            if (ImGui::SliderFloat("Frame", &t, 0.0f, duration, "%.3fs")) {
+                                // Scrub: pause and jump to the chosen time.
+                                data->animPlayer.setPlaybackSpeed(0.0f);
+                                data->animPlayer.setCurrentTime(t);
+                            }
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("/ %.2fs", duration);
+                        }
+                    }
+                }
 
-                        for (const auto& f : obj->getHEFaces()) {
-                            SceneObject::StoredHEFace newF = f;
-                            if (newF.halfEdgeIndex != UINT32_MAX) newF.halfEdgeIndex += heOffset;
-                            combinedHEFaces.push_back(newF);
+
+
+                    // --- Named clip library: assemble idle+walk+... on ONE model,
+                    //     then export a single multi-clip GLB for the game.
+                    if (m_ctx.selectedObject && m_objectAnims.count(m_ctx.selectedObject)) {
+                        ImGui::Separator();
+                        ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f), "Animation Clips (for the game)");
+                        ImGui::SetNextItemWidth(110);
+                        ImGui::InputText("##clipname", m_clipNameBuf, sizeof(m_clipNameBuf));
+                        ImGui::SameLine();
+                        if (ImGui::Button("Save Current Clip")) {
+                            auto& lib = m_namedClips[m_ctx.selectedObject];
+                            std::string nm = m_clipNameBuf[0] ? m_clipNameBuf : ("clip" + std::to_string(lib.size() + 1));
+                            bool replaced = false;
+                            for (auto& pr : lib) if (pr.first == nm) { pr.second = m_objectAnims[m_ctx.selectedObject]; replaced = true; break; }
+                            if (!replaced) lib.push_back({nm, m_objectAnims[m_ctx.selectedObject]});
+                            std::cout << "[Clips] saved '" << nm << "' (" << lib.size() << " total)\n";
                         }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Save the CURRENT (corrected) animation under this name.\n"
+                                              "Import idle -> correct -> Save 'idle'; import walk -> Save 'walk';\n"
+                                              "then Export Multi-Clip GLB. Re-saving a name overwrites it.");
+
+                        auto& lib = m_namedClips[m_ctx.selectedObject];
+                        for (size_t ci = 0; ci < lib.size(); ++ci) {
+                            ImGui::BulletText("%s", lib[ci].first.c_str());
+                            ImGui::SameLine(); ImGui::PushID(static_cast<int>(ci));
+                            if (ImGui::SmallButton("remove")) { lib.erase(lib.begin() + ci); ImGui::PopID(); break; }
+                            ImGui::PopID();
+                        }
+                        if (!lib.empty()) {
+                            if (ImGui::Button("Export Multi-Clip GLB")) exportMultiClipGLB();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Export the model with ALL saved clips as one GLB\n(e.g. idle+walk) for the game. Requires Set Bind Pose.");
+                        }
+                    }
+
+                    // pose2anim: load a video-derived bone animation onto this rig.
+                    sameLineIfButtonFits("Import Anim (JSON)");
+                    if (ImGui::Button("Import Anim (JSON)")) {
+                        nfdchar_t* outPath = nullptr;
+                        nfdfilteritem_t filters[2] = {{"LIME animation", "limeanim.json"}, {"JSON", "json"}};
+                        if (NFD_OpenDialog(&outPath, filters, 2, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
+                            importBoneAnimationJSON(outPath);
+                            NFD_FreePath(outPath);
+                        }
+                    }
+
+                    // Anim from Video: full pipeline — pick ANY video (Grok Imagine,
+                    // phone footage, ...), run local 3D mocap (GVHMR) + rotation
+                    // retarget in the background, auto-import onto this rig.
+                    if (m_vid2animRunning) {
+                        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
+                                           "Generating anim from video... (~1 min, GPU busy)");
                     } else {
-                        allHaveHEData = false;
+                        sameLineIfButtonFits("Anim from Video...");
+                        if (ImGui::Button("Anim from Video...")) {
+                            nfdchar_t* vPath = nullptr;
+                            nfdfilteritem_t vf[1] = {{"Video", "mp4,mov,webm,mkv,avi"}};
+                            if (NFD_OpenDialog(&vPath, vf, 1, nullptr) == NFD_OKAY) {
+                                m_vid2animVideoPath = vPath;
+                                NFD_FreePath(vPath);
+                                m_vid2animStartFrame = 0;
+                                m_vid2animEndFrame = 0;
+                                probeVideoInfo();  // fill total frames + fps
+                                m_vid2animShowPopup = true;
+                            }
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Generate an animation FROM a video clip:\n"
+                                              "local 3D mocap (GVHMR) + retarget onto this rig.\n"
+                                              "Prompt a clip in Grok Imagine, point this at it.");
+                        }
                     }
-                }
-
-                if (!combinedVerts.empty()) {
-                    // Create new combined object
-                    auto combinedObj = std::make_unique<SceneObject>("Combined");
-
-                    // Pass texture from the textured source object
-                    const unsigned char* texPtr = nullptr;
-                    int texW = 0, texH = 0;
-                    if (texturedSource && texturedSource->hasTextureData()) {
-                        texPtr = texturedSource->getTextureData().data();
-                        texW = texturedSource->getTextureWidth();
-                        texH = texturedSource->getTextureHeight();
+                    // Persistent status so a fast failure / a finished run doesn't vanish.
+                    if (!m_vid2animStatus.empty() && !m_vid2animRunning) {
+                        bool failed = m_vid2animStatus.rfind("FAILED", 0) == 0;
+                        ImGui::TextColored(failed ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
+                                                  : ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                                           "%s", m_vid2animStatus.c_str());
                     }
-                    uint32_t handle = m_ctx.modelRenderer.createModel(combinedVerts, combinedIndices, texPtr, texW, texH);
-                    combinedObj->setBufferHandle(handle);
-                    combinedObj->setIndexCount(static_cast<uint32_t>(combinedIndices.size()));
-                    combinedObj->setVertexCount(static_cast<uint32_t>(combinedVerts.size()));
-                    combinedObj->setMeshData(combinedVerts, combinedIndices);
+                    if (m_vid2animShowPopup) {
+                        ImGui::OpenPopup("Anim from Video");
+                        m_vid2animShowPopup = false;
+                    }
+                    if (ImGui::BeginPopupModal("Anim from Video", nullptr,
+                                               ImGuiWindowFlags_AlwaysAutoResize)) {
+                        ImGui::Text("Video: %s",
+                                    std::filesystem::path(m_vid2animVideoPath).filename().string().c_str());
+                        if (m_vid2animTotalFrames > 0)
+                            ImGui::Text("%d frames @ %.0f fps  (frame 0 .. %d)",
+                                        m_vid2animTotalFrames, m_vid2animFps,
+                                        m_vid2animTotalFrames - 1);
+                        ImGui::Separator();
 
-                    // Store combined half-edge data if all sources had it
-                    if (allHaveHEData && !combinedHEVerts.empty()) {
-                        combinedObj->setEditableMeshData(combinedHEVerts, combinedHE, combinedHEFaces);
+                        // Backend picker: GVHMR (SMPL, best quality, non-commercial
+                        // model) vs RTM (RTMPose3D, Apache-licensed local 3D).
+                        const char* vidBackends[] = { "GVHMR (SMPL)", "RTM (RTMPose3D)" };
+                        ImGui::SetNextItemWidth(180);
+                        ImGui::Combo("Backend", &m_vid2animBackend, vidBackends, 2);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("GVHMR: SMPL mocap, best quality (non-commercial model).\n"
+                                              "RTM: RTMPose3D 3D joints, Apache-licensed, body-only\n"
+                                              "(no fingers). Both retarget onto this rig by bone name.");
+                        if (m_vid2animBackend == 1)
+                            ImGui::TextDisabled("(RTM: whole clip only — no frame-range trim yet)");
+                        ImGui::Separator();
+                        ImGui::Checkbox("Use clip range (frames)", &m_vid2animUseRange);
+                        int maxF = (m_vid2animTotalFrames > 0) ? m_vid2animTotalFrames - 1 : 100000;
+                        if (m_vid2animUseRange) {
+                            ImGui::SetNextItemWidth(110);
+                            ImGui::InputInt("Start frame", &m_vid2animStartFrame);
+                            ImGui::SetNextItemWidth(110);
+                            ImGui::InputInt("End frame", &m_vid2animEndFrame);
+                            m_vid2animStartFrame = std::clamp(m_vid2animStartFrame, 0, maxF);
+                            m_vid2animEndFrame   = std::clamp(m_vid2animEndFrame, 0, maxF);
+                        } else {
+                            ImGui::TextDisabled("The whole video will be used.");
+                        }
+                        bool rangeOk = !m_vid2animUseRange ||
+                                       (m_vid2animEndFrame > m_vid2animStartFrame);
+                        if (!rangeOk)
+                            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "End frame must be after Start");
+                        if (ImGui::Button("Generate") && rangeOk) {
+                            launchVideoToAnim();
+                            ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Load a pose2anim *.limeanim.json (per-frame bone positions\nderived from a video) onto this rig. Bones matched by name.\nSet Bind Pose first to see it deform. Rung 1: positions only.");
                     }
 
-                    // Copy texture data to combined object so it persists
-                    if (texturedSource && texturedSource->hasTextureData()) {
-                        combinedObj->setTextureData(texturedSource->getTextureData(),
-                                                    texturedSource->getTextureWidth(),
-                                                    texturedSource->getTextureHeight());
+                    // ---- Pose Reference stepper --------------------------------
+                    // Point at a folder of meshes; each shows as a ghost to hand-pose
+                    // the skeleton against. Step through, Set Key on each, to build a
+                    // clip. (Meshes are display-only — excluded from selection/save.)
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Pose Reference (folder -> keys)");
+                    if (ImGui::Button("Load Pose References...")) {
+                        nfdchar_t* dir = nullptr;
+                        if (NFD_PickFolder(&dir, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
+                            loadPoseRefFolder(dir);
+                            NFD_FreePath(dir);
+                        }
                     }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Pick a folder of meshes (GLB). Each is shown as a ghost\n"
+                                          "silhouette to hand-pose the skeleton against; step through\n"
+                                          "and Set Key on each pose to build one animation clip.");
+                    if (!m_poseRefFiles.empty()) {
+                        ImGui::BeginDisabled(m_poseRefIndex <= 0);
+                        if (ImGui::Button("Prev##poseref")) showPoseRef(m_poseRefIndex - 1);
+                        ImGui::EndDisabled();
+                        ImGui::SameLine();
+                        ImGui::BeginDisabled(m_poseRefIndex >= static_cast<int>(m_poseRefFiles.size()) - 1);
+                        if (ImGui::Button("Next##poseref")) showPoseRef(m_poseRefIndex + 1);
+                        ImGui::EndDisabled();
+                        ImGui::SameLine();
+                        std::string rn = (m_poseRefIndex >= 0)
+                            ? std::filesystem::path(m_poseRefFiles[m_poseRefIndex]).filename().string()
+                            : std::string("(none)");
+                        ImGui::Text("Ref %d/%d: %s", m_poseRefIndex + 1,
+                                    static_cast<int>(m_poseRefFiles.size()), rn.c_str());
 
-                    // Queue all existing objects for deletion
-                    for (auto& obj : m_ctx.sceneObjects) {
-                        m_ctx.pendingDeletions.push_back(obj.get());
+                        // Registration controls appear when we're showing a reference
+                        // SKELETON (a .bones.json sidecar was found) rather than a mesh.
+                        if (!m_poseRefBoneHeads.empty()) {
+                            ImGui::Checkbox("Show ref skeleton", &m_showPoseRefSkeleton);
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Z-up", &m_poseRefZUp)) applyPoseRefTransform();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("UniRig armatures are Z-up; LIME is Y-up.\nLeave on unless the reference lies on its side.");
+                            ImGui::SetNextItemWidth(150);
+                            if (ImGui::SliderFloat("Ref scale", &m_poseRefScale, 0.05f, 10.0f, "%.2f",
+                                                   ImGuiSliderFlags_Logarithmic))
+                                applyPoseRefTransform();
+                            ImGui::SetNextItemWidth(220);
+                            if (ImGui::DragFloat3("Ref offset", &m_poseRefOffset.x, 0.01f))
+                                applyPoseRefTransform();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Nudge the magenta reference bones to line up with\nyour working skeleton, then pose to match.");
+
+                            // Conform: snap the working skeleton onto the reference.
+                            ImGui::Separator();
+                            if (ImGui::Button("Conform All to Ref")) {
+                                conformBonesToReference(true);
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Snap EVERY working bone to its nearest reference bone and\n"
+                                                  "orient it to match — adopts the whole reference pose in one\n"
+                                                  "click. Then fix hands/fingers per-bone below. (Register the\n"
+                                                  "overlay with scale/offset first so 'nearest' is meaningful.)");
+                            ImGui::SameLine();
+                            ImGui::BeginDisabled(m_selectedBone < 0);
+                            if (ImGui::Button("Conform Selected to Ref")) {
+                                conformBonesToReference(false);
+                            }
+                            ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                                ImGui::SetTooltip(m_selectedBone < 0
+                                    ? "Select a bone first (click it in the bone list or viewport)."
+                                    : "Snap ONLY the selected bone to its nearest reference bone.\n"
+                                      "Use to fix bones the bulk conform mismatched (esp. fingers).");
+                        }
+
+                        if (ImGui::Button("Clear Reference")) {
+                            if (m_ctx.clearPoseReferenceCallback) m_ctx.clearPoseReferenceCallback();
+                            m_poseRefFiles.clear();
+                            m_poseRefIndex = -1;
+                            m_poseRefBoneHeadsRaw.clear();
+                            m_poseRefBoneParents.clear();
+                            m_poseRefBoneHeads.clear();
+                        }
                     }
-
-                    // Clear selection
-                    m_ctx.selectedObject = nullptr;
-                    m_ctx.selectedObjects.clear();
-                    m_ctx.editableMesh.clear();
-                    m_ctx.meshDirty = false;
-
-                    // Add combined object
-                    m_ctx.sceneObjects.push_back(std::move(combinedObj));
-
-                    std::cout << "[Combine] Created combined mesh with " << combinedVerts.size()
-                              << " vertices, " << combinedIndices.size() / 3 << " triangles" << std::endl;
-                }
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Merge all objects into one combined mesh.\nTransforms are baked in, UVs preserved.");
-            }
-        }
-
-        ImGui::Spacing();
-
-        // Transform controls for selected object
-        if (m_ctx.selectedObject) {
-            ImGui::TextColored(ImVec4(1, 1, 0, 1), "Transform");
-            ImGui::Separator();
-
-            auto& transform = m_ctx.selectedObject->getTransform();
-            glm::vec3 pos = transform.getPosition();
-            glm::vec3 rot = glm::degrees(glm::eulerAngles(transform.getRotation()));
-            glm::vec3 scale = transform.getScale();
-
-            // Position - directly editable input fields
-            ImGui::Text("Position");
-            ImGui::PushItemWidth(-1);
-            if (ImGui::InputFloat3("##pos", &pos.x, "%.3f")) {
-                transform.setPosition(pos);
-            }
-            ImGui::PopItemWidth();
-
-            // Rotation - directly editable input fields
-            ImGui::Text("Rotation");
-            ImGui::PushItemWidth(-1);
-            if (ImGui::InputFloat3("##rot", &rot.x, "%.1f")) {
-                transform.setRotation(rot);
-            }
-            ImGui::PopItemWidth();
-
-            // Scale - directly editable input fields
-            ImGui::Text("Scale");
-            ImGui::PushItemWidth(-1);
-            if (ImGui::InputFloat3("##scale", &scale.x, "%.3f")) {
-                transform.setScale(scale);
-            }
-            ImGui::PopItemWidth();
-
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1), "Snap Settings");
-            ImGui::Separator();
-
-            ImGui::Checkbox("Enable Snap", &m_ctx.snapEnabled);
-
-            if (m_ctx.snapEnabled) {
-                ImGui::PushItemWidth(80);
-                ImGui::InputFloat("Move", &m_ctx.moveSnapIncrement, 0.0f, 0.0f, "%.2f");
-                if (m_ctx.moveSnapIncrement < 0.01f) m_ctx.moveSnapIncrement = 0.01f;
-
-                ImGui::InputFloat("Rotate", &m_ctx.rotateSnapIncrement, 0.0f, 0.0f, "%.0f");
-                if (m_ctx.rotateSnapIncrement < 1.0f) m_ctx.rotateSnapIncrement = 1.0f;
-                ImGui::PopItemWidth();
-
-                // Quick preset buttons for rotation
-                ImGui::SameLine();
-                if (ImGui::SmallButton("15")) m_ctx.rotateSnapIncrement = 15.0f;
-                ImGui::SameLine();
-                if (ImGui::SmallButton("45")) m_ctx.rotateSnapIncrement = 45.0f;
-                ImGui::SameLine();
-                if (ImGui::SmallButton("90")) m_ctx.rotateSnapIncrement = 90.0f;
-            }
         }
     }
     ImGui::End();

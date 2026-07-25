@@ -1821,29 +1821,7 @@ void ModelingMode::renderAnimationTimeline() {
         if (ImGui::Button("Delete Key")) deleteKeyOnSelectedNearTime();
         if (!haveObj) ImGui::EndDisabled();
 
-        // ── Cycle tools: hand-key locomotion without fighting mocap ──
-        if (!haveObj) ImGui::BeginDisabled();
-        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Cycle Tools");
-        // Foot-plant: keep planted feet from sliding while you pose the body.
-        ImGui::Checkbox("Lock Feet (IK)", &m_ikLockFeet);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Freeze the IK foot goals so moving the pelvis/body can't\n"
-                              "drag the planted feet. Turn off to step a foot forward.");
-        ImGui::SameLine();
-        if (ImGui::Button("Plant Feet Here")) plantFeetAtCurrent();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Re-lock each IK foot goal at its CURRENT position.");
-        if (ImGui::Button("Mirror Pose")) mirrorPoseAtCurrentTime();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Mirror the key at the playhead left<->right. Pose one stride,\n"
-                              "copy it to the opposite phase, then Mirror Pose there.");
-        ImGui::SameLine();
-        if (ImGui::Button("Close Loop")) makeLoopClosed();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Append the start pose one frame past the end so the clip\n"
-                              "loops seamlessly.");
-        if (!haveObj) ImGui::EndDisabled();
-
+        // Prev/next keyframe nav (Cycle Tools + Copy/Paste moved to Animation window).
         ImGui::SameLine();
         if (!haveKeys) ImGui::BeginDisabled();
         if (ImGui::Button("|<<")) jumpToPrevKey();
@@ -1851,16 +1829,7 @@ void ModelingMode::renderAnimationTimeline() {
         ImGui::SameLine();
         if (ImGui::Button(">>|")) jumpToNextKey();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to next keyframe");
-        ImGui::SameLine();
-        if (ImGui::Button("Copy")) copyKeyAtCurrentTime();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the key nearest the playhead (within 50 ms)");
         if (!haveKeys) ImGui::EndDisabled();
-
-        ImGui::SameLine();
-        if (!haveObj || !m_keyClipboard.valid) ImGui::BeginDisabled();
-        if (ImGui::Button("Paste")) pasteKeyAtCurrentTime();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Insert (or overwrite) a key at the playhead from the clipboard");
-        if (!haveObj || !m_keyClipboard.valid) ImGui::EndDisabled();
 
         ImGui::SameLine();
         if (haveObj) {
@@ -1886,10 +1855,6 @@ void ModelingMode::renderAnimationTimeline() {
         } else {
             ImGui::TextDisabled("(select an object to key)");
         }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset Layout")) {
-        m_layoutResetPending = true;
     }
 
     // Scrub bar.

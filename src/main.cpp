@@ -2174,6 +2174,10 @@ private:
                 ImGui::MenuItem("Camera", nullptr, &m_showCameraWindow);
                 ImGui::MenuItem("Image References", nullptr, &m_showImageRefWindow);
                 ImGui::MenuItem("Library", nullptr, &m_showLibraryWindow);
+                if (m_editorContext) {
+                    ImGui::MenuItem("Rigging", nullptr, &m_editorContext->showRiggingWindow);
+                    ImGui::MenuItem("Animation", nullptr, &m_editorContext->showAnimationWindow);
+                }
                 if (m_modelingMode) {
                     ImGui::Separator();
                     bool alwaysGizmo = m_modelingMode->getAlwaysShowGizmo();
