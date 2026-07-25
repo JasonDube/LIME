@@ -105,6 +105,16 @@ private:
     // "correction_bones" (retargeter tells us which anonymous bone is which).
     std::unordered_map<SceneObject*, std::unordered_map<std::string, int>> m_correctionBones;
 
+    // Live "Plant Feet" corrector — blends each foot toward its rest orientation on
+    // ALL axes, killing the constant roll/pitch twist that monocular mocap injects
+    // into feet (which a yaw-only fix can't see). 0 = as-generated, 1 = flat/planted.
+    float m_plantFeet = 0.0f;
+    std::unordered_map<SceneObject*, ObjectAnimTrack> m_feetPristine;
+
+    // Keyframe thinning: keep every Nth key, delete the rest (mocap is often way
+    // denser than a game clip needs).
+    int m_thinKeepEvery = 10;
+
     // Named-clip library: build idle+walk+... on one model (each a saved,
     // corrected track), then export them all as ONE multi-clip GLB for the game.
     std::unordered_map<SceneObject*, std::vector<std::pair<std::string, ObjectAnimTrack>>> m_namedClips;
@@ -686,6 +696,11 @@ private:
     // thigh subtrees rotated inward by `degrees` (world frontal plane). Non-
     // destructive; works on generated anims. Pass 0 to clear the correction.
     void applyStanceWidth(SceneObject* obj, float degrees);
+    // Feet: blend each foot bone's rotation toward its rest orientation (all axes)
+    // by amount 0..1, removing the constant mocap twist while keeping the motion.
+    void applyPlantFeet(SceneObject* obj, float amount);
+    // Keyframe thinning: keep every keepEvery-th key (+ the last), delete the rest.
+    void thinKeyframes(SceneObject* obj, int keepEvery);
     // Legs: constant LOCAL Y+Z euler floor per UpLeg bone (deg; X=0).
     std::vector<glm::vec3> detectAPoseSpread(const eden::Skeleton& skel,
                                              const eden::AnimationClip& clip);

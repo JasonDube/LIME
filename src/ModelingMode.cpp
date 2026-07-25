@@ -2189,6 +2189,39 @@ void ModelingMode::renderModelingEditorUI() {
                         ImGui::SetTooltip("Swings both legs inward at the hip to bring the feet\n"
                                           "closer together (past the A-pose rest). Works on\n"
                                           "generated animations too. Non-destructive.");
+
+                    // Plant Feet — kill the constant foot twist monocular mocap injects
+                    // (roll a yaw fix can't see). 0 = as-generated, 1 = flat/planted.
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Plant Feet");
+                    ImGui::SetNextItemWidth(180);
+                    float plant = m_plantFeet;
+                    if (ImGui::SliderFloat("Untwist Feet", &plant, 0.0f, 1.0f, "%.2f",
+                                           ImGuiSliderFlags_AlwaysClamp)) {
+                        applyPlantFeet(m_ctx.selectedObject, plant);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Blends each foot toward its rest orientation on ALL axes,\n"
+                                          "removing the constant roll/twist mocap wrings into feet.\n"
+                                          "1.0 = flat/planted (right for standing clips); real foot\n"
+                                          "motion is kept. Non-destructive.");
+
+                    // Thin Keyframes — keep every Nth key, delete the in-betweens.
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Thin Keyframes");
+                    {
+                        size_t nKeys = m_objectAnims[m_ctx.selectedObject].times.size();
+                        ImGui::TextDisabled("%zu keys", nKeys);
+                    }
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::InputInt("Keep every Nth", &m_thinKeepEvery);
+                    if (m_thinKeepEvery < 2) m_thinKeepEvery = 2;
+                    if (ImGui::Button("Thin Keyframes")) {
+                        thinKeyframes(m_ctx.selectedObject, m_thinKeepEvery);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Deletes every key EXCEPT every Nth (and the last one),\n"
+                                          "clearing all the keys in between. Destructive to the\n"
+                                          "loaded track — re-import the anim to get full density back.");
                 }
 
                 // A-Pose spread fix — only for imported skinned GLBs (Meshy/Mixamo)

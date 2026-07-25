@@ -255,6 +255,7 @@ void ModelingMode::importBoneAnimationJSON(const std::string& path) {
     m_timelineCurrentTime = 0.0f;
     m_timelineLastAppliedTime = -1.0f;  // force re-apply on next tick
     m_stancePristine.erase(obj); m_stanceWidth = 0.0f;  // fresh anim -> stance slider resets
+    m_feetPristine.erase(obj); m_plantFeet = 0.0f;       // and the plant-feet slider
 
     // Body-part -> rig-bone map from the retargeter, so correction sliders find
     // the right bones on any rig (esp. anonymous UniRig bone_N names).
@@ -736,6 +737,123 @@ void ModelingMode::applyStanceWidth(SceneObject* obj, float degrees) {
     reskinFromBoneDeltas();
 }
 
+// Blend each foot toward its rest orientation on ALL axes. Monocular mocap can't
+// see foot roll, so it injects a big CONSTANT twist that wrings the foot around the
+// ankle; a yaw-only fix is blind to it (roll doesn't change where the toe points).
+// We compute each foot bone's MEAN world-rotation over the clip (= the constant
+// bias) and remove `amount` of it, so at 1.0 the foot sits flat/planted with only
+// the real per-frame motion left. Non-destructive (re-layers from a pristine copy).
+void ModelingMode::applyPlantFeet(SceneObject* obj, float amount) {
+    auto ai = m_objectAnims.find(obj);
+    if (ai == m_objectAnims.end()) return;
+    if (!m_ctx.editableMesh.hasSkeleton()) return;
+    const Skeleton& skel = m_ctx.editableMesh.getSkeleton();
+    const size_t n = skel.bones.size();
+
+    if (!m_feetPristine.count(obj)) m_feetPristine[obj] = ai->second;
+    ObjectAnimTrack out = m_feetPristine[obj];   // copy, then correct the feet
+    m_plantFeet = amount;
+
+    // Foot bones: prefer the retargeter's role map (anonymous rigs), else match names.
+    std::vector<int> feet;
+    auto ci = m_correctionBones.find(obj);
+    if (ci != m_correctionBones.end()) {
+        for (const char* role : {"ankle_l", "ankle_r", "foot_l", "foot_r"}) {
+            auto r = ci->second.find(role);
+            if (r != ci->second.end() && r->second >= 0 && r->second < static_cast<int>(n))
+                feet.push_back(r->second);
+        }
+    }
+    if (feet.empty()) {
+        auto lc = [](const std::string& nm){ std::string s; for(char c:nm) s+=static_cast<char>(std::tolower((unsigned char)c)); return s; };
+        for (size_t b = 0; b < n; ++b) {
+            std::string s = lc(skel.bones[b].name);
+            if (s.find("ankle")!=std::string::npos || s.find("foot")!=std::string::npos)
+                feet.push_back(static_cast<int>(b));
+        }
+    }
+    std::cout << "[PlantFeet] " << amount << ", matched " << feet.size() << " foot bone(s):";
+    for (int f : feet) std::cout << " '" << skel.bones[f].name << "'";
+    std::cout << std::endl;
+
+    if (amount > 1e-4f && !feet.empty()) {
+        const size_t F = out.times.size();
+        for (int fb : feet) {
+            // Mean world-rotation delta over the clip = the constant bias to remove.
+            glm::quat ref(1, 0, 0, 0); bool haveRef = false;
+            glm::quat acc(0, 0, 0, 0);
+            for (size_t f = 0; f < F; ++f) {
+                if (f >= out.boneRotationsPerKey.size()) continue;
+                auto& rots = out.boneRotationsPerKey[f];
+                if (static_cast<int>(rots.size()) <= fb) continue;
+                glm::quat q = glm::normalize(rots[fb]);
+                if (!haveRef) { ref = q; haveRef = true; }
+                if (glm::dot(q, ref) < 0.0f) q = -q;         // align hemisphere (double cover)
+                acc.w += q.w; acc.x += q.x; acc.y += q.y; acc.z += q.z;
+            }
+            if (!haveRef) continue;
+            glm::quat mean = glm::normalize(acc);
+            // Partial de-bias: at amount=1 remove the whole mean → foot at rest.
+            glm::quat deBias = glm::slerp(glm::quat(1, 0, 0, 0), glm::inverse(mean), amount);
+            glm::mat3 C = glm::mat3_cast(deBias);
+            for (size_t f = 0; f < F; ++f) {
+                if (f >= out.bonePositionsPerKey.size() || f >= out.boneRotationsPerKey.size()) continue;
+                auto& heads = out.bonePositionsPerKey[f];
+                auto& rots  = out.boneRotationsPerKey[f];
+                if (static_cast<int>(heads.size()) <= fb || static_cast<int>(rots.size()) <= fb) continue;
+                glm::vec3 pivot = heads[fb];
+                for (size_t k = 0; k < n; ++k) {
+                    if (!isInSubtree(skel, static_cast<int>(k), fb)) continue;   // foot + toe
+                    heads[k] = pivot + C * (heads[k] - pivot);
+                    rots[k]  = glm::normalize(deBias * rots[k]);
+                }
+            }
+        }
+    }
+
+    m_objectAnims[obj] = std::move(out);
+    m_timelineLastAppliedTime = -1.0f;
+    reskinFromBoneDeltas();
+}
+
+// Keep every keepEvery-th keyframe (plus the final one so the clip keeps its full
+// length) and delete the rest — mocap comes in far denser than a game clip needs.
+// Destructive to the loaded track; re-import to get the full density back.
+void ModelingMode::thinKeyframes(SceneObject* obj, int keepEvery) {
+    if (keepEvery < 2) return;
+    auto ai = m_objectAnims.find(obj);
+    if (ai == m_objectAnims.end()) return;
+    ObjectAnimTrack& t = ai->second;
+    const size_t F = t.times.size();
+    if (F == 0) return;
+
+    std::vector<size_t> keep;
+    for (size_t i = 0; i < F; i += static_cast<size_t>(keepEvery)) keep.push_back(i);
+    if (keep.empty() || keep.back() != F - 1) keep.push_back(F - 1);   // always keep the end
+
+    ObjectAnimTrack out;
+    auto pick = [&](auto& dst, const auto& src) {
+        if (src.size() == F) for (size_t k : keep) dst.push_back(src[k]);
+    };
+    for (size_t k : keep) out.times.push_back(t.times[k]);
+    pick(out.positions, t.positions);
+    pick(out.rotations, t.rotations);
+    pick(out.scales,    t.scales);
+    pick(out.bonePositionsPerKey, t.bonePositionsPerKey);
+    pick(out.boneRotationsPerKey, t.boneRotationsPerKey);
+
+    std::cout << "[ThinKeys] kept " << out.times.size() << " of " << F
+              << " keys (every " << keepEvery << ")\n";
+
+    m_objectAnims[obj] = std::move(out);
+    // Base track changed → drop corrective pristines + reset sliders so they
+    // recapture from the thinned track.
+    m_stancePristine.erase(obj); m_feetPristine.erase(obj);
+    m_stanceWidth = 0.0f; m_plantFeet = 0.0f;
+    m_timelineLastAppliedTime = -1.0f;
+    reskinFromBoneDeltas();
+}
+
 void ModelingMode::importSkinnedGLBNative(const SkinnedLoadResult& skinned) {
     SceneObject* obj = m_ctx.selectedObject;
     if (!obj) { std::cout << "[SkinnedImport] No object selected\n"; return; }
@@ -832,6 +950,7 @@ void ModelingMode::importSkinnedGLBNative(const SkinnedLoadResult& skinned) {
     //    track at any strength later without re-importing.
     m_aposeNeutralize = 0.0f;
     m_stancePristine.erase(obj); m_stanceWidth = 0.0f;  // fresh anim -> stance slider resets
+    m_feetPristine.erase(obj); m_plantFeet = 0.0f;       // and the plant-feet slider
     if (!skinned.animations.empty()) {
         m_importedClipSource[obj] = { glbSkel, skinned.animations[0] };
         buildNativeTrackFromClip(obj, glbSkel, skinned.animations[0]);
