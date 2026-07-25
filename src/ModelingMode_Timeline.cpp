@@ -321,17 +321,24 @@ void ModelingMode::launchVideoToAnim() {
         return;
     }
 
+    // Backend: GVHMR (SMPL, best quality) or RTM (RTMPose3D, Apache-licensed 3D).
+    // Both scripts take <video> <rig.glb> <out.json> and write a LIMEANIM the rig
+    // plays by bone name; only GVHMR supports the frame-range trim for now.
+    const bool useRTM = (m_vid2animBackend == 1);
     const char* homeEnv = std::getenv("HOME");
-    std::string script = std::string(homeEnv ? homeEnv : "") + "/Desktop/pose2anim/clip2anim.sh";
+    std::string home = homeEnv ? homeEnv : "";
+    std::string script = home + (useRTM ? "/Desktop/pose2anim/clip2anim_rtm.sh"
+                                        : "/Desktop/pose2anim/clip2anim.sh");
     if (!std::filesystem::exists(script)) {
         std::cout << "[Vid2Anim] Pipeline script not found: " << script << "\n";
+        m_vid2animStatus = "FAILED: script not found: " + script;
         return;
     }
 
     std::filesystem::path vp(m_vid2animVideoPath);
     std::string outName = vp.stem().string();
     std::string rangeArgs;
-    if (m_vid2animUseRange) {
+    if (m_vid2animUseRange && !useRTM) {   // RTM script has no frame-range trim yet
         char buf[64];
         std::snprintf(buf, sizeof(buf), " %d %d", m_vid2animStartFrame, m_vid2animEndFrame);
         rangeArgs = buf;

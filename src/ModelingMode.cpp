@@ -2987,6 +2987,19 @@ void ModelingMode::renderModelingEditorUI() {
                                         m_vid2animTotalFrames, m_vid2animFps,
                                         m_vid2animTotalFrames - 1);
                         ImGui::Separator();
+
+                        // Backend picker: GVHMR (SMPL, best quality, non-commercial
+                        // model) vs RTM (RTMPose3D, Apache-licensed local 3D).
+                        const char* vidBackends[] = { "GVHMR (SMPL)", "RTM (RTMPose3D)" };
+                        ImGui::SetNextItemWidth(180);
+                        ImGui::Combo("Backend", &m_vid2animBackend, vidBackends, 2);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("GVHMR: SMPL mocap, best quality (non-commercial model).\n"
+                                              "RTM: RTMPose3D 3D joints, Apache-licensed, body-only\n"
+                                              "(no fingers). Both retarget onto this rig by bone name.");
+                        if (m_vid2animBackend == 1)
+                            ImGui::TextDisabled("(RTM: whole clip only — no frame-range trim yet)");
+                        ImGui::Separator();
                         ImGui::Checkbox("Use clip range (frames)", &m_vid2animUseRange);
                         int maxF = (m_vid2animTotalFrames > 0) ? m_vid2animTotalFrames - 1 : 100000;
                         if (m_vid2animUseRange) {

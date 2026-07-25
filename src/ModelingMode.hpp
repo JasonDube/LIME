@@ -180,6 +180,7 @@ private:
     int   m_vid2animEndFrame = 0;
     int   m_vid2animTotalFrames = 0;     // probed from the chosen video
     double m_vid2animFps = 0.0;
+    int   m_vid2animBackend = 0;         // 0 = GVHMR (SMPL), 1 = RTM (RTMPose3D, Apache)
 
     // "Auto-Rig (UniRig)": run local skeleton+skinning prediction on the selected
     // (unrigged) mesh in a background process, then reload the rigged result.
