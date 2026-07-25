@@ -30,6 +30,7 @@ struct LoadedMesh {
     std::string name;
     LoadedTexture texture;  // Base color texture if available
     bool hasTexture = false;
+    bool hasVertexColors = false;  // true if the GLB had a COLOR_0 attribute (keep those colors)
 
     // Half-edge data for preserving quad topology (optional, from EDEN exports)
     std::optional<StoredHEData> halfEdgeData;

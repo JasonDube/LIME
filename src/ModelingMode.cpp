@@ -5116,28 +5116,45 @@ void ModelingMode::renderModelingEditorUI() {
     clampWindowAboveTimeline("AI Generate (Hunyuan3D)##window");
     if (ImGui::Begin("AI Generate (Hunyuan3D)##window", &m_ctx.showAIGenerateWindow)) {
 
-        // -- Server control row --
-        bool serverOn = m_ctx.aiServerRunning;
-        if (ImGui::Checkbox("Server##hunyuan", &serverOn)) {
-            if (m_ctx.toggleServerCallback) {
-                m_ctx.toggleServerCallback(m_generateLowVRAM, false);
-            }
+        // -- Backend picker: pick the engine, then Start/Stop it right below --
+        const char* backends[] = { "Hunyuan3D (8081)", "TRELLIS.2 (8083)", "TripoSR (8084)" };
+        ImGui::SetNextItemWidth(200);
+        ImGui::Combo("Backend", &m_gen3dBackend, backends, IM_ARRAYSIZE(backends));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Which image-to-3D engine to use. Only one runs at a time\n"
+                              "(12GB VRAM) — starting one stops the other. Generate sends here.");
+
+        // Throttled reachability of the SELECTED backend (gates Generate + status).
+        m_gen3dPingTimer -= ImGui::GetIO().DeltaTime;
+        if (m_gen3dPingedBackend != m_gen3dBackend || m_gen3dPingTimer <= 0.0f) {
+            if (m_ctx.pingGen3dPort) m_gen3dReachable = m_ctx.pingGen3dPort(gen3dPort(m_gen3dBackend));
+            m_gen3dPingedBackend = m_gen3dBackend;
+            m_gen3dPingTimer = 1.5f;
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(serverOn ? "Click to stop Hunyuan3D server" : "Click to start Hunyuan3D server");
+
+        // -- Server control: Start/Stop the SELECTED backend, all from within LIME --
+        bool selRunning = m_ctx.aiServerRunning && m_ctx.aiServerBackend == m_gen3dBackend;
+        std::string startBtn = std::string(selRunning ? "Stop " : "Start ") + gen3dName(m_gen3dBackend);
+        if (ImGui::Button(startBtn.c_str(), ImVec2(150, 0))) {
+            if (m_ctx.toggleServerCallback) m_ctx.toggleServerCallback(m_generateLowVRAM, false);
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Launch/stop this backend's server (own conda env + port) from\n"
+                              "inside LIME. Switching backends stops the other first (VRAM).");
         ImGui::SameLine();
-        if (serverOn && m_ctx.aiServerReady) {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Ready");
-        } else if (serverOn) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Starting...");
-        } else {
-            ImGui::TextDisabled("Stopped");
-        }
-        ImGui::SameLine(0, 20);
-        ImGui::Checkbox("Low VRAM##srv", &m_generateLowVRAM);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Mini model + CPU offload for texture (recommended for 12GB).\nStop and restart server after changing.");
+        if (m_gen3dReachable)
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "up");
+        else if (selRunning)
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "starting...");
+        else if (m_ctx.aiServerRunning && m_ctx.aiServerBackend >= 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "(%s running)", gen3dName(m_ctx.aiServerBackend));
+        else
+            ImGui::TextDisabled("stopped");
+        if (m_gen3dBackend == 0) {   // Low VRAM applies to Hunyuan only
+            ImGui::SameLine(0, 20);
+            ImGui::Checkbox("Low VRAM", &m_generateLowVRAM);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Hunyuan mini model + CPU offload (12GB). Restart server after changing.");
         }
 
         ImGui::Separator();
@@ -5220,7 +5237,12 @@ void ModelingMode::renderModelingEditorUI() {
         }
 
         // -- Key settings (always visible) --
-        ImGui::SliderInt("Max Faces", &m_generateMaxFaces, 1000, 100000);
+        ImGui::SliderInt("Max Faces", &m_generateMaxFaces, 1000, 2000000, "%d",
+                         ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Face-count cap for the generated mesh (log scale; Ctrl+click to\n"
+                              "type an exact value). Up to 2,000,000 — high counts are slow and\n"
+                              "VRAM-heavy, and you'll want to retopo/decimate for the game anyway.");
 
         ImGui::Checkbox("Texture", &m_generateTexture);
         if (ImGui::IsItemHovered()) {
@@ -5256,7 +5278,8 @@ void ModelingMode::renderModelingEditorUI() {
         // -- Generate / Cancel --
         bool isGenerating = m_ctx.aiGenerating;
         bool hasImage = m_generateMultiView ? !m_generateFrontPath.empty() : !m_generateImagePath.empty();
-        bool canGenerate = m_ctx.aiServerReady && !isGenerating && hasImage;
+        // Gate on the SELECTED backend being reachable (not just Hunyuan's status).
+        bool canGenerate = m_gen3dReachable && !isGenerating && hasImage;
 
         if (!canGenerate) ImGui::BeginDisabled();
         if (ImGui::Button("Generate", ImVec2(ImGui::GetContentRegionAvail().x * 0.65f, 32))) {

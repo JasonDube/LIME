@@ -370,10 +370,12 @@ struct EditorContext {
     std::function<void(const std::string& prompt, const std::string& imagePath)> generateModelCallback;
     std::function<void()> cancelGenerationCallback;
     std::function<void(bool, bool)> toggleServerCallback;  // start/stop (lowVRAM, enableTex)
+    std::function<bool(int port)> pingGen3dPort;           // is a backend reachable on this port?
     bool& aiGenerating;
     std::string& aiGenerateStatus;
     bool& aiServerRunning;
     bool& aiServerReady;
+    int&  aiServerBackend;   // which gen3d backend is running (0/1/2), -1 = none
     std::vector<std::string>& aiLogLines;  // Server log output
     bool showAIGenerateWindow = false;
 

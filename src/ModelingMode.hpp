@@ -800,7 +800,13 @@ public:
     bool getAlwaysShowGizmo() const { return m_alwaysShowGizmo; }
     void setAlwaysShowGizmo(bool v) { m_alwaysShowGizmo = v; }
 
-    // AI Generate (Hunyuan3D) UI state — public so main.cpp can read params
+    // AI Generate UI state — public so main.cpp can read params
+    int m_gen3dBackend = 0;   // 0=Hunyuan3D(8081), 1=TRELLIS.2(8083), 2=TripoSR(8084)
+    bool  m_gen3dReachable = false;   // is the SELECTED backend's port responding?
+    float m_gen3dPingTimer = 0.0f;    // throttle the reachability ping
+    int   m_gen3dPingedBackend = -1;  // force an immediate re-ping when the pick changes
+    static int gen3dPort(int b)        { return b == 1 ? 8083 : b == 2 ? 8084 : 8081; }
+    static const char* gen3dName(int b){ return b == 1 ? "TRELLIS.2" : b == 2 ? "TripoSR" : "Hunyuan3D"; }
     char m_generatePrompt[512] = "";
     std::string m_generateImagePath;         // Single mode image
     bool m_generateMultiView = false;        // Multi-view mode

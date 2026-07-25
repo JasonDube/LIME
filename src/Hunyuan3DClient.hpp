@@ -17,6 +17,11 @@ public:
     Hunyuan3DClient(const std::string& host = "localhost", int port = 8081)
         : m_host(host), m_port(port) {}
 
+    // Re-point at a different backend. TRELLIS.2 (8083) and TripoSR (8084) speak the
+    // same /send + /status protocol as Hunyuan3D (8081), so the client is unchanged.
+    void setEndpoint(const std::string& host, int port) { m_host = host; m_port = port; }
+    int  port() const { return m_port; }
+
     /**
      * @brief Check if the Hunyuan server is reachable
      */

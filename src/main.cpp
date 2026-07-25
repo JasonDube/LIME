@@ -1571,10 +1571,15 @@ private:
             .toggleServerCallback = [this](bool lowVRAM, bool enableTex) {
                 toggleHunyuanServer(lowVRAM, enableTex);
             },
+            .pingGen3dPort = [](int port) {
+                Hunyuan3DClient probe("localhost", port);
+                return probe.isServerRunning();   // localhost-refused returns instantly
+            },
             .aiGenerating = m_aiGenerating,
             .aiGenerateStatus = m_aiGenerateStatus,
             .aiServerRunning = m_aiServerRunning,
             .aiServerReady = m_aiServerReady,
+            .aiServerBackend = m_aiServerBackend,
             .aiLogLines = m_aiLogLines,
             .onMetadataLoaded = [this](const std::unordered_map<std::string, std::string>& meta) {
                 m_widgetTypeIndex = 0;
@@ -3269,8 +3274,10 @@ private:
                 mesh.texture.width, mesh.texture.height
             );
 
-            // Apply default mesh color to vertices if no texture
-            if (!mesh.hasTexture) {
+            // Apply default mesh color ONLY when the mesh has neither a texture nor its
+            // own per-vertex colors. GLBs with a COLOR_0 attribute (photogrammetry, splat
+            // point clouds, TripoSR, etc.) keep their real colors — don't flatten them.
+            if (!mesh.hasTexture && !mesh.hasVertexColors) {
                 for (auto& v : mesh.vertices) {
                     v.color = m_defaultMeshColor;
                 }
@@ -3282,8 +3289,8 @@ private:
             obj->setModelPath(path);  // source GLB (used by Anim from Video to find the rig)
             obj->setMeshData(mesh.vertices, mesh.indices);
 
-            // Update GPU with recolored vertices
-            if (!mesh.hasTexture) {
+            // Update GPU with recolored vertices (only if we actually recolored them)
+            if (!mesh.hasTexture && !mesh.hasVertexColors) {
                 m_modelRenderer->updateModelBuffer(handle, mesh.vertices);
             }
 
@@ -3338,10 +3345,17 @@ private:
     void startAIGeneration(const std::string& prompt, const std::string& imagePath) {
         if (m_aiGenerating) return;
 
+        // Point the client at the selected backend (Hunyuan/TRELLIS/TripoSR) — all
+        // three speak the same protocol on different ports.
+        int backend = m_modelingMode ? m_modelingMode->m_gen3dBackend : 0;
+        int port = ModelingMode::gen3dPort(backend);
+        const char* bname = ModelingMode::gen3dName(backend);
+        m_hunyuanClient.setEndpoint("localhost", port);
+
         // Check server
         if (!m_hunyuanClient.isServerRunning()) {
-            m_aiGenerateStatus = "Server not running (localhost:8081)";
-            std::cerr << "[Hunyuan3D] Server not reachable" << std::endl;
+            m_aiGenerateStatus = std::string(bname) + " not running (localhost:" + std::to_string(port) + ")";
+            std::cerr << "[" << bname << "] Server not reachable on " << port << std::endl;
             return;
         }
 
@@ -3403,9 +3417,10 @@ private:
         m_aiLogIndex = 0;
         m_aiLogLines.clear();
 
-        // Launch background polling thread
-        m_aiGenerateThread = std::thread([this, uid]() {
-            Hunyuan3DClient client("localhost", 8081);
+        // Launch background polling thread — poll the SELECTED backend's port (not
+        // a hardcoded 8081), so log + status work for TRELLIS/TripoSR too.
+        m_aiGenerateThread = std::thread([this, uid, port]() {
+            Hunyuan3DClient client("localhost", port);
             while (!m_aiGenerateCancelled) {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 if (m_aiGenerateCancelled) break;
@@ -3464,27 +3479,34 @@ private:
         m_aiGenerateStatus = "Cancelled";
     }
 
+    // Toggle the SELECTED backend's server. Only one runs at a time (12GB), so
+    // starting a different backend stops the current one first.
     void toggleHunyuanServer(bool lowVRAM, bool enableTex) {
+        int sel = m_modelingMode ? m_modelingMode->m_gen3dBackend : 0;
         if (m_aiServerRunning) {
+            int running = m_aiServerBackend;
             stopHunyuanServer();
-        } else {
-            startHunyuanServer(lowVRAM, enableTex);
+            if (running == sel) return;        // clicked to stop the running backend → done
         }
+        startGen3dServer(sel, lowVRAM);         // start (or switch to) the selected backend
     }
 
-    void startHunyuanServer(bool lowVRAM, bool enableTex = false) {
+    void startGen3dServer(int backend, bool lowVRAM) {
         if (m_aiServerRunning) return;
+        int port = ModelingMode::gen3dPort(backend);
+        std::string name = ModelingMode::gen3dName(backend);
 
         // Kill any orphaned server still holding the port from a previous session
         {
-            FILE* fp = popen("lsof -ti :8081 2>/dev/null", "r");
+            std::string q = "lsof -ti :" + std::to_string(port) + " 2>/dev/null";
+            FILE* fp = popen(q.c_str(), "r");
             if (fp) {
                 char buf[64];
                 while (fgets(buf, sizeof(buf), fp)) {
                     pid_t orphan = atoi(buf);
                     if (orphan > 0) {
                         kill(orphan, SIGTERM);
-                        std::cout << "[Hunyuan3D] Killed orphaned process " << orphan << " on port 8081" << std::endl;
+                        std::cout << "[" << name << "] Killed orphaned process " << orphan << " on port " << port << std::endl;
                     }
                 }
                 pclose(fp);
@@ -3497,21 +3519,26 @@ private:
             // New process group so we can kill all children cleanly
             setpgid(0, 0);
 
-            // Child process — launch the server via bash
-            // Texture is loaded on-demand (freed between shape/tex steps)
-            // so --enable_tex is safe on 12GB — it just enables the capability
-            // --low_vram adds CPU offload for texture pipeline
-            std::string modelPath = lowVRAM ? "tencent/Hunyuan3D-2mini" : "tencent/Hunyuan3D-2";
-            std::string subfolder = lowVRAM ? "hunyuan3d-dit-v2-mini-turbo" : "hunyuan3d-dit-v2-0-turbo";
-            std::string cmd =
-                "cd ~/Desktop/hunyuan3d2/Hunyuan3D-2 && "
-                "source .venv/bin/activate && "
-                "python api_server.py"
-                " --model_path " + modelPath +
-                " --subfolder " + subfolder +
-                " --port 8081"
-                " --enable_tex" +
-                std::string(lowVRAM ? " --low_vram" : "");
+            // Build the launch command per backend. TRELLIS/TripoSR run their own
+            // scripts (conda env + port set inside); Hunyuan is built inline.
+            std::string cmd;
+            if (backend == 1) {
+                cmd = "bash \"$HOME/Desktop/LIME/launch_trellis.sh\"";
+            } else if (backend == 2) {
+                cmd = "bash \"$HOME/Desktop/LIME/launch_triposr.sh\"";
+            } else {
+                std::string modelPath = lowVRAM ? "tencent/Hunyuan3D-2mini" : "tencent/Hunyuan3D-2";
+                std::string subfolder = lowVRAM ? "hunyuan3d-dit-v2-mini-turbo" : "hunyuan3d-dit-v2-0-turbo";
+                cmd =
+                    "cd ~/Desktop/hunyuan3d2/Hunyuan3D-2 && "
+                    "source .venv/bin/activate && "
+                    "python api_server.py"
+                    " --model_path " + modelPath +
+                    " --subfolder " + subfolder +
+                    " --port 8081"
+                    " --enable_tex" +
+                    std::string(lowVRAM ? " --low_vram" : "");
+            }
 
             execl("/bin/bash", "bash", "-c", cmd.c_str(), nullptr);
             _exit(1);  // exec failed
@@ -3519,18 +3546,18 @@ private:
             // Also set pgid from parent side (race condition guard)
             setpgid(pid, pid);
             m_aiServerPID = pid;
+            m_aiServerBackend = backend;
             m_aiServerRunning = true;
             m_aiServerReady = false;
-            std::string modeDesc = std::string(lowVRAM ? "mini" : "full") + (enableTex ? " + texture" : "");
-            m_aiGenerateStatus = "Starting server (" + modeDesc + ")...";
-            std::cout << "[Hunyuan3D] Server process launched, PID=" << pid << " (" << modeDesc << ")" << std::endl;
+            m_aiGenerateStatus = "Starting " + name + " (may take a minute)...";
+            std::cout << "[" << name << "] Server process launched, PID=" << pid << " on port " << port << std::endl;
 
             // Launch background thread to poll until server is actually responding
             if (m_aiServerStartupThread.joinable()) {
                 m_aiServerStartupThread.join();
             }
-            m_aiServerStartupThread = std::thread([this]() {
-                Hunyuan3DClient probe("localhost", 8081);
+            m_aiServerStartupThread = std::thread([this, port, name]() {
+                Hunyuan3DClient probe("localhost", port);
                 for (int attempt = 0; attempt < 120; ++attempt) {  // Up to ~4 minutes
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                     if (!m_aiServerRunning) return;  // Server was stopped
@@ -3542,24 +3569,24 @@ private:
                         m_aiServerRunning = false;
                         m_aiServerReady = false;
                         m_aiServerPID = -1;
-                        m_aiGenerateStatus = "Server process exited unexpectedly";
-                        std::cerr << "[Hunyuan3D] Server process no longer exists" << std::endl;
+                        m_aiGenerateStatus = name + " process exited unexpectedly";
+                        std::cerr << "[" << name << "] Server process no longer exists" << std::endl;
                         return;
                     }
 
                     if (probe.isServerRunning()) {
                         m_aiServerReady = true;
-                        m_aiGenerateStatus = "Server ready";
-                        std::cout << "[Hunyuan3D] Server is ready (took ~" << (attempt + 1) * 2 << "s)" << std::endl;
+                        m_aiGenerateStatus = name + " ready";
+                        std::cout << "[" << name << "] Server is ready (took ~" << (attempt + 1) * 2 << "s)" << std::endl;
                         return;
                     }
 
                     // Update status with elapsed time
-                    m_aiGenerateStatus = "Starting server... (" + std::to_string((attempt + 1) * 2) + "s)";
+                    m_aiGenerateStatus = "Starting " + name + "... (" + std::to_string((attempt + 1) * 2) + "s)";
                 }
                 // Timed out
-                m_aiGenerateStatus = "Server startup timed out";
-                std::cerr << "[Hunyuan3D] Server did not respond after 4 minutes" << std::endl;
+                m_aiGenerateStatus = name + " startup timed out";
+                std::cerr << "[" << name << "] Server did not respond after 4 minutes" << std::endl;
             });
         } else {
             m_aiGenerateStatus = "Failed to start server (fork error)";
@@ -3608,8 +3635,9 @@ private:
             waitpid(pid, &status, 0);  // Blocking wait to reap
         }
 
+        m_aiServerBackend = -1;
         m_aiGenerateStatus = "Server stopped";
-        std::cout << "[Hunyuan3D] Server stopped" << std::endl;
+        std::cout << "[Gen3D] Server stopped" << std::endl;
     }
 
     void createTestCube() {
@@ -4843,6 +4871,7 @@ private:
 
     // Hunyuan3D server process management
     bool m_aiServerRunning = false;       // Process launched (checkbox state)
+    int  m_aiServerBackend = -1;          // which gen3d backend is running (0/1/2), -1 = none
     bool m_aiServerReady = false;         // Server actually responding to HTTP
     pid_t m_aiServerPID = -1;
     std::thread m_aiServerStartupThread;

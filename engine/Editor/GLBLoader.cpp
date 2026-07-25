@@ -215,6 +215,7 @@ LoadResult GLBLoader::load(const std::string& filepath) {
             const uint8_t* colorData = nullptr;
             size_t colorStride = 0;
             int colorComponents = 0;
+            int colorCompType = TINYGLTF_COMPONENT_TYPE_FLOAT;
             auto colorIt = primitive.attributes.find("COLOR_0");
             if (colorIt != primitive.attributes.end()) {
                 const auto& colorAccessor = model.accessors[colorIt->second];
@@ -222,7 +223,15 @@ LoadResult GLBLoader::load(const std::string& filepath) {
                 const auto& colorBuffer = model.buffers[colorBufferView.buffer];
                 colorData = colorBuffer.data.data() + colorBufferView.byteOffset + colorAccessor.byteOffset;
                 colorComponents = (colorAccessor.type == TINYGLTF_TYPE_VEC3) ? 3 : 4;
-                colorStride = colorBufferView.byteStride ? colorBufferView.byteStride : sizeof(float) * colorComponents;
+                colorCompType = colorAccessor.componentType;
+                loadedMesh.hasVertexColors = true;   // keep these; don't overwrite with a flat default
+                // COLOR_0 is commonly stored as normalized uint8 (5121) or uint16 (5123),
+                // NOT float. Use the real component size for the default stride — assuming
+                // float over-reads the buffer (garbage colors on small meshes; segfault on
+                // large vertex-colored meshes, e.g. photogrammetry / splat point clouds).
+                size_t compSize = (colorCompType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)  ? 1 :
+                                  (colorCompType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) ? 2 : 4;
+                colorStride = colorBufferView.byteStride ? colorBufferView.byteStride : compSize * colorComponents;
             }
 
             // Build vertices using ModelVertex
@@ -256,12 +265,22 @@ LoadResult GLBLoader::load(const std::string& filepath) {
                     vertex.texCoord = glm::vec2(0);
                 }
 
-                // Color (with proper stride)
+                // Color — decode per the accessor's actual component type (float, or
+                // normalized uint8 / uint16). Previously always read as float, which used
+                // the wrong stride and misread uint8 colors (the common case from trimesh /
+                // Blender / most tools) — showed as garbage/untextured, or crashed on big meshes.
                 if (colorData) {
-                    const float* col = reinterpret_cast<const float*>(colorData + i * colorStride);
+                    const uint8_t* c = colorData + i * colorStride;
+                    auto readChan = [&](int k) -> float {
+                        if (colorCompType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
+                            return c[k] / 255.0f;
+                        if (colorCompType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+                            return reinterpret_cast<const uint16_t*>(c)[k] / 65535.0f;
+                        return reinterpret_cast<const float*>(c)[k];  // FLOAT
+                    };
                     vertex.color = glm::vec4(
-                        col[0], col[1], col[2],
-                        colorComponents > 3 ? col[3] : 1.0f
+                        readChan(0), readChan(1), readChan(2),
+                        colorComponents > 3 ? readChan(3) : 1.0f
                     );
                 } else {
                     vertex.color = glm::vec4(1.0f);  // Default white
