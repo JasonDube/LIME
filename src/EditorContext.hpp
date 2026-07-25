@@ -377,6 +377,10 @@ struct EditorContext {
     bool& aiServerReady;
     int&  aiServerBackend;   // which gen3d backend is running (0/1/2), -1 = none
     std::vector<std::string>& aiLogLines;  // Server log output
+    // Batch: generate a mesh from every image in a folder (in filename order),
+    // writing the .glb results into a sibling "<folder>_meshes" directory.
+    std::function<void(const std::string& framesDir)> batchGenerateCallback;
+    bool& batchActive;                     // a folder batch is currently running
     bool showAIGenerateWindow = false;
 
     // Callback to update widget properties UI when a .lime is loaded

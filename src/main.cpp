@@ -1210,7 +1210,11 @@ protected:
                 m_aiGenerateThread.join();
             }
             m_aiGenerating = false;
-            if (!m_aiGeneratedGLBPath.empty()) {
+            if (m_batchActive) {
+                // Batch: file the result under the frame's name, don't load into the
+                // scene (dozens of meshes would pile up), then start the next frame.
+                finishBatchFrame(!m_aiGeneratedGLBPath.empty());
+            } else if (!m_aiGeneratedGLBPath.empty()) {
                 std::cout << "[Hunyuan3D] Loading generated model: " << m_aiGeneratedGLBPath << std::endl;
                 loadModel(m_aiGeneratedGLBPath);
                 std::cout << "[Hunyuan3D] Model loaded, framing..." << std::endl;
@@ -1222,6 +1226,14 @@ protected:
                 m_aiGenerateStatus = "Model loaded!";
                 std::cout << "[Hunyuan3D] Auto-loaded generated model" << std::endl;
             }
+        }
+
+        // Batch failure/stall: a frame's job ended without a completed model (server
+        // error, unreachable, or bad image). Record it and move to the next frame so
+        // one bad frame doesn't stall the whole run.
+        if (m_batchActive && m_batchAwaiting && !m_aiGenerating && !m_aiGenerateComplete) {
+            if (m_aiGenerateThread.joinable()) m_aiGenerateThread.join();
+            finishBatchFrame(false);
         }
 
         // Initialize ImGui frame BEFORE input processing so IsWindowHovered() uses current state
@@ -1581,6 +1593,10 @@ private:
             .aiServerReady = m_aiServerReady,
             .aiServerBackend = m_aiServerBackend,
             .aiLogLines = m_aiLogLines,
+            .batchGenerateCallback = [this](const std::string& framesDir) {
+                startBatchGeneration(framesDir);
+            },
+            .batchActive = m_batchActive,
             .onMetadataLoaded = [this](const std::unordered_map<std::string, std::string>& meta) {
                 m_widgetTypeIndex = 0;
                 memset(m_widgetParamName, 0, sizeof(m_widgetParamName));
@@ -3470,13 +3486,121 @@ private:
     }
 
     void cancelAIGeneration() {
-        if (!m_aiGenerating) return;
-        m_aiGenerateCancelled = true;
-        if (m_aiGenerateThread.joinable()) {
-            m_aiGenerateThread.join();
+        // Cancelling during a batch stops the whole run, not just the current frame.
+        bool wasBatch = m_batchActive;
+        m_batchActive = false;
+        m_batchAwaiting = false;
+        if (m_aiGenerating) {
+            m_aiGenerateCancelled = true;
+            if (m_aiGenerateThread.joinable()) {
+                m_aiGenerateThread.join();
+            }
+            m_aiGenerating = false;
         }
-        m_aiGenerating = false;
-        m_aiGenerateStatus = "Cancelled";
+        m_aiGenerateStatus = wasBatch
+            ? "Batch cancelled (" + std::to_string(m_batchOkCount) + " done, "
+                + std::to_string(m_batchIndex) + "/" + std::to_string(m_batchFrames.size()) + " reached)"
+            : "Cancelled";
+    }
+
+    // ---- Batch: generate a mesh for every image in a folder ----------------
+    // Enumerates images in `framesDir` (filename order), creates a sibling
+    // "<framesDir>_meshes" folder, and kicks off the first frame. Subsequent
+    // frames are driven from update() as each job finishes (VRAM fits one job).
+    void startBatchGeneration(const std::string& framesDir) {
+        if (m_aiGenerating || m_batchActive) return;
+
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (framesDir.empty() || !fs::is_directory(framesDir, ec)) {
+            m_aiGenerateStatus = "Batch: not a folder";
+            return;
+        }
+
+        // Collect image files, sorted by filename so frame_00001, frame_00002, ...
+        // are processed in order.
+        m_batchFrames.clear();
+        for (const auto& e : fs::directory_iterator(framesDir, ec)) {
+            if (!e.is_regular_file()) continue;
+            std::string ext = e.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp")
+                m_batchFrames.push_back(e.path().string());
+        }
+        std::sort(m_batchFrames.begin(), m_batchFrames.end());
+        if (m_batchFrames.empty()) {
+            m_aiGenerateStatus = "Batch: no images in folder";
+            return;
+        }
+
+        // Sibling folder next to the frames folder: /x/dialogue_frames -> /x/dialogue_frames_meshes
+        fs::path dir(framesDir);
+        if (dir.filename().empty()) dir = dir.parent_path();   // trailing-slash case
+        m_batchOutDir = (dir.parent_path() / (dir.filename().string() + "_meshes")).string();
+        fs::create_directories(m_batchOutDir, ec);
+        if (ec) {
+            m_aiGenerateStatus = "Batch: cannot create " + m_batchOutDir;
+            return;
+        }
+
+        // Reuse the prompt currently typed in the AI Generate window (may be empty).
+        m_batchPrompt = m_modelingMode ? std::string(m_modelingMode->m_generatePrompt) : std::string();
+
+        m_batchActive = true;
+        m_batchIndex = 0;
+        m_batchOkCount = 0;
+        m_batchFailCount = 0;
+        std::cout << "[Batch] " << m_batchFrames.size() << " frame(s) -> " << m_batchOutDir << std::endl;
+        launchBatchFrame();
+    }
+
+    void launchBatchFrame() {
+        if (!m_batchActive || m_batchIndex >= m_batchFrames.size()) return;
+        const std::string& img = m_batchFrames[m_batchIndex];
+        std::string name = std::filesystem::path(img).filename().string();
+        m_aiGenerateStatus = "Batch " + std::to_string(m_batchIndex + 1) + "/"
+                           + std::to_string(m_batchFrames.size()) + ": " + name;
+        m_batchAwaiting = true;
+        startAIGeneration(m_batchPrompt, img);
+        // If the job never launched (server down / read fail), m_aiGenerating stays
+        // false; update()'s batch-failure path will record it and move on.
+    }
+
+    // Move the just-finished GLB into the batch folder under the frame's name,
+    // then advance to the next frame (or finish the batch).
+    void finishBatchFrame(bool ok) {
+        namespace fs = std::filesystem;
+        if (m_batchIndex < m_batchFrames.size()) {
+            std::string stem = fs::path(m_batchFrames[m_batchIndex]).stem().string();
+            if (ok && !m_aiGeneratedGLBPath.empty()) {
+                std::string dest = (fs::path(m_batchOutDir) / (stem + ".glb")).string();
+                std::error_code ec;
+                fs::rename(m_aiGeneratedGLBPath, dest, ec);
+                if (ec) {  // rename can fail across filesystems; fall back to copy
+                    fs::copy_file(m_aiGeneratedGLBPath, dest,
+                                  fs::copy_options::overwrite_existing, ec);
+                }
+                if (ec) { m_batchFailCount++; std::cerr << "[Batch] save failed: " << ec.message() << std::endl; }
+                else    { m_batchOkCount++;   std::cout << "[Batch] saved " << dest << std::endl; }
+            } else {
+                m_batchFailCount++;
+                std::cerr << "[Batch] frame failed: " << m_batchFrames[m_batchIndex] << std::endl;
+            }
+        }
+        m_aiGeneratedGLBPath.clear();
+        m_batchAwaiting = false;
+        m_batchIndex++;
+
+        if (m_batchIndex >= m_batchFrames.size()) {
+            m_batchActive = false;
+            m_aiGenerateStatus = "Batch done: " + std::to_string(m_batchOkCount) + " ok, "
+                               + std::to_string(m_batchFailCount) + " failed -> "
+                               + fs::path(m_batchOutDir).filename().string() + "/";
+            std::cout << "[Batch] complete." << std::endl;
+        } else {
+            launchBatchFrame();
+        }
     }
 
     // Toggle the SELECTED backend's server. Only one runs at a time (12GB), so
@@ -4868,6 +4992,18 @@ private:
     std::atomic<bool> m_aiGenerateComplete{false};
     std::atomic<bool> m_aiGenerateCancelled{false};
     std::string m_aiGeneratedGLBPath;
+
+    // Batch generation: one mesh per image in a chosen folder, in filename order.
+    // Frames are processed sequentially (only one job fits in VRAM); each result
+    // is moved into a sibling "<folder>_meshes" dir, named after its source frame.
+    bool m_batchActive = false;
+    bool m_batchAwaiting = false;               // a frame's job is in flight
+    std::vector<std::string> m_batchFrames;     // source images, sorted
+    size_t m_batchIndex = 0;
+    std::string m_batchOutDir;                  // sibling mesh folder
+    std::string m_batchPrompt;                  // prompt reused for every frame
+    int m_batchOkCount = 0;
+    int m_batchFailCount = 0;
 
     // Hunyuan3D server process management
     bool m_aiServerRunning = false;       // Process launched (checkbox state)

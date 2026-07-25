@@ -5313,6 +5313,32 @@ void ModelingMode::renderModelingEditorUI() {
             ImGui::TextColored(statusColor, "%s", m_ctx.aiGenerateStatus.c_str());
         }
 
+        // -- Batch: one mesh per image in a folder (e.g. Tearsheet's *_frames) --
+        ImGui::Separator();
+        if (m_ctx.batchActive) {
+            if (ImGui::Button("Cancel Batch", ImVec2(-1, 28))) {
+                if (m_ctx.cancelGenerationCallback) m_ctx.cancelGenerationCallback();
+            }
+        } else {
+            bool canBatch = m_gen3dReachable && !isGenerating;
+            if (!canBatch) ImGui::BeginDisabled();
+            if (ImGui::Button("Batch from Folder...", ImVec2(-1, 28))) {
+                nfdchar_t* outPath = nullptr;
+                if (NFD_PickFolder(&outPath, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
+                    std::string folder = outPath;
+                    NFD_FreePath(outPath);
+                    if (m_ctx.batchGenerateCallback) m_ctx.batchGenerateCallback(folder);
+                }
+            }
+            if (!canBatch) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Pick a folder of frames (e.g. Tearsheet's <clip>_frames).\n"
+                                  "Generates one mesh per image, in filename order, using the\n"
+                                  "settings above. Results go to a sibling \"<folder>_meshes\"\n"
+                                  "folder, each named after its source frame.\n"
+                                  "(Start the backend server first.)");
+        }
+
         ImGui::Separator();
 
         // -- Server Output Log --
