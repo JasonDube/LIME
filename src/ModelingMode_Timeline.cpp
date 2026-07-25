@@ -390,6 +390,7 @@ void ModelingMode::launchAutoRig() {
 
     m_autoRigOut = out;
     m_autoRigSourceName = m_ctx.selectedObject ? m_ctx.selectedObject->getName() : "";
+    m_autoRigSourceObj  = m_ctx.selectedObject;   // exact object to remove on success
     m_autoRigRunning = true;
     m_autoRigDone = false;
     m_autoRigOk = false;
@@ -401,6 +402,296 @@ void ModelingMode::launchAutoRig() {
         m_autoRigOk = (rc == 0) && std::filesystem::exists(out);
         m_autoRigDone = true;
     }).detach();
+}
+
+// Pose Reference stepper: point at a folder of meshes and show them one at a
+// time as a display-only ghost to hand-pose the skeleton against.
+void ModelingMode::loadPoseRefFolder(const std::string& dir) {
+    m_poseRefFiles.clear();
+    m_poseRefIndex = -1;
+    std::error_code ec;
+    if (dir.empty() || !std::filesystem::is_directory(dir, ec)) {
+        std::cout << "[PoseRef] Not a folder: " << dir << "\n";
+        return;
+    }
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (!e.is_regular_file()) continue;
+        std::string ext = e.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+        if (ext == ".glb" || ext == ".gltf")
+            m_poseRefFiles.push_back(e.path().string());
+    }
+    std::sort(m_poseRefFiles.begin(), m_poseRefFiles.end());  // filename order
+    if (m_poseRefFiles.empty()) {
+        std::cout << "[PoseRef] No .glb meshes in " << dir << "\n";
+        return;
+    }
+    std::cout << "[PoseRef] " << m_poseRefFiles.size() << " reference mesh(es) loaded\n";
+    showPoseRef(0);
+}
+
+void ModelingMode::showPoseRef(int idx) {
+    if (m_poseRefFiles.empty()) return;
+    idx = std::clamp(idx, 0, static_cast<int>(m_poseRefFiles.size()) - 1);
+    m_poseRefIndex = idx;
+
+    // Prefer the skeleton overlay: if this mesh has a UniRig ".bones.json" sidecar
+    // (mesh2skel.sh output), draw its bones as the reference and show NO mesh ghost
+    // (bones are the clearer target). Otherwise fall back to the mesh silhouette.
+    std::filesystem::path glb(m_poseRefFiles[idx]);
+    std::filesystem::path sidecar = glb.parent_path() / (glb.stem().string() + ".bones.json");
+    if (std::filesystem::exists(sidecar) && loadPoseRefBones(sidecar.string())) {
+        if (m_ctx.clearPoseReferenceCallback) m_ctx.clearPoseReferenceCallback();  // no mesh ghost
+    } else {
+        m_poseRefBoneHeadsRaw.clear();
+        m_poseRefBoneParents.clear();
+        m_poseRefBoneHeads.clear();
+        if (m_ctx.loadPoseReferenceCallback)
+            m_ctx.loadPoseReferenceCallback(m_poseRefFiles[idx]);
+    }
+}
+
+// Parse a mesh2skel ".bones.json" sidecar into reference bone heads + parent
+// links, then transform them for display. Returns false if it isn't a bones file.
+bool ModelingMode::loadPoseRefBones(const std::string& jsonPath) {
+    std::ifstream f(jsonPath);
+    if (!f.is_open()) return false;
+    nlohmann::json j;
+    try { f >> j; } catch (const std::exception&) { return false; }
+    if (!j.contains("armatures")) return false;
+
+    m_poseRefBoneHeadsRaw.clear();
+    m_poseRefBoneParents.clear();
+    std::vector<std::string> names, parentNames;
+    for (const auto& arm : j["armatures"]) {
+        if (!arm.contains("bones")) continue;
+        for (const auto& b : arm["bones"]) {
+            const auto& h = b["head"];
+            m_poseRefBoneHeadsRaw.emplace_back(h[0].get<float>(), h[1].get<float>(), h[2].get<float>());
+            names.push_back(b.value("name", std::string()));
+            parentNames.push_back((b.contains("parent") && !b["parent"].is_null())
+                                  ? b["parent"].get<std::string>() : std::string());
+        }
+    }
+    if (m_poseRefBoneHeadsRaw.empty()) return false;
+
+    std::unordered_map<std::string, int> nameToIdx;
+    for (size_t i = 0; i < names.size(); ++i) nameToIdx[names[i]] = static_cast<int>(i);
+    m_poseRefBoneParents.assign(names.size(), -1);
+    for (size_t i = 0; i < parentNames.size(); ++i) {
+        if (parentNames[i].empty()) continue;
+        auto it = nameToIdx.find(parentNames[i]);
+        if (it != nameToIdx.end()) m_poseRefBoneParents[i] = it->second;
+    }
+    applyPoseRefTransform();
+    return true;
+}
+
+// Raw armature-space heads -> display heads: optional Z-up->Y-up flip (UniRig
+// armatures are Z-up; LIME meshes are Y-up), then uniform scale + world offset
+// so the user can register the overlay onto the working skeleton.
+void ModelingMode::applyPoseRefTransform() {
+    m_poseRefBoneHeads.resize(m_poseRefBoneHeadsRaw.size());
+    for (size_t i = 0; i < m_poseRefBoneHeadsRaw.size(); ++i) {
+        glm::vec3 p = m_poseRefBoneHeadsRaw[i];
+        if (m_poseRefZUp) p = glm::vec3(p.x, p.z, -p.y);   // Blender Z-up -> glTF Y-up
+        m_poseRefBoneHeads[i] = p * m_poseRefScale + m_poseRefOffset;
+    }
+}
+
+// Skeleton Only: run mesh2skel.sh (UniRig skeleton stage, no skinning) on the
+// selected mesh in a detached worker. Completion is polled in update(), which
+// installs the predicted bones as the editable skeleton (unbound).
+void ModelingMode::launchAutoSkeleton() {
+    if (m_autoSkelRunning || m_autoRigRunning || m_vid2animRunning) return;
+
+    std::string mesh;
+    if (m_ctx.selectedObject && !m_ctx.selectedObject->getModelPath().empty())
+        mesh = m_ctx.selectedObject->getModelPath();
+    else
+        mesh = m_ctx.currentFilePath;
+    if (mesh.empty()) {
+        m_autoSkelStatus = "FAILED: no source mesh file known (open the model first)";
+        return;
+    }
+
+    const char* homeEnv = std::getenv("HOME");
+    std::string script = std::string(homeEnv ? homeEnv : "") + "/Desktop/pose2anim/mesh2skel.sh";
+    if (!std::filesystem::exists(script)) {
+        m_autoSkelStatus = "FAILED: pipeline script not found: " + script;
+        return;
+    }
+
+    std::filesystem::path mp(mesh);
+    std::string outGlb   = (mp.parent_path() / (mp.stem().string() + "_skeleton.glb")).string();
+    std::string bonesJson= (mp.parent_path() / (mp.stem().string() + "_skeleton.bones.json")).string();
+    std::string cmd = "'" + script + "' '" + mesh + "' '" + outGlb + "' > /tmp/mesh2skel_lime.log 2>&1";
+
+    m_autoSkelBonesJson = bonesJson;
+    m_autoSkelTargetObj = m_ctx.selectedObject;
+    m_autoSkelRunning = true;
+    m_autoSkelDone = false;
+    m_autoSkelOk = false;
+    m_autoSkelStatus = "Predicting skeleton for " + mp.filename().string() + "...";
+    std::cout << "[AutoSkel] Running: " << cmd << "\n";
+
+    std::thread([this, cmd, bonesJson]() {
+        int rc = std::system(cmd.c_str());
+        m_autoSkelOk = (rc == 0) && std::filesystem::exists(bonesJson);
+        m_autoSkelDone = true;
+    }).detach();
+}
+
+// Install a mesh2skel ".bones.json" as the EDITABLE skeleton on the target
+// object: Z-up->Y-up, auto-fit to the mesh's local bounds (match height +
+// center), and NO skinning/binding. The mesh is untouched — hide/delete it and
+// bind later with Set Bind Pose + Auto Weights.
+void ModelingMode::installSkeletonFromBonesJson(const std::string& jsonPath) {
+    SceneObject* obj = m_autoSkelTargetObj ? m_autoSkelTargetObj : m_ctx.selectedObject;
+    if (!obj) { std::cout << "[AutoSkel] no target object\n"; return; }
+    if (m_ctx.selectedObject != obj) { m_ctx.selectedObject = obj; buildEditableMeshFromObject(); }
+    if (!m_ctx.editableMesh.isValid()) { std::cout << "[AutoSkel] target has no editable mesh\n"; return; }
+
+    std::ifstream f(jsonPath);
+    if (!f.is_open()) { std::cout << "[AutoSkel] cannot open " << jsonPath << "\n"; return; }
+    nlohmann::json j;
+    try { f >> j; } catch (const std::exception&) { std::cout << "[AutoSkel] bad json\n"; return; }
+    if (!j.contains("armatures")) return;
+
+    std::vector<glm::vec3>   heads;
+    std::vector<std::string> names, parentNames;
+    for (const auto& arm : j["armatures"]) {
+        if (!arm.contains("bones")) continue;
+        for (const auto& b : arm["bones"]) {
+            const auto& h = b["head"];
+            glm::vec3 p(h[0].get<float>(), h[1].get<float>(), h[2].get<float>());
+            p = glm::vec3(p.x, p.z, -p.y);          // UniRig Z-up -> LIME Y-up
+            heads.push_back(p);
+            names.push_back(b.value("name", std::string()));
+            parentNames.push_back((b.contains("parent") && !b["parent"].is_null())
+                                  ? b["parent"].get<std::string>() : std::string());
+        }
+    }
+    if (heads.empty()) { std::cout << "[AutoSkel] no bones in json\n"; return; }
+
+    // Auto-fit to the mesh's local bounds: match height, center on the mesh.
+    AABB mb = obj->getLocalBounds();
+    glm::vec3 sMin = heads[0], sMax = heads[0];
+    for (const auto& p : heads) { sMin = glm::min(sMin, p); sMax = glm::max(sMax, p); }
+    glm::vec3 sCenter = (sMin + sMax) * 0.5f;
+    glm::vec3 mCenter = (mb.min + mb.max) * 0.5f;
+    float sH = sMax.y - sMin.y, mH = mb.max.y - mb.min.y;
+    float scale = (sH > 1e-5f && mH > 1e-5f) ? (mH / sH) : 1.0f;
+    for (auto& p : heads) p = (p - sCenter) * scale + mCenter;
+
+    // Build the editable skeleton (same representation Load Skeleton uses).
+    std::unordered_map<std::string, int> nameToIdx;
+    for (size_t i = 0; i < names.size(); ++i) nameToIdx[names[i]] = static_cast<int>(i);
+    Skeleton newSkel;
+    std::vector<glm::vec3> newPositions;
+    for (size_t i = 0; i < heads.size(); ++i) {
+        Bone bone;
+        bone.name = names[i].empty() ? ("bone_" + std::to_string(i)) : names[i];
+        bone.parentIndex = -1;
+        if (!parentNames[i].empty()) {
+            auto it = nameToIdx.find(parentNames[i]);
+            if (it != nameToIdx.end()) bone.parentIndex = it->second;
+        }
+        bone.localTransform = glm::translate(glm::mat4(1.0f), heads[i]);
+        bone.inverseBindMatrix = glm::inverse(bone.localTransform);
+        newSkel.bones.push_back(bone);
+        newSkel.boneNameToIndex[bone.name] = static_cast<int>(i);
+        newPositions.push_back(heads[i]);
+    }
+    m_ctx.editableMesh.setSkeleton(newSkel);
+    m_bonePositions = newPositions;
+    m_selectedBone = newPositions.empty() ? -1 : 0;
+    m_ctx.meshDirty = true;
+    invalidateWireframeCache();
+    m_riggingMode = true;
+    m_showSkeleton = true;
+    std::cout << "[AutoSkel] Installed " << newSkel.bones.size()
+              << " bones (unbound) from " << jsonPath << "\n";
+}
+
+// Shortest-arc quaternion rotating unit vector `from` onto `to`.
+static glm::quat swingBetween(const glm::vec3& from, const glm::vec3& to) {
+    glm::vec3 a = glm::normalize(from), b = glm::normalize(to);
+    float d = glm::dot(a, b);
+    if (d >  0.99999f) return glm::quat(1, 0, 0, 0);
+    if (d < -0.99999f) {                       // opposite: rotate 180 about any perpendicular
+        glm::vec3 ax = glm::cross(glm::vec3(1, 0, 0), a);
+        if (glm::dot(ax, ax) < 1e-8f) ax = glm::cross(glm::vec3(0, 1, 0), a);
+        return glm::angleAxis(glm::pi<float>(), glm::normalize(ax));
+    }
+    glm::vec3 ax = glm::normalize(glm::cross(a, b));
+    return glm::angleAxis(std::acos(glm::clamp(d, -1.0f, 1.0f)), ax);
+}
+
+// Conform the working skeleton to the magenta reference skeleton. For each target
+// bone: snap its head to the nearest reference bone head, then set its world
+// rotation to the swing that takes its REST direction-to-child onto the new
+// direction-to-child (so the mesh bends, not just translates — matching the
+// reskin contract v' = R*(vRest - bindPos) + animPos). all=true does every bone;
+// all=false does only the selected bone (to fix hands/fingers the bulk pass got
+// wrong — the frames' bone counts differ mostly in the hands).
+void ModelingMode::conformBonesToReference(bool all) {
+    if (m_poseRefBoneHeads.empty() || m_bonePositions.empty()) return;
+    if (!m_ctx.editableMesh.isValid()) return;
+    const Skeleton& skel = m_ctx.editableMesh.getSkeleton();
+    const size_t n = m_bonePositions.size();
+    if (m_boneWorldRotations.size() != n)
+        m_boneWorldRotations.assign(n, glm::quat(1, 0, 0, 0));
+
+    std::vector<bool> conform(n, false);
+    if (all) { for (size_t i = 0; i < n; ++i) conform[i] = true; }
+    else if (m_selectedBone >= 0 && m_selectedBone < static_cast<int>(n)) conform[m_selectedBone] = true;
+    else return;
+
+    // Rest heads: use the bind pose if set (matches what reskin subtracts),
+    // else the skeleton's install-time rest (localTransform translation).
+    const bool haveBind = (m_bindPoseBonePositions.size() == n);
+    auto rest = [&](size_t i) -> glm::vec3 {
+        return haveBind ? m_bindPoseBonePositions[i] : glm::vec3(skel.bones[i].localTransform[3]);
+    };
+
+    // 1) Snap each conformed bone head to the nearest reference bone head.
+    for (size_t i = 0; i < n; ++i) {
+        if (!conform[i]) continue;
+        const glm::vec3& w = m_bonePositions[i];
+        int best = -1; float bestD = FLT_MAX;
+        for (size_t j = 0; j < m_poseRefBoneHeads.size(); ++j) {
+            glm::vec3 dv = w - m_poseRefBoneHeads[j];
+            float d = glm::dot(dv, dv);
+            if (d < bestD) { bestD = d; best = static_cast<int>(j); }
+        }
+        if (best >= 0) m_bonePositions[i] = m_poseRefBoneHeads[best];
+    }
+
+    // 2) Derive each conformed bone's world rotation from rest->new, aimed at its
+    //    first child (leaf bones keep identity — no direction to define a swing).
+    std::vector<int> firstChild(n, -1);
+    for (size_t i = 0; i < n && i < skel.bones.size(); ++i) {
+        int p = skel.bones[i].parentIndex;
+        if (p >= 0 && p < static_cast<int>(n) && firstChild[p] < 0) firstChild[p] = static_cast<int>(i);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (!conform[i]) continue;
+        int c = firstChild[i];
+        if (c < 0) { m_boneWorldRotations[i] = glm::quat(1, 0, 0, 0); continue; }
+        glm::vec3 bindDir = rest(c) - rest(i);
+        glm::vec3 newDir  = m_bonePositions[c] - m_bonePositions[i];
+        if (glm::dot(bindDir, bindDir) < 1e-10f || glm::dot(newDir, newDir) < 1e-10f) {
+            m_boneWorldRotations[i] = glm::quat(1, 0, 0, 0); continue;
+        }
+        m_boneWorldRotations[i] = swingBetween(bindDir, newDir);
+    }
+
+    reskinFromBoneDeltas();   // no-ops until a bind pose is set (mesh may be hidden)
+    m_ctx.meshDirty = true;
+    std::cout << "[Conform] " << (all ? "all bones" : "selected bone")
+              << " conformed to reference.\n";
 }
 
 // Normalized world rotation of a matrix's upper 3x3 (removes any scale, e.g.

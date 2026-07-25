@@ -209,25 +209,46 @@ void ModelingMode::update(float deltaTime) {
         m_autoRigRunning = false;
         if (m_autoRigOk) {
             std::cout << "[AutoRig] Done — loading " << m_autoRigOut << std::endl;
-            // Hide the unrigged source object first: the rigged model loads at
-            // the same spot, and two stacked copies means viewport clicks keep
-            // selecting the rig-less twin ("it didn't bind!").
-            if (!m_autoRigSourceName.empty()) {
+            // Delete the unrigged source object outright (not just hide it). The
+            // rigged model loads at the same spot; leaving the original behind —
+            // visible OR merely hidden — is what makes a "UniRig" hang around in
+            // the scene after you've deleted its twin. We match by the exact
+            // pointer captured at launch (names collide; a hidden ghost can't be
+            // clicked), validating it's still in the scene, then route through the
+            // deferred-deletion path so its GPU handles are freed safely.
+            bool removedSource = false;
+            if (m_autoRigSourceObj) {
                 for (auto& so : m_ctx.sceneObjects) {
-                    if (so && so->getName() == m_autoRigSourceName && !so->isSkinned()) {
-                        so->setVisible(false);
-                        std::cout << "[AutoRig] Hid unrigged source object '"
+                    if (so.get() == m_autoRigSourceObj) {
+                        m_ctx.pendingDeletions.push_back(m_autoRigSourceObj);
+                        removedSource = true;
+                        std::cout << "[AutoRig] Removing unrigged source object '"
                                   << m_autoRigSourceName << "'" << std::endl;
                         break;
                     }
                 }
             }
+            m_autoRigSourceObj = nullptr;
             m_autoRigStatus = "Done: " + std::filesystem::path(m_autoRigOut).filename().string()
-                            + " loaded (source hidden)";
+                            + (removedSource ? " loaded (source removed)" : " loaded");
             if (m_ctx.requestLoadModel) m_ctx.requestLoadModel(m_autoRigOut);
         } else {
             std::cout << "[AutoRig] FAILED — see /tmp/mesh2rig_lime.log" << std::endl;
             m_autoRigStatus = "FAILED — see /tmp/mesh2rig_lime.log";
+        }
+    }
+
+    // Skeleton-Only pipeline finished? Install the predicted bones as the
+    // editable skeleton (unbound) on the main thread.
+    if (m_autoSkelDone.exchange(false)) {
+        m_autoSkelRunning = false;
+        if (m_autoSkelOk) {
+            installSkeletonFromBonesJson(m_autoSkelBonesJson);
+            m_autoSkelStatus = "Done: skeleton installed (unbound). Hide the mesh, pose, "
+                               "then Set Bind Pose + Auto Weights to bind.";
+        } else {
+            std::cout << "[AutoSkel] FAILED — see /tmp/mesh2skel_lime.log" << std::endl;
+            m_autoSkelStatus = "FAILED — see /tmp/mesh2skel_lime.log";
         }
     }
 
@@ -1054,6 +1075,11 @@ void ModelingMode::drawOverlays(float vpX, float vpY, float vpW, float vpH) {
         drawSkeletonOverlay(vpX, vpY, vpW, vpH);
     }
 
+    // Draw the pose-reference skeleton (frame N's UniRig bones, magenta guide)
+    if (m_riggingMode) {
+        drawPoseRefSkeletonOverlay(vpX, vpY, vpW, vpH);
+    }
+
     // Draw the imported GLB skinned model's animated skeleton (moves with playback)
     if (m_riggingMode) {
         drawSkinnedSkeletonOverlay(vpX, vpY, vpW, vpH);
@@ -1113,6 +1139,9 @@ void ModelingMode::renderModelingEditorUI() {
 
         for (size_t i = 0; i < m_ctx.sceneObjects.size(); ++i) {
             auto& obj = m_ctx.sceneObjects[i];
+            // Pose-reference ghosts are display-only: keep them out of the outliner
+            // so they can't be selected or edited (managed by the Pose Reference stepper).
+            if (obj->isPoseReference()) continue;
             ImGui::PushID(static_cast<int>(i));
 
             // Check if in multi-selection set or is primary selection
@@ -2163,6 +2192,30 @@ void ModelingMode::renderModelingEditorUI() {
                                    "%s", m_autoRigStatus.c_str());
             }
 
+            // Skeleton Only (UniRig): predict just the bones (no skinning) and
+            // install them as the editable skeleton, auto-fit and UNBOUND — a
+            // starting rig you refine by hand, then bind later.
+            if (m_autoSkelRunning) {
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
+                                   "Predicting skeleton... (~30s, GPU busy)");
+            } else {
+                if (ImGui::Button("Skeleton Only (UniRig)")) {
+                    launchAutoSkeleton();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Predict JUST the skeleton (no skinning) and install it as the\n"
+                                      "editable skeleton, auto-fit to this mesh and UNBOUND. A fast\n"
+                                      "starting rig to refine by hand: hide the mesh, pose the bones,\n"
+                                      "then Set Bind Pose + Auto Weights to bind when ready.");
+                }
+            }
+            if (!m_autoSkelStatus.empty() && !m_autoSkelRunning) {
+                bool failed = m_autoSkelStatus.rfind("FAILED", 0) == 0;
+                ImGui::TextColored(failed ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
+                                          : ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                                   "%s", m_autoSkelStatus.c_str());
+            }
+
             if (m_riggingMode) {
                 auto& skel = m_ctx.editableMesh.getSkeleton();
                 int numBones = static_cast<int>(skel.bones.size());
@@ -2960,6 +3013,89 @@ void ModelingMode::renderModelingEditorUI() {
                     }
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Load a pose2anim *.limeanim.json (per-frame bone positions\nderived from a video) onto this rig. Bones matched by name.\nSet Bind Pose first to see it deform. Rung 1: positions only.");
+                    }
+
+                    // ---- Pose Reference stepper --------------------------------
+                    // Point at a folder of meshes; each shows as a ghost to hand-pose
+                    // the skeleton against. Step through, Set Key on each, to build a
+                    // clip. (Meshes are display-only — excluded from selection/save.)
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Pose Reference (folder -> keys)");
+                    if (ImGui::Button("Load Pose References...")) {
+                        nfdchar_t* dir = nullptr;
+                        if (NFD_PickFolder(&dir, nfdDefaultDir(m_ctx.projectPath)) == NFD_OKAY) {
+                            loadPoseRefFolder(dir);
+                            NFD_FreePath(dir);
+                        }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Pick a folder of meshes (GLB). Each is shown as a ghost\n"
+                                          "silhouette to hand-pose the skeleton against; step through\n"
+                                          "and Set Key on each pose to build one animation clip.");
+                    if (!m_poseRefFiles.empty()) {
+                        ImGui::BeginDisabled(m_poseRefIndex <= 0);
+                        if (ImGui::Button("Prev##poseref")) showPoseRef(m_poseRefIndex - 1);
+                        ImGui::EndDisabled();
+                        ImGui::SameLine();
+                        ImGui::BeginDisabled(m_poseRefIndex >= static_cast<int>(m_poseRefFiles.size()) - 1);
+                        if (ImGui::Button("Next##poseref")) showPoseRef(m_poseRefIndex + 1);
+                        ImGui::EndDisabled();
+                        ImGui::SameLine();
+                        std::string rn = (m_poseRefIndex >= 0)
+                            ? std::filesystem::path(m_poseRefFiles[m_poseRefIndex]).filename().string()
+                            : std::string("(none)");
+                        ImGui::Text("Ref %d/%d: %s", m_poseRefIndex + 1,
+                                    static_cast<int>(m_poseRefFiles.size()), rn.c_str());
+
+                        // Registration controls appear when we're showing a reference
+                        // SKELETON (a .bones.json sidecar was found) rather than a mesh.
+                        if (!m_poseRefBoneHeads.empty()) {
+                            ImGui::Checkbox("Show ref skeleton", &m_showPoseRefSkeleton);
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Z-up", &m_poseRefZUp)) applyPoseRefTransform();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("UniRig armatures are Z-up; LIME is Y-up.\nLeave on unless the reference lies on its side.");
+                            ImGui::SetNextItemWidth(150);
+                            if (ImGui::SliderFloat("Ref scale", &m_poseRefScale, 0.05f, 10.0f, "%.2f",
+                                                   ImGuiSliderFlags_Logarithmic))
+                                applyPoseRefTransform();
+                            ImGui::SetNextItemWidth(220);
+                            if (ImGui::DragFloat3("Ref offset", &m_poseRefOffset.x, 0.01f))
+                                applyPoseRefTransform();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Nudge the magenta reference bones to line up with\nyour working skeleton, then pose to match.");
+
+                            // Conform: snap the working skeleton onto the reference.
+                            ImGui::Separator();
+                            if (ImGui::Button("Conform All to Ref")) {
+                                conformBonesToReference(true);
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Snap EVERY working bone to its nearest reference bone and\n"
+                                                  "orient it to match — adopts the whole reference pose in one\n"
+                                                  "click. Then fix hands/fingers per-bone below. (Register the\n"
+                                                  "overlay with scale/offset first so 'nearest' is meaningful.)");
+                            ImGui::SameLine();
+                            ImGui::BeginDisabled(m_selectedBone < 0);
+                            if (ImGui::Button("Conform Selected to Ref")) {
+                                conformBonesToReference(false);
+                            }
+                            ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                                ImGui::SetTooltip(m_selectedBone < 0
+                                    ? "Select a bone first (click it in the bone list or viewport)."
+                                    : "Snap ONLY the selected bone to its nearest reference bone.\n"
+                                      "Use to fix bones the bulk conform mismatched (esp. fingers).");
+                        }
+
+                        if (ImGui::Button("Clear Reference")) {
+                            if (m_ctx.clearPoseReferenceCallback) m_ctx.clearPoseReferenceCallback();
+                            m_poseRefFiles.clear();
+                            m_poseRefIndex = -1;
+                            m_poseRefBoneHeadsRaw.clear();
+                            m_poseRefBoneParents.clear();
+                            m_poseRefBoneHeads.clear();
+                        }
                     }
                 }
 
@@ -10821,12 +10957,17 @@ void ModelingMode::saveLimeScene() {
         return;
     }
 
+    // Pose-reference ghosts are transient display aids — never write them to the scene.
+    size_t savableCount = 0;
+    for (auto& o : m_ctx.sceneObjects) if (!o->isPoseReference()) ++savableCount;
+
     file << "# LIME Scene Format v1.0\n";
     file << "# Multi-object scene file\n";
-    file << "scene_objects: " << m_ctx.sceneObjects.size() << "\n\n";
+    file << "scene_objects: " << savableCount << "\n\n";
 
     for (size_t objIdx = 0; objIdx < m_ctx.sceneObjects.size(); ++objIdx) {
         auto& obj = m_ctx.sceneObjects[objIdx];
+        if (obj->isPoseReference()) continue;
 
         file << "OBJECT_BEGIN \"" << obj->getName() << "\"\n";
 

@@ -187,6 +187,12 @@ public:
     void setVisible(bool visible) { m_visible = visible; }
     bool isVisible() const { return m_visible; }
 
+    // Pose-reference ghost: a display-only mesh loaded as a silhouette to hand-pose
+    // a skeleton against (the "Pose Reference" stepper). Rendered normally, but
+    // excluded from selection/picking and from scene save/export.
+    void setPoseReference(bool r) { m_isPoseReference = r; }
+    bool isPoseReference() const { return m_isPoseReference; }
+
     // X-Ray mode (render both sides, see through backfaces)
     void setXRay(bool xray) { m_xray = xray; }
     bool isXRay() const { return m_xray; }
@@ -734,6 +740,7 @@ private:
     uint32_t m_vertexCount = 0;
     AABB m_localBounds;
     bool m_selected = false;
+    bool m_isPoseReference = false;
     bool m_visible = true;
     bool m_xray = false;             // X-Ray mode (render both sides)
     bool m_flatShading = false;      // Flat (faceted) shading via fragment derivatives

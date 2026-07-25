@@ -531,6 +531,43 @@ void ModelingMode::drawSkeletonOverlay(float vpX, float vpY, float vpW, float vp
     drawList->PopClipRect();
 }
 
+// Draw the pose-reference skeleton: frame N's UniRig-predicted bones (from a
+// .bones.json sidecar), in magenta, as a guide to hand-pose the working skeleton
+// against. Drawn in world space (identity model) — the scale/offset registration
+// knobs in the Pose Reference panel bring it onto the working rig.
+void ModelingMode::drawPoseRefSkeletonOverlay(float vpX, float vpY, float vpW, float vpH) {
+    if (!m_showPoseRefSkeleton || m_poseRefBoneHeads.empty()) return;
+
+    Camera& cam = (m_ctx.splitView && vpX > 0) ? m_ctx.camera2 : m_ctx.camera;
+    glm::mat4 vp = cam.getProjectionMatrix(vpW / vpH) * cam.getViewMatrix();
+
+    auto worldToScreen = [&](const glm::vec3& w) -> ImVec2 {
+        glm::vec4 clip = vp * glm::vec4(w, 1.0f);
+        if (clip.w <= 0.0f) return ImVec2(-1000, -1000);
+        glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        return ImVec2(vpX + (ndc.x + 1.0f) * 0.5f * vpW, vpY + (1.0f - ndc.y) * 0.5f * vpH);
+    };
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->PushClipRect(ImVec2(vpX, vpY), ImVec2(vpX + vpW, vpY + vpH), true);
+
+    const ImU32 lineCol  = IM_COL32(255, 90, 220, 220);
+    const ImU32 jointCol = IM_COL32(255, 150, 240, 240);
+    for (size_t i = 0; i < m_poseRefBoneHeads.size(); ++i) {
+        ImVec2 hs = worldToScreen(m_poseRefBoneHeads[i]);
+        int p = (i < m_poseRefBoneParents.size()) ? m_poseRefBoneParents[i] : -1;
+        if (p >= 0 && p < static_cast<int>(m_poseRefBoneHeads.size())) {
+            ImVec2 ps = worldToScreen(m_poseRefBoneHeads[p]);
+            if (hs.x > -500 && ps.x > -500) dl->AddLine(hs, ps, lineCol, 2.0f);
+        }
+        if (hs.x > -500) {
+            dl->AddCircleFilled(hs, 3.5f, IM_COL32(0, 0, 0, 180));
+            dl->AddCircleFilled(hs, 2.5f, jointCol);
+        }
+    }
+    dl->PopClipRect();
+}
+
 // Draw the imported GLB skinned model's skeleton, posed at the current animation
 // frame. Unlike drawSkeletonOverlay (which draws the LIME editor skeleton from
 // m_bonePositions), this reads the live pose from the skinned model's animation

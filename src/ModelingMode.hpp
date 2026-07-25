@@ -189,7 +189,47 @@ private:
     std::atomic<bool> m_autoRigOk{false};
     std::string m_autoRigOut;            // rigged GLB the pipeline will produce
     std::string m_autoRigStatus;         // persistent last-run status
-    std::string m_autoRigSourceName;     // scene object that was rigged (hidden on success)
+    std::string m_autoRigSourceName;     // scene object that was rigged (removed on success)
+    SceneObject* m_autoRigSourceObj = nullptr;  // exact source object, validated before removal
+
+    // "Skeleton Only (UniRig)": predict JUST the skeleton (no skinning) via
+    // mesh2skel.sh, then install it as the EDITABLE skeleton — auto-fit to the
+    // mesh and UNBOUND. A starting rig to refine by hand; bind later (Set Bind
+    // Pose + Auto Weights). Much faster than full Auto-Rig.
+    void launchAutoSkeleton();
+    std::atomic<bool> m_autoSkelRunning{false};
+    std::atomic<bool> m_autoSkelDone{false};
+    std::atomic<bool> m_autoSkelOk{false};
+    std::string  m_autoSkelBonesJson;             // <stem>_skeleton.bones.json the pipeline writes
+    std::string  m_autoSkelStatus;                // persistent last-run status
+    SceneObject* m_autoSkelTargetObj = nullptr;   // object to install the skeleton onto
+    void installSkeletonFromBonesJson(const std::string& jsonPath);
+
+    // Pose Reference stepper: hand-pose ONE skeleton across a folder of meshes
+    // (e.g. Tearsheet frame-meshes) — each is shown as a ghost silhouette; Set Key
+    // on each stepped pose builds a single animation clip on that skeleton.
+    std::vector<std::string> m_poseRefFiles;   // GLBs in the chosen folder, sorted
+    int m_poseRefIndex = -1;                    // currently shown reference (-1 = none)
+    void loadPoseRefFolder(const std::string& dir);
+    void showPoseRef(int idx);                  // display reference idx (clamps)
+
+    // Reference-skeleton overlay: if a stepped mesh has a UniRig ".bones.json"
+    // sidecar (from mesh2skel.sh), draw THAT frame's predicted bones as a colored
+    // guide to hand-pose the working skeleton against — clearer than the silhouette.
+    std::vector<glm::vec3> m_poseRefBoneHeadsRaw;  // heads as read from JSON (armature space)
+    std::vector<int>       m_poseRefBoneParents;   // parent index per bone (-1 = root)
+    std::vector<glm::vec3> m_poseRefBoneHeads;     // transformed for display (world space)
+    bool  m_showPoseRefSkeleton = true;            // draw the reference bones
+    bool  m_poseRefZUp   = true;                   // convert UniRig Z-up -> LIME Y-up
+    float m_poseRefScale = 1.0f;                   // overlay scale (registration knob)
+    glm::vec3 m_poseRefOffset{0.0f};               // overlay world offset (registration knob)
+    bool loadPoseRefBones(const std::string& jsonPath);  // parse a .bones.json sidecar
+    void applyPoseRefTransform();                  // raw heads -> display heads
+    void drawPoseRefSkeletonOverlay(float vpX, float vpY, float vpW, float vpH);
+    // Conform the working skeleton to the reference skeleton by snapping each bone
+    // to its nearest reference bone and deriving the bone rotation from rest->new.
+    // all=true does every bone; all=false does only the selected bone.
+    void conformBonesToReference(bool all);
     // Rig-runtime (bind pose + keyframes) persistence embedded in .lime files.
     std::string serializeRigRuntime(SceneObject* obj);
     void deserializeRigRuntime(const std::string& blob, SceneObject* obj);

@@ -1254,15 +1254,17 @@ protected:
                 // Remove from multi-selection set first
                 m_selectedObjects.erase(obj);
 
-                // Clear primary selection if it's being deleted
+                // Clear primary selection AND the editable mesh only when the object
+                // being deleted is the one the editable mesh was built from (the
+                // selected object). Clearing unconditionally wiped the active rig
+                // whenever ANY other object was removed — e.g. retiring a pose-
+                // reference ghost on "Next" made the skeleton/rigging UI vanish.
                 if (m_selectedObject == obj) {
                     m_selectedObject = nullptr;
-                }
-
-                // Clear editable mesh if it was built from this object
-                if (m_modelingMode && m_editorContext) {
-                    m_editorContext->editableMesh.clear();
-                    m_editorContext->meshDirty = false;
+                    if (m_modelingMode && m_editorContext) {
+                        m_editorContext->editableMesh.clear();
+                        m_editorContext->meshDirty = false;
+                    }
                 }
 
                 // Find and remove from scene
@@ -1597,6 +1599,12 @@ private:
                 startBatchGeneration(framesDir);
             },
             .batchActive = m_batchActive,
+            .loadPoseReferenceCallback = [this](const std::string& glbPath) {
+                loadPoseReference(glbPath);
+            },
+            .clearPoseReferenceCallback = [this]() {
+                clearPoseReference();
+            },
             .onMetadataLoaded = [this](const std::unordered_map<std::string, std::string>& meta) {
                 m_widgetTypeIndex = 0;
                 memset(m_widgetParamName, 0, sizeof(m_widgetParamName));
@@ -3358,6 +3366,61 @@ private:
         m_gizmoMode = GizmoMode::Move;
     }
 
+    // ---- Pose-reference ghost -------------------------------------------------
+    // Retire the current reference ghost(s): hide immediately (so it vanishes this
+    // frame) and route through the deferred-deletion safe point to free GPU handles.
+    void clearPoseReference() {
+        for (SceneObject* o : m_poseRefObjs) {
+            if (!o) continue;
+            o->setVisible(false);
+            m_pendingDeletions.push_back(o);
+        }
+        m_poseRefObjs.clear();
+    }
+
+    // Load a GLB as a display-only ghost at the origin: reuses the normal mesh
+    // render path, but the object is flagged pose-reference so it's excluded from
+    // selection, the outliner, and scene save. Not selected, no editable-mesh
+    // rebuild, no skeleton import — it's purely a silhouette to pose against.
+    void loadPoseReference(const std::string& path) {
+        clearPoseReference();
+
+        LoadResult loadResult = GLBLoader::load(path);
+        if (!loadResult.success) {
+            std::cerr << "[PoseRef] Failed to load " << path << ": " << loadResult.error << std::endl;
+            return;
+        }
+
+        for (auto& mesh : loadResult.meshes) {
+            auto obj = std::make_unique<SceneObject>("[poseref] " + mesh.name);
+
+            uint32_t handle = m_modelRenderer->createModel(
+                mesh.vertices, mesh.indices,
+                mesh.hasTexture ? mesh.texture.data.data() : nullptr,
+                mesh.texture.width, mesh.texture.height);
+
+            if (!mesh.hasTexture && !mesh.hasVertexColors) {
+                for (auto& v : mesh.vertices) v.color = m_defaultMeshColor;
+            }
+
+            obj->setBufferHandle(handle);
+            obj->setIndexCount(static_cast<uint32_t>(mesh.indices.size()));
+            obj->setVertexCount(static_cast<uint32_t>(mesh.vertices.size()));
+            obj->setMeshData(mesh.vertices, mesh.indices);
+            obj->setPoseReference(true);
+            obj->setVisible(true);
+
+            if (!mesh.hasTexture && !mesh.hasVertexColors) {
+                m_modelRenderer->updateModelBuffer(handle, mesh.vertices);
+            }
+
+            m_poseRefObjs.push_back(obj.get());
+            m_sceneObjects.push_back(std::move(obj));
+        }
+        std::cout << "[PoseRef] Showing " << std::filesystem::path(path).filename().string()
+                  << " (" << m_poseRefObjs.size() << " mesh(es))" << std::endl;
+    }
+
     void startAIGeneration(const std::string& prompt, const std::string& imagePath) {
         if (m_aiGenerating) return;
 
@@ -4992,6 +5055,11 @@ private:
     std::atomic<bool> m_aiGenerateComplete{false};
     std::atomic<bool> m_aiGenerateCancelled{false};
     std::string m_aiGeneratedGLBPath;
+
+    // Pose-reference ghost objects: display-only meshes (one GLB may hold several
+    // sub-meshes) shown as a silhouette to hand-pose a skeleton against. Only one
+    // reference GLB is shown at a time; loading a new one retires the previous.
+    std::vector<SceneObject*> m_poseRefObjs;
 
     // Batch generation: one mesh per image in a chosen folder, in filename order.
     // Frames are processed sequentially (only one job fits in VRAM); each result

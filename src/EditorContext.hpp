@@ -381,6 +381,13 @@ struct EditorContext {
     // writing the .glb results into a sibling "<folder>_meshes" directory.
     std::function<void(const std::string& framesDir)> batchGenerateCallback;
     bool& batchActive;                     // a folder batch is currently running
+
+    // Pose-reference ghost: load a GLB as a display-only silhouette to hand-pose a
+    // skeleton against (the "Pose Reference" stepper), or clear it. Managed by the
+    // app so it reuses the normal GLB load/render path.
+    std::function<void(const std::string& glbPath)> loadPoseReferenceCallback;
+    std::function<void()> clearPoseReferenceCallback;
+
     bool showAIGenerateWindow = false;
 
     // Callback to update widget properties UI when a .lime is loaded
